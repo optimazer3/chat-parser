@@ -10,42 +10,22 @@ from __future__ import annotations
 
 import asyncio
 
-import anthropic
 import asyncpg
 
 from ..config import settings
+from ..llm import LLM, LLMError, build_llm
 from ..normalize.chunker import load_thread_text
 from .prompts import SYSTEM_EXTRACT
 from .schema import Extraction
 from .validate import validate
 
 
-async def extract_one(
-    client: anthropic.AsyncAnthropic, text: str
-) -> tuple[Extraction | None, str | None]:
-    resp = await client.messages.parse(
-        model=settings.model_extract,
-        max_tokens=16000,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_EXTRACT,
-                # Системный промпт одинаков для всех тредов -> кэшируем.
-                # Проверяй usage.cache_read_input_tokens: если 0, кэш не работает.
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            }
-        ],
-        messages=[{"role": "user", "content": text}],
-        output_format=Extraction,
-    )
-    if resp.stop_reason == "refusal":
-        cat = getattr(resp.stop_details, "category", None)
-        return None, f"refusal:{cat}"
-    return resp.parsed_output, None
+async def extract_one(llm: LLM, text: str) -> Extraction:
+    return await llm.structured(SYSTEM_EXTRACT, text, Extraction, max_tokens=8000)
 
 
 async def run(pool: asyncpg.Pool, limit: int | None = None) -> dict:
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    llm = build_llm()
     rows = await pool.fetch(
         """
         select chat_id, root_id, message_ids, started_at
@@ -72,25 +52,15 @@ async def run(pool: asyncpg.Pool, limit: int | None = None) -> dict:
                 )
                 return
             try:
-                extraction, err = await extract_one(client, text)
-            except anthropic.APIError as e:
+                extraction = await extract_one(llm, text)
+            except (LLMError, Exception) as e:  # noqa: BLE001 — один тред не валит прогон
                 stats["failed"] += 1
                 await pool.execute(
                     "update threads set status='failed' where chat_id=$1 and root_id=$2",
                     chat_id,
                     root_id,
                 )
-                print(f"  ! {chat_id}/{root_id}: {e}")
-                return
-
-            if extraction is None:
-                stats["failed"] += 1
-                await pool.execute(
-                    "update threads set status='skipped' where chat_id=$1 and root_id=$2",
-                    chat_id,
-                    root_id,
-                )
-                print(f"  ! {chat_id}/{root_id}: {err}")
+                print(f"  ! {chat_id}/{root_id}: {type(e).__name__}: {e}")
                 return
 
             signals, dropped = validate(extraction, text, set(ids))

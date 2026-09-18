@@ -10,7 +10,10 @@ import typer
 from rich import print
 
 from . import db
+from pydantic import BaseModel
+
 from .config import settings
+from .llm import build_llm
 from .analyze import extract as extract_mod
 from .cluster import llm_cluster
 from .ingest import collector
@@ -29,6 +32,24 @@ def _run(coro):
             await db.close_pool()
 
     return asyncio.run(wrapper())
+
+
+@app.command()
+def models(grep: str = typer.Option("", help="Показать только id, содержащие подстроку")) -> None:
+    """Список моделей, которые реально отдаёт шлюз. Из него бери LLM_MODEL."""
+
+    async def go():
+        llm = build_llm()
+        ids = await llm.list_models()
+        shown = [m for m in ids if grep.lower() in m.lower()] if grep else ids
+        print(f"[dim]{settings.llm_base_url} — моделей: {len(ids)}[/dim]")
+        for m in shown:
+            mark = " [green]<- LLM_MODEL[/green]" if m == settings.llm_model else ""
+            print(f"  {m}{mark}")
+        if grep and not shown:
+            print(f"[yellow]ничего не найдено по «{grep}»[/yellow]")
+
+    _run(go())
 
 
 @app.command("init-db")
@@ -95,11 +116,27 @@ async def _probe_telegram():
             await client.disconnect()
 
 
-async def _probe_anthropic():
-    import anthropic
+class _Ping(BaseModel):
+    ok: bool
+    answer: str
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=1)
-    return await client.models.retrieve(settings.model_extract)
+
+async def _probe_llm():
+    """Проверяет ключ, наличие модели и то, какой режим JSON понимает шлюз."""
+    llm = build_llm()
+    available = await llm.list_models()
+    if settings.llm_model and settings.llm_model not in available:
+        raise RuntimeError(
+            f"модель '{settings.llm_model}' шлюз не отдаёт. "
+            f"Доступно {len(available)} шт., посмотри: chat-parser models"
+        )
+    await llm.structured(
+        "Ты отвечаешь строго одним JSON-объектом.",
+        "Верни ok=true и answer=\"pong\".",
+        _Ping,
+        max_tokens=200,
+    )
+    return llm.mode, available
 
 
 @app.command()
@@ -119,10 +156,15 @@ def doctor() -> None:
             problems.append("AUTHOR_SALT")
         else:
             print("  [green]OK[/green]   AUTHOR_SALT задан")
-        if not settings.anthropic_api_key:
-            print("  [red]FAIL[/red] ANTHROPIC_API_KEY пуст")
-            problems.append("ANTHROPIC_API_KEY")
-        print(f"  [dim]модели: {settings.model_extract} / {settings.model_synth}[/dim]")
+        if not settings.llm_api_key:
+            print("  [red]FAIL[/red] LLM_API_KEY пуст")
+            problems.append("LLM_API_KEY")
+        else:
+            print("  [green]OK[/green]   LLM_API_KEY задан")
+        if settings.tg_bot_token and not settings.admin_ids:
+            print("  [red]FAIL[/red] TG_BOT_TOKEN задан, а TG_ADMIN_IDS пуст — "
+                  "бот пустит кого угодно")
+            problems.append("TG_ADMIN_IDS")
 
         print("\n[bold]2. База данных[/bold]")
         print(f"  [dim]{db.safe_dsn()}[/dim]")
@@ -156,13 +198,22 @@ def doctor() -> None:
             print(f"  [green]OK[/green]   вошли как {me.first_name} "
                   f"(@{me.username}), id {me.id}")
 
-        print("\n[bold]4. Anthropic[/bold]")
-        model, err = await _probe(_probe_anthropic())
-        if err:
-            print(f"  [red]FAIL[/red] {err}")
-            problems.append("Anthropic")
+        print("\n[bold]4. LLM[/bold]")
+        print(f"  [dim]{settings.llm_base_url} · модель {settings.llm_model or '(не задана)'}[/dim]")
+        if not settings.llm_model:
+            print("  [red]FAIL[/red] LLM_MODEL не задан — посмотри: chat-parser models")
+            problems.append("LLM_MODEL")
         else:
-            print(f"  [green]OK[/green]   {model.display_name} доступна")
+            res, err = await _probe(_probe_llm(), 60)
+            if err:
+                print(f"  [red]FAIL[/red] {err}")
+                problems.append("LLM")
+            else:
+                mode, available = res
+                print(f"  [green]OK[/green]   модель отвечает, "
+                      f"режим JSON: [bold]{mode}[/bold] ({len(available)} моделей на шлюзе)")
+                if settings.llm_json_mode == "auto":
+                    print(f"  [dim]можно зафиксировать: LLM_JSON_MODE={mode}[/dim]")
 
         print()
         if problems:
@@ -304,6 +355,20 @@ def status() -> None:
         print(f"тредов в очереди на анализ: {pend}")
 
     _run(go())
+
+
+@app.command("bot")
+def bot_cmd() -> None:
+    """Запустить телеграм-бота: отчёты и команды прямо в Telegram."""
+    from .bot.main import run_bot
+
+    if not settings.tg_bot_token:
+        print("[red]TG_BOT_TOKEN не задан[/red] — получи токен у @BotFather")
+        raise typer.Exit(1)
+    if not settings.admin_ids:
+        print("[red]TG_ADMIN_IDS пуст[/red] — без него ботом сможет управлять кто угодно")
+        raise typer.Exit(1)
+    asyncio.run(run_bot())
 
 
 @app.command()

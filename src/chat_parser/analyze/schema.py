@@ -53,6 +53,16 @@ class Clustering(BaseModel):
     clusters: list[ClusterDraft]
 
 
+class MergeGroup(BaseModel):
+    label: str
+    statement: str
+    draft_ids: list[int]
+
+
+class Merging(BaseModel):
+    groups: list[MergeGroup]
+
+
 class Card(BaseModel):
     title: str
     statement: str
