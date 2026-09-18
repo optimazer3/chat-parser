@@ -13,7 +13,14 @@ def build_client() -> TelegramClient:
         if settings.tg_session_string
         else settings.tg_session
     )
-    client = TelegramClient(session, settings.tg_api_id, settings.tg_api_hash)
+    client = TelegramClient(
+        session,
+        settings.tg_api_id,
+        settings.tg_api_hash,
+        connection_retries=3,
+        retry_delay=2,
+        timeout=20,
+    )
     # Ожидания короче порога Telethon проглатывает сам; всё длиннее ловим руками
     # и откладываем чат, чтобы воркер не висел.
     client.flood_sleep_threshold = 60

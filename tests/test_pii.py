@@ -21,3 +21,8 @@ def test_author_pseudonym_is_stable_and_salted():
     assert a != b
     assert author_label(a).startswith("u:") and len(author_label(a)) == 10
     assert author_hash(None, "salt-a") is None
+
+
+def test_mask_is_idempotent():
+    once = mask_text("почта a@b.ru и телефон +7 912 345 67 89")
+    assert mask_text(once) == once

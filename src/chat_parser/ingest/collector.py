@@ -12,16 +12,73 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from telethon import TelegramClient, errors, utils
+from telethon.tl import functions, types
 from telethon.tl.types import Message
 
 from ..config import settings
 from ..pii import author_hash, author_label, mask_text
 
 BATCH = 100
+
+# t.me/+HASH, t.me/joinchat/HASH или голый +HASH — приватное приглашение
+INVITE_RE = re.compile(r"(?:t\.me/joinchat/|t\.me/\+|^\+)([A-Za-z0-9_-]{8,})")
+
+
+class NeedsJoin(RuntimeError):
+    """Приватный чат, в котором аккаунт ещё не состоит."""
+
+
+class JoinPending(RuntimeError):
+    """Заявка на вступление отправлена, ждёт одобрения админа."""
+
+
+def invite_hash(ref: str) -> str | None:
+    m = INVITE_RE.search(ref.strip())
+    return m.group(1) if m else None
+
+
+async def resolve(client: TelegramClient, ref: str, join: bool = False):
+    """Резолвит @username, ссылку t.me, приватный инвайт или id в entity.
+
+    Приватную группу нельзя читать, не состоя в ней, поэтому для инвайт-ссылки
+    нужен явный join=True — вступление это самое рискованное действие для
+    аккаунта, случайно оно происходить не должно.
+    """
+    h = invite_hash(ref)
+    if not h:
+        return await client.get_entity(ref)
+
+    try:
+        info = await client(functions.messages.CheckChatInviteRequest(h))
+    except errors.InviteHashExpiredError as e:
+        raise RuntimeError("ссылка-приглашение протухла, попроси новую") from e
+    except errors.InviteHashInvalidError as e:
+        raise RuntimeError("ссылка-приглашение невалидна") from e
+
+    # Уже участник, либо превью с временным доступом к истории
+    if isinstance(info, (types.ChatInviteAlready, types.ChatInvitePeek)):
+        return info.chat
+
+    title = getattr(info, "title", "?")
+    if not join:
+        raise NeedsJoin(f"«{title}»: приватный чат, нужно вступить — добавь --join")
+
+    try:
+        upd = await client(functions.messages.ImportChatInviteRequest(h))
+    except errors.UserAlreadyParticipantError:
+        info = await client(functions.messages.CheckChatInviteRequest(h))
+        return info.chat
+    except errors.InviteRequestSentError as e:
+        raise JoinPending(
+            f"«{title}»: заявка отправлена, ждёт одобрения админа. "
+            "Повтори add-chat после одобрения."
+        ) from e
+    return upd.chats[0]
 
 
 def _media_type(msg: Message) -> str | None:
@@ -74,9 +131,11 @@ async def _save(conn: asyncpg.Connection, rows: list[tuple]) -> None:
     )
 
 
-async def register_chat(client: TelegramClient, pool: asyncpg.Pool, ref: str) -> int:
-    """Резолвит @username / ссылку / id и заводит чат в БД."""
-    entity = await client.get_entity(ref)
+async def register_chat(
+    client: TelegramClient, pool: asyncpg.Pool, ref: str, join: bool = False
+) -> int:
+    """Резолвит ссылку и заводит чат в БД."""
+    entity = await resolve(client, ref, join=join)
     chat_id = utils.get_peer_id(entity)
     await pool.execute(
         """

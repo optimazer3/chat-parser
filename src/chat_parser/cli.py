@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 from pathlib import Path
 
 import typer
 from rich import print
 
 from . import db
+from .config import settings
 from .analyze import extract as extract_mod
 from .cluster import llm_cluster
 from .ingest import collector
@@ -28,9 +31,157 @@ def _run(coro):
     return asyncio.run(wrapper())
 
 
+@app.command("init-db")
+def init_db() -> None:
+    """Накатить схему в Supabase. Идемпотентно, повторный запуск безопасен."""
+
+    async def go():
+        print(f"БД: [dim]{db.safe_dsn()}[/dim]")
+        missing = await db.apply_schema()
+        if missing:
+            print(f"[red]Не создались таблицы: {', '.join(missing)}[/red]")
+            raise typer.Exit(1)
+        print(f"[green]Схема применена[/green] ({len(db.EXPECTED_TABLES)} таблиц)")
+
+    _run(go())
+
+
+DOCTOR_TIMEOUT = 25
+TG_CONNECT_TIMEOUT = 15
+
+
+async def _probe(coro, seconds: int = DOCTOR_TIMEOUT):
+    """(результат, None) либо (None, текст ошибки). Не виснет никогда."""
+    try:
+        return await asyncio.wait_for(coro, seconds), None
+    except TimeoutError:
+        return None, f"таймаут {seconds}с — хост недоступен или сеть режет соединение"
+    except Exception as e:  # noqa: BLE001 — доктор обязан дойти до конца
+        return None, f"{type(e).__name__}: {e}"
+
+
+async def _probe_db():
+    pool = await db.get_pool()
+    ver = await pool.fetchval("select version()")
+    missing = await db.missing_tables()
+    counts = None
+    if not missing:
+        counts = await pool.fetchrow(
+            "select (select count(*) from chats) chats,"
+            " (select count(*) from messages) msgs,"
+            " (select count(*) from threads) thr,"
+            " (select count(*) from signals) sig"
+        )
+    return ver, missing, counts
+
+
+async def _probe_telegram():
+    # Свой таймаут на connect: если отменять его снаружи, Telethon оставляет
+    # висящие фоновые задачи и засоряет вывод трейсбеками.
+    client = build_client()
+    try:
+        try:
+            await asyncio.wait_for(client.connect(), TG_CONNECT_TIMEOUT)
+        except TimeoutError as e:
+            raise RuntimeError(
+                f"не удалось подключиться к Telegram за {TG_CONNECT_TIMEOUT}с — "
+                "проверь сеть, VPN или прокси"
+            ) from e
+        if not await client.is_user_authorized():
+            return None
+        return await client.get_me()
+    finally:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+
+async def _probe_anthropic():
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=1)
+    return await client.models.retrieve(settings.model_extract)
+
+
+@app.command()
+def doctor() -> None:
+    """Проверить окружение целиком. Вывод можно скопировать целиком в чат."""
+
+    async def go():
+        # Telethon шумит в лог при обрыве соединения — доктору это не нужно.
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+        logging.getLogger("telethon").setLevel(logging.CRITICAL)
+        problems: list[str] = []
+
+        print("[bold]1. Конфигурация[/bold]")
+        if settings.author_salt in ("", "change-me"):
+            print('  [red]FAIL[/red] AUTHOR_SALT не задан — сгенерируй:')
+            print('        python -c "import secrets; print(secrets.token_hex(16))"')
+            problems.append("AUTHOR_SALT")
+        else:
+            print("  [green]OK[/green]   AUTHOR_SALT задан")
+        if not settings.anthropic_api_key:
+            print("  [red]FAIL[/red] ANTHROPIC_API_KEY пуст")
+            problems.append("ANTHROPIC_API_KEY")
+        print(f"  [dim]модели: {settings.model_extract} / {settings.model_synth}[/dim]")
+
+        print("\n[bold]2. База данных[/bold]")
+        print(f"  [dim]{db.safe_dsn()}[/dim]")
+        res, err = await _probe(_probe_db())
+        if err:
+            print(f"  [red]FAIL[/red] {err}")
+            print("  [dim]подсказка: в Supabase бери Session pooler (порт 5432),")
+            print("  [dim]прямое подключение у новых проектов только по IPv6[/dim]")
+            problems.append("БД")
+        else:
+            ver, missing, counts = res
+            print(f"  [green]OK[/green]   {ver.split(',')[0]}")
+            if missing:
+                print(f"  [red]FAIL[/red] нет таблиц: {', '.join(missing)}"
+                      " — запусти chat-parser init-db")
+                problems.append("схема")
+            else:
+                print(f"  [green]OK[/green]   схема на месте · чатов {counts['chats']},"
+                      f" сообщений {counts['msgs']}, тредов {counts['thr']},"
+                      f" сигналов {counts['sig']}")
+
+        print("\n[bold]3. Telegram[/bold]")
+        me, err = await _probe(_probe_telegram())
+        if err:
+            print(f"  [red]FAIL[/red] {err}")
+            problems.append("Telegram")
+        elif me is None:
+            print("  [red]FAIL[/red] сессия не авторизована — python scripts/login.py")
+            problems.append("Telegram")
+        else:
+            print(f"  [green]OK[/green]   вошли как {me.first_name} "
+                  f"(@{me.username}), id {me.id}")
+
+        print("\n[bold]4. Anthropic[/bold]")
+        model, err = await _probe(_probe_anthropic())
+        if err:
+            print(f"  [red]FAIL[/red] {err}")
+            problems.append("Anthropic")
+        else:
+            print(f"  [green]OK[/green]   {model.display_name} доступна")
+
+        print()
+        if problems:
+            print(f"[red bold]Не готово: {', '.join(problems)}.[/red bold] См. выше.")
+            raise typer.Exit(1)
+        print("[green bold]Всё готово.[/green bold] "
+              "Дальше: chat-parser add-chat <ссылка> --join")
+
+    _run(go())
+
+
 @app.command("add-chat")
-def add_chat(refs: list[str]) -> None:
-    """Завести чаты: @username, ссылка t.me или id."""
+def add_chat(
+    refs: list[str],
+    join: bool = typer.Option(
+        False, "--join", help="Вступить в приватный чат по инвайт-ссылке"
+    ),
+) -> None:
+    """Завести чаты: @username, ссылка t.me (в т.ч. приватная t.me/+hash) или id."""
 
     async def go():
         pool = await db.get_pool()
@@ -38,10 +189,15 @@ def add_chat(refs: list[str]) -> None:
         await client.start()
         for ref in refs:
             try:
-                cid = await collector.register_chat(client, pool, ref)
-                print(f"[green]+[/green] {ref} -> {cid}")
+                cid = await collector.register_chat(client, pool, ref, join=join)
+                title = await pool.fetchval("select title from chats where id = $1", cid)
+                print(f"[green]+[/green] {ref} -> {cid} «{title}»")
+            except collector.NeedsJoin as e:
+                print(f"[yellow]?[/yellow] {e}")
+            except collector.JoinPending as e:
+                print(f"[yellow]~[/yellow] {e}")
             except Exception as e:  # noqa: BLE001 — показать причину и идти дальше
-                print(f"[red]![/red] {ref}: {e}")
+                print(f"[red]![/red] {ref}: {type(e).__name__}: {e}")
         await client.disconnect()
 
     _run(go())

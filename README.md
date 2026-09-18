@@ -28,12 +28,13 @@ cp .env.example .env
 ### Supabase
 
 1. Создай проект на supabase.com.
-2. SQL Editor -> New query -> вставь содержимое `db/schema.sql` -> Run.
-3. Project Settings -> Database -> Connection string -> URI. Бери **Session
+2. Project Settings -> Database -> Connection string -> URI. Бери **Session
    pooler** (порт 5432) — он IPv4-совместимый; прямое подключение к БД у новых
    проектов работает только по IPv6. Transaction pooler (6543) тоже подойдёт:
    `db.py` поднимает asyncpg с `statement_cache_size=0`.
-4. Положи строку в `DATABASE_URL` в `.env`, подставив пароль.
+3. Положи строку в `DATABASE_URL` в `.env`, подставив пароль.
+4. `chat-parser init-db` — накатит схему. Идемпотентно, можно гонять повторно.
+   Альтернатива без CLI: SQL Editor -> New query -> содержимое `db/schema.sql`.
 
 Free tier (500 МБ) хватает с запасом: 300k сообщений ≈ 80 МБ. Сырой JSON
 от Telegram намеренно не сохраняется.
@@ -60,11 +61,26 @@ python -c "import secrets; print(secrets.token_hex(16))"   # -> AUTHOR_SALT
 ## Первый запуск
 
 ```bash
-chat-parser add-chat @optics_owners_chat @optika_prof   # завести чаты
+chat-parser doctor                                      # проверить всё разом
+chat-parser add-chat "https://t.me/+HASH" --join        # приватный чат
+chat-parser add-chat @optika_prof                       # публичный
 chat-parser ingest --mode backfill --limit 2000         # пробная выгрузка
 chat-parser threads                                     # склеить в диалоги
 chat-parser extract --limit 50                          # 50 тредов на пробу
 ```
+
+`doctor` проверяет конфиг, связь с Supabase, авторизацию в Telegram и доступ
+к модели, и печатает понятный отчёт. Начинай всегда с него.
+
+### Приватные чаты
+
+Ссылка вида `t.me/+HASH` — приватное приглашение. Такой чат **нельзя читать,
+не вступив в него**, поэтому нужен явный флаг `--join`: вступление это самое
+рискованное для аккаунта действие, случайно оно происходить не должно.
+Держись в пределах 5–10 вступлений в сутки.
+
+Если группа с премодерацией, `add-chat` скажет «заявка отправлена» — повтори
+команду после того, как админ одобрит.
 
 Теперь **посмотри глазами** на таблицу `signals` в Supabase Table Editor.
 Это главная проверка: сигналы осмысленные или модель льёт воду? Если плохо —
@@ -97,7 +113,9 @@ chat-parser report
 
 | Команда | Что делает |
 |---|---|
-| `add-chat @a @b` | Резолвит чаты и заводит их в БД |
+| `init-db` | Накатывает схему в Supabase |
+| `doctor` | Проверяет конфиг, БД, Telegram и доступ к модели |
+| `add-chat @a @b [--join]` | Резолвит чаты и заводит их в БД |
 | `ingest --mode backfill\|incremental` | Выгрузка истории / досинхронизация |
 | `threads` | Склейка сообщений в диалоги |
 | `extract` | Извлечение сигналов через Claude |
