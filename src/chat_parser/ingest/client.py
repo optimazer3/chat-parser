@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
@@ -8,11 +10,13 @@ from ..config import settings
 
 def build_client() -> TelegramClient:
     """Клиент под user-аккаунтом (MTProto). Bot API историю не отдаёт."""
-    session = (
-        StringSession(settings.tg_session_string)
-        if settings.tg_session_string
-        else settings.tg_session
-    )
+    if settings.tg_session_string:
+        session = StringSession(settings.tg_session_string)
+    else:
+        # data/ в репозитории не лежит (он в .gitignore), а sqlite не создаёт
+        # каталог сам — на свежем клоне это «unable to open database file».
+        Path(settings.tg_session).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        session = settings.tg_session
     client = TelegramClient(
         session,
         settings.tg_api_id,

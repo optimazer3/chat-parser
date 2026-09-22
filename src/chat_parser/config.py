@@ -1,4 +1,14 @@
+from pathlib import Path
+
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+WHERE_TO_GET = {
+    "tg_api_id": "my.telegram.org -> API development tools",
+    "tg_api_hash": "my.telegram.org -> API development tools",
+    "database_url": "Supabase -> Project Settings -> Database -> Connection string (URI, Session pooler)",
+    "author_salt": 'python -c "import secrets; print(secrets.token_hex(16))"',
+}
 
 
 class Settings(BaseSettings):
@@ -46,4 +56,24 @@ class Settings(BaseSettings):
         return self.llm_model_synth or self.llm_model
 
 
-settings = Settings()  # type: ignore[call-arg]
+def _load() -> Settings:
+    try:
+        return Settings()  # type: ignore[call-arg]
+    except ValidationError as e:
+        missing = [
+            str(err["loc"][0]) for err in e.errors() if err["type"] == "missing"
+        ]
+        if not missing:
+            raise
+        lines = ["", "Не заполнен .env — не хватает переменных:", ""]
+        for name in missing:
+            hint = WHERE_TO_GET.get(name, "")
+            lines.append(f"  {name.upper()}" + (f"  — {hint}" if hint else ""))
+        lines += ["", f"Файл .env ожидается здесь: {Path('.env').resolve()}"]
+        if not Path(".env").is_file():
+            lines.append("Его нет. Создай:  cp .env.example .env")
+        lines.append("")
+        raise SystemExit("\n".join(lines)) from None
+
+
+settings = _load()
