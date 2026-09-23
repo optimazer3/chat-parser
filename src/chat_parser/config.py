@@ -23,7 +23,9 @@ def is_placeholder_hash(value: str) -> bool:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # env_ignore_empty: строка вида «TG_API_ID=» значит «не задано», а не
+    # «пустая строка». Иначе любое пустое числовое поле роняет запуск.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_ignore_empty=True)
 
     # --- Telegram: аккаунт-сборщик (MTProto) ---
     # Необязательны: без них работает всё, кроме выгрузки из Telegram.
@@ -111,18 +113,25 @@ def _load() -> Settings:
     try:
         return Settings()  # type: ignore[call-arg]
     except ValidationError as e:
-        missing = [
-            str(err["loc"][0]) for err in e.errors() if err["type"] == "missing"
-        ]
-        if not missing:
-            raise
-        lines = ["", "Не заполнен .env — не хватает переменных:", ""]
-        for name in missing:
-            hint = WHERE_TO_GET.get(name, "")
-            lines.append(f"  {name.upper()}" + (f"  — {hint}" if hint else ""))
-        lines += ["", f"Файл .env ожидается здесь: {Path('.env').resolve()}"]
+        missing, invalid = [], []
+        for err in e.errors():
+            name = str(err["loc"][0]).upper() if err["loc"] else "?"
+            if err["type"] == "missing":
+                missing.append(name)
+            else:
+                invalid.append(f"  {name} = {err.get('input')!r} — {err['msg']}")
+        lines = [""]
+        if missing:
+            lines += ["Не заполнен .env — не хватает переменных:", ""]
+            for name in missing:
+                hint = WHERE_TO_GET.get(name.lower(), "")
+                lines.append(f"  {name}" + (f"  — {hint}" if hint else ""))
+            lines.append("")
+        if invalid:
+            lines += ["В .env неверные значения:", "", *invalid, ""]
+        lines.append(f"Файл .env ожидается здесь: {Path('.env').resolve()}")
         if not Path(".env").is_file():
-            lines.append("Его нет. Создай:  cp .env.example .env")
+            lines.append("Его нет. Создай:  copy .env.example .env  (в Linux/macOS: cp)")
         lines.append("")
         raise SystemExit("\n".join(lines)) from None
 

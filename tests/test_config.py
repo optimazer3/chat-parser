@@ -47,3 +47,23 @@ def test_extra_body_parsed():
 def test_extra_body_invalid_json_explains_itself():
     with pytest.raises(SystemExit, match="невалидный JSON"):
         _ = make(llm_extra_body="{enable_thinking: false}").llm_extra_body_dict
+
+
+def test_blank_lines_in_env_file_mean_unset(tmp_path, monkeypatch):
+    """«TG_API_ID=» в .env — это «не задано», а не падение на int('').
+
+    Регрессия: README советует оставить строки пустыми, а запуск падал.
+    """
+    for var in ("TG_API_ID", "TG_API_HASH", "EXTRACT_CONCURRENCY", "LLM_EXTRA_BODY"):
+        monkeypatch.delenv(var, raising=False)
+    env = tmp_path / ".env"
+    env.write_text(
+        "TG_API_ID=\nTG_API_HASH=\nEXTRACT_CONCURRENCY=\nLLM_EXTRA_BODY=\n"
+        "DATABASE_URL=postgresql://u:p@h/db\nAUTHOR_SALT=abc\n",
+        encoding="utf-8",
+    )
+    s = Settings(_env_file=env)
+    assert s.tg_api_id is None
+    assert not s.telegram_ready
+    assert s.extract_concurrency == 4
+    assert s.llm_extra_body_dict == {}
