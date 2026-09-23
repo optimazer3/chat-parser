@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     tg_session: str = "data/optics"
     tg_session_string: str = ""
 
+    # Прокси для Telegram (бот и сборщик), если провайдер его блокирует:
+    # socks5://127.0.0.1:10808 или http://127.0.0.1:10809. См. net.py.
+    tg_proxy: str = ""
+
     # --- Telegram: бот-панель (отдельная сущность, свой токен от BotFather) ---
     tg_bot_token: str = ""
     tg_admin_ids: str = ""  # "123456789,987654321" — кому можно командовать ботом

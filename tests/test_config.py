@@ -67,3 +67,17 @@ def test_blank_lines_in_env_file_mean_unset(tmp_path, monkeypatch):
     assert not s.telegram_ready
     assert s.extract_concurrency == 4
     assert s.llm_extra_body_dict == {}
+
+
+def test_telethon_client_gets_proxy(monkeypatch):
+    from chat_parser.config import settings
+    from chat_parser.ingest.client import build_client
+
+    monkeypatch.setattr(settings, "tg_api_id", 20481234)
+    monkeypatch.setattr(settings, "tg_api_hash", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+    monkeypatch.setattr(settings, "tg_session_string", "")
+    monkeypatch.setattr(settings, "tg_session", str(__import__("tempfile").mkdtemp()) + "/s")
+    monkeypatch.setattr(settings, "tg_proxy", "socks5://127.0.0.1:10808")
+    client = build_client()
+    assert client._proxy == {"proxy_type": "socks5", "addr": "127.0.0.1", "port": 10808,
+                             "rdns": True}

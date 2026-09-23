@@ -6,6 +6,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from ..config import settings
+from ..net import telethon_proxy
 
 
 class TelegramNotConfigured(RuntimeError):
@@ -31,6 +32,7 @@ def build_client() -> TelegramClient:
         session,
         settings.tg_api_id,
         settings.tg_api_hash,
+        proxy=telethon_proxy(settings.tg_proxy),
         connection_retries=3,
         retry_delay=2,
         timeout=20,

@@ -13,10 +13,13 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
+from aiogram.types import BotCommand, User
 
 from .. import db
 from ..config import settings
+from ..net import aiogram_proxy, network_hint
 from . import format as fmt
 from . import jobs
 from .auth import AdminOnly
@@ -77,26 +80,53 @@ async def scheduler(bot: Bot) -> None:
         await _broadcast(bot, fmt.fmt_digest(stats, new_signals, new_msgs, list(top)))
 
 
-async def run_bot() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    bot = Bot(
+def build_bot() -> Bot:
+    """Бот с прокси из TG_PROXY, если он задан."""
+    proxy = aiogram_proxy(settings.tg_proxy)
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
+    return Bot(
         token=settings.tg_bot_token,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher()
-    guard = AdminOnly(settings.admin_ids)
-    dp.message.outer_middleware(guard)
-    dp.callback_query.outer_middleware(guard)
-    dp.include_router(router)
 
-    await bot.set_my_commands(COMMANDS)
-    me = await bot.get_me()
-    log.info("бот @%s запущен, админов: %d", me.username, len(settings.admin_ids))
 
-    task = asyncio.create_task(scheduler(bot))
+async def check_bot(bot: Bot) -> User:
+    """get_me с понятными ошибками вместо трейсбека aiogram."""
     try:
+        return await bot.get_me()
+    except TelegramUnauthorizedError:
+        raise SystemExit(
+            "TG_BOT_TOKEN не подходит — Telegram его не принял. "
+            "Возьми токен заново у @BotFather (/mybots -> API Token)."
+        ) from None
+    except TelegramNetworkError as e:
+        raise SystemExit(network_hint(e.message, settings.tg_proxy)) from None
+
+
+async def run_bot() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        bot = build_bot()
+    except ValueError as e:  # неправильный TG_PROXY
+        raise SystemExit(str(e)) from None
+    task: asyncio.Task | None = None
+    try:
+        # Связь проверяем до сборки диспетчера: router — модульный синглтон,
+        # и его можно подключить только к одному диспетчеру за процесс.
+        me = await check_bot(bot)
+        dp = Dispatcher()
+        guard = AdminOnly(settings.admin_ids)
+        dp.message.outer_middleware(guard)
+        dp.callback_query.outer_middleware(guard)
+        dp.include_router(router)
+        await bot.set_my_commands(COMMANDS)
+        via = f", через прокси {settings.tg_proxy}" if settings.tg_proxy else ""
+        log.info("бот @%s запущен%s, админов: %d", me.username, via, len(settings.admin_ids))
+        task = asyncio.create_task(scheduler(bot))
         await dp.start_polling(bot)
     finally:
-        task.cancel()
+        if task is not None:
+            task.cancel()
         await db.close_pool()
         await bot.session.close()

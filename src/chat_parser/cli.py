@@ -21,10 +21,17 @@ from .ingest.client import build_client
 from .normalize import threads as threads_mod
 from .report import build_md
 
-app = typer.Typer(no_args_is_help=True, help="Мониторинг чатов рынка оптики")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Мониторинг чатов рынка оптики",
+    # По умолчанию typer печатает в трейсбеке значения переменных — туда
+    # попадают пароль от БД и токены, а трейсбеки уходят скриншотами.
+    pretty_exceptions_show_locals=False,
+)
 
 DOCTOR_TIMEOUT = 25
 LLM_TIMEOUT = 150
+BOT_REQUEST_TIMEOUT = 30
 # «Думающие» модели тратят токены на рассуждения до ответа — 200 им не
 # хватало даже на «pong».
 PING_MAX_TOKENS = 4000
@@ -180,6 +187,26 @@ async def _probe_telegram():
             await client.disconnect()
 
 
+async def _probe_bot():
+    """Связь с api.telegram.org — тем же путём, что и у бота (с прокси)."""
+    from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
+
+    from .bot.main import build_bot
+
+    bot = build_bot()
+    try:
+        return await bot.get_me(request_timeout=BOT_REQUEST_TIMEOUT)
+    except TelegramUnauthorizedError:
+        raise RuntimeError("Telegram не принял TG_BOT_TOKEN — возьми токен у @BotFather") from None
+    except TelegramNetworkError as e:
+        raise RuntimeError(
+            f"нет связи с api.telegram.org ({e.message}). Провайдер, похоже, блокирует "
+            "Telegram: включи VPN на весь компьютер или задай TG_PROXY в .env"
+        ) from None
+    finally:
+        await bot.session.close()
+
+
 class _Ping(BaseModel):
     ok: bool
     answer: str
@@ -225,11 +252,13 @@ def doctor() -> None:
             problems.append("LLM_API_KEY")
         else:
             print("  [green]OK[/green]   LLM_API_KEY задан")
-        if settings.tg_bot_token and not settings.admin_ids:
-            print("  [red]FAIL[/red] TG_BOT_TOKEN задан, а TG_ADMIN_IDS пуст — "
-                  "бот пустит кого угодно")
-            problems.append("TG_ADMIN_IDS")
+        try:
+            from .net import parse_proxy
 
+            parse_proxy(settings.tg_proxy)
+        except ValueError as e:
+            print(f"  [red]FAIL[/red] {e}")
+            problems.append("TG_PROXY")
         print("\n[bold]2. База данных[/bold]")
         print(f"  [dim]{db.safe_dsn()}[/dim]")
         res, err = await _probe(_probe_db())
@@ -282,7 +311,23 @@ def doctor() -> None:
                 print(f"  [green]OK[/green]   вошли как {me.first_name} "
                       f"(@{me.username}), id {me.id}")
 
-        print("\n[bold]4. LLM[/bold]")
+        print("\n[bold]4. Telegram-бот[/bold]")
+        if settings.tg_proxy:
+            print(f"  [dim]через прокси {settings.tg_proxy}[/dim]")
+        if not settings.tg_bot_token:
+            print("  [yellow]—[/yellow]    TG_BOT_TOKEN не задан — бот не запустится (@BotFather)")
+        else:
+            me, err = await _probe(_probe_bot(), BOT_REQUEST_TIMEOUT + 15)
+            if err:
+                print(f"  [red]FAIL[/red] {err}")
+                problems.append("бот")
+            else:
+                print(f"  [green]OK[/green]   @{me.username} на связи")
+            if not settings.admin_ids:
+                print("  [red]FAIL[/red] TG_ADMIN_IDS пуст — бот не стартует без списка админов")
+                problems.append("TG_ADMIN_IDS")
+
+        print("\n[bold]5. LLM[/bold]")
         print(f"  [dim]{settings.llm_base_url} · модель {settings.llm_model or '(не задана)'}[/dim]")
         if not settings.llm_model:
             print("  [red]FAIL[/red] LLM_MODEL не задан — посмотри: chat-parser models")
