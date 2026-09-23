@@ -179,15 +179,16 @@ async def import_file(
         )
         await conn.execute(
             """
-            insert into cursors (chat_id, oldest_id, newest_id, backfill_done, note)
-            values ($1,$2,$3,true,$4)
+            insert into cursors (chat_id, oldest_id, newest_id, backfill_done, note, last_run)
+            values ($1,$2,$3,true,$4,now())
             on conflict (chat_id) do update set
                 oldest_id = least(coalesce(cursors.oldest_id, excluded.oldest_id),
                                   excluded.oldest_id),
                 newest_id = greatest(coalesce(cursors.newest_id, excluded.newest_id),
                                      excluded.newest_id),
                 backfill_done = cursors.backfill_done or excluded.backfill_done,
-                note = excluded.note
+                note = excluded.note,
+                last_run = now()
             """,
             chat_id,
             min(ids),

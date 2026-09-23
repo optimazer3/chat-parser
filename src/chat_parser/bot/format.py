@@ -18,6 +18,23 @@ AUDIENCE_RU = {
 }
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """plural(3, "тред", "треда", "тредов") -> "треда"."""
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+
+def threads_word(n: int) -> str:
+    return f"{fmt_tokens(n)} {plural(n, 'тред', 'треда', 'тредов')}"
+
+
 def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=False)
 
@@ -126,6 +143,11 @@ def fmt_digest(stats: dict[str, Any], new_signals: int, new_msgs: int, top: list
         f"Новых сигналов: <b>{new_signals}</b>",
     ]
     ext = stats.get("extract") or {}
+    if ext.get("pending_left"):
+        lines.append(
+            f"В очереди осталось тредов: <b>{ext['pending_left']}</b> — "
+            "доразберутся в следующие ночи или сразу через /extract"
+        )
     if ext.get("drop_rate", 0) > 0.05:
         lines.append(
             f"⚠️ отбраковка цитат {ext['drop_rate']:.0%} — промпт стоит поправить"
@@ -139,3 +161,50 @@ def fmt_digest(stats: dict[str, Any], new_signals: int, new_msgs: int, top: list
             )
         lines.append("\nПодробно: /pain &lt;номер&gt; · весь отчёт: /report")
     return "\n".join(lines)
+
+
+def fmt_tokens(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def fmt_estimate(pending: int, per_thread: int | None) -> str:
+    if not pending:
+        return "Очередь пуста — разбирать нечего. Новые треды появятся после импорта."
+    text = f"В очереди <b>{threads_word(pending)}</b>."
+    if per_thread:
+        text += (
+            f"\nПо прошлому прогону ~{fmt_tokens(per_thread)} токенов на тред → "
+            f"вся очередь ≈ <b>{fmt_tokens(per_thread * pending)}</b> токенов."
+        )
+    else:
+        text += (
+            "\nОценки расхода пока нет — начни с пробы на 20 тредов, "
+            "после неё бот посчитает стоимость всей очереди."
+        )
+    return text
+
+
+def extract_choices(pending: int) -> list[tuple[str, str]]:
+    """Кнопки выбора объёма: (подпись, значение для callback)."""
+    options = [(threads_word(n), str(n)) for n in (20, 100) if pending > n]
+    if pending:
+        options.append((f"Все {fmt_tokens(pending)}", "all"))
+    return options
+
+
+def fmt_extract_progress(done: int, total: int, stats: dict[str, Any]) -> str:
+    return (
+        f"🧠 Разбираю сигналы: <b>{done}/{total}</b>\n"
+        f"сигналов {stats['signals']} · без сигналов {stats['empty']} · "
+        f"ошибок {stats['failed']}"
+    )
+
+
+def fmt_extract_summary(summary_lines: list[str]) -> str:
+    head, *rest = summary_lines
+    return "✅ <b>" + esc(head) + "</b>\n" + "\n".join(esc(x.strip()) for x in rest)
+
+
+def fmt_busy(what: str, progress: str = "") -> str:
+    tail = f" ({esc(progress)})" if progress else ""
+    return f"⏳ Сейчас идёт «{esc(what)}»{tail}. Дождись окончания — прогресс в /status."

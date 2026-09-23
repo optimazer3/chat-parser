@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 
 import asyncpg
 
@@ -55,7 +56,9 @@ def _fmt(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
-def summary_lines(stats: dict) -> list[str]:
+def summary_lines(
+    stats: dict, retry_hint: str = "chat-parser extract --retry-failed"
+) -> list[str]:
     """Человекочитаемая сводка прогона с оценкой на остаток очереди."""
     mins, secs = divmod(int(stats.get("seconds", 0)), 60)
     tok = stats.get("tokens") or {}
@@ -85,7 +88,7 @@ def summary_lines(stats: dict) -> list[str]:
     elif not left:
         lines.append("  очередь пуста")
     if stats["failed"]:
-        lines.append("  упавшие треды можно повторить: chat-parser extract --retry-failed")
+        lines.append(f"  упавшие треды можно повторить: {retry_hint}")
     return lines
 
 
@@ -93,7 +96,16 @@ def _log(line: str) -> None:
     print(line, flush=True)
 
 
-async def run(pool: asyncpg.Pool, limit: int | None = None, verbose: bool = False) -> dict:
+# (обработано, всего, текущая статистика) — для прогресса в боте
+OnProgress = Callable[[int, int, dict], Awaitable[None]]
+
+
+async def run(
+    pool: asyncpg.Pool,
+    limit: int | None = None,
+    verbose: bool = False,
+    on_progress: OnProgress | None = None,
+) -> dict:
     llm = build_llm()
     started = time.monotonic()
     rows = await pool.fetch(
@@ -113,11 +125,16 @@ async def run(pool: asyncpg.Pool, limit: int | None = None, verbose: bool = Fals
     if verbose:
         _log(f"Тредов к обработке: {total} (параллельно {settings.extract_concurrency})")
 
-    def progress(root_id: int, note: str) -> None:
+    async def progress(root_id: int, note: str) -> None:
         nonlocal done
         done += 1
         if verbose:
             _log(f"  [{done}/{total}] тред {root_id}: {note}")
+        if on_progress is not None:
+            try:
+                await on_progress(done, total, stats)
+            except Exception:  # noqa: BLE001 — сбой отрисовки прогресса не валит разбор
+                pass
 
     async def handle(row: asyncpg.Record) -> None:
         chat_id, root_id = row["chat_id"], row["root_id"]
@@ -130,7 +147,7 @@ async def run(pool: asyncpg.Pool, limit: int | None = None, verbose: bool = Fals
                     chat_id,
                     root_id,
                 )
-                progress(root_id, "пустой тред, пропущен")
+                await progress(root_id, "пустой тред, пропущен")
                 return
             try:
                 extraction = await extract_one(llm, text)
@@ -141,7 +158,7 @@ async def run(pool: asyncpg.Pool, limit: int | None = None, verbose: bool = Fals
                     chat_id,
                     root_id,
                 )
-                progress(root_id, f"ОШИБКА {type(e).__name__}: {e}")
+                await progress(root_id, f"ОШИБКА {type(e).__name__}: {e}")
                 return
 
             signals, dropped = validate(extraction, text, set(ids))
@@ -191,7 +208,7 @@ async def run(pool: asyncpg.Pool, limit: int | None = None, verbose: bool = Fals
             note = f"{len(signals)} сигн." if signals else "сигналов нет"
             if dropped:
                 note += f", отбраковано {dropped}"
-            progress(root_id, note)
+            await progress(root_id, note)
 
     await asyncio.gather(*(handle(r) for r in rows))
     judged = stats["signals"] + stats["dropped"]

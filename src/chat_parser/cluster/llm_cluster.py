@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -208,14 +209,20 @@ async def run(pool: asyncpg.Pool) -> dict:
     return out
 
 
-async def make_cards(pool: asyncpg.Pool, top: int = 15) -> int:
+async def make_cards(
+    pool: asyncpg.Pool,
+    top: int = 15,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+) -> int:
     """Развёрнутая карточка для топовых кластеров."""
     llm = build_llm(settings.synth_model)
     clusters = await pool.fetch(
         "select id, audience, label, statement from clusters order by score desc limit $1", top
     )
     done = 0
-    for c in clusters:
+    for i, c in enumerate(clusters, 1):
+        if on_progress is not None:
+            await on_progress(i, len(clusters))
         signals = await pool.fetch(
             """
             select type, summary, evidence_quote, context, intensity

@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     extract_max_tokens_retry: int = 24000
     cluster_batch: int = 120
     daily_run_hour_utc: int = 6
+    # Защита от дорогих прогонов из бота: если в очереди больше тредов,
+    # /run сначала спросит подтверждение с оценкой токенов.
+    bot_confirm_threshold: int = 50
+    # Потолок тредов на разбор в ночном прогоне по расписанию. Остаток
+    # доразберётся в следующие ночи или вручную через /extract.
+    auto_extract_limit: int = 200
 
     # --- Пороги нормализации ---
     thread_gap_minutes: int = 10

@@ -25,15 +25,17 @@ from .handlers import router
 log = logging.getLogger("chat_parser.bot")
 
 COMMANDS = [
-    BotCommand(command="status", description="что собрано и что в очереди"),
+    BotCommand(command="status", description="что собрано, что в очереди, что идёт"),
+    BotCommand(command="extract", description="разобрать сигналы (с оценкой токенов)"),
+    BotCommand(command="cluster", description="сгруппировать сигналы в боли"),
     BotCommand(command="top", description="топ болей"),
     BotCommand(command="pain", description="карточка боли по номеру"),
     BotCommand(command="signals", description="последние сигналы"),
-    BotCommand(command="run", description="прогнать цикл сейчас"),
     BotCommand(command="report", description="отчёт файлом"),
+    BotCommand(command="redo", description="переразобрать после правки промпта"),
+    BotCommand(command="retry", description="повторить упавшие треды"),
+    BotCommand(command="run", description="полный цикл одной кнопкой"),
     BotCommand(command="chats", description="список чатов"),
-    BotCommand(command="addchat", description="добавить чат"),
-    BotCommand(command="models", description="модели на шлюзе"),
     BotCommand(command="help", description="справка"),
 ]
 
@@ -47,13 +49,19 @@ async def _broadcast(bot: Bot, text: str) -> None:
             log.warning("не доставлено %s: %s", admin, e)
 
 
+async def _noop_progress(_: str) -> None:
+    return None
+
+
 async def scheduler(bot: Bot) -> None:
     """Суточный прогон и дайджест в заданный час UTC."""
     while True:
         await asyncio.sleep(jobs.seconds_until(settings.daily_run_hour_utc))
         since = await jobs.last_pipeline_at()
         try:
-            stats = await jobs.run_pipeline(lambda _: asyncio.sleep(0))
+            # Потолок: если кто-то залил большой экспорт, ночной прогон не
+            # сожжёт всю очередь разом — остаток разберётся в следующие ночи.
+            stats = await jobs.run_pipeline(_noop_progress, settings.auto_extract_limit)
         except jobs.Busy:
             log.info("плановый прогон пропущен: занято")
             continue
