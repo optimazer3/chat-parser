@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 
 import asyncpg
 
+from .. import usage
 from ..config import settings
 from ..llm import LLM, LLMError, TokenBudgetExhausted, build_llm
 from ..normalize.chunker import load_thread_text
@@ -210,7 +211,16 @@ async def run(
                 note += f", отбраковано {dropped}"
             await progress(root_id, note)
 
-    await asyncio.gather(*(handle(r) for r in rows))
+    finished = False
+    try:
+        await asyncio.gather(*(handle(r) for r in rows))
+        finished = True
+    finally:
+        # И при остановке кнопкой: токены до остановки тоже потрачены.
+        await usage.record(
+            pool, "extract", llm, threads=done,
+            seconds=time.monotonic() - started, cancelled=not finished,
+        )
     judged = stats["signals"] + stats["dropped"]
     stats["drop_rate"] = round(stats["dropped"] / judged, 3) if judged else 0.0
     stats["seconds"] = round(time.monotonic() - started)

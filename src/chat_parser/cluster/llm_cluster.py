@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ import asyncpg
 
 from ..analyze.prompts import SYSTEM_CARD, SYSTEM_CLUSTER, SYSTEM_MERGE
 from ..analyze.schema import Card, Clustering, Merging
+from .. import usage
 from ..config import settings
 from ..llm import LLM, LLMError, build_llm
 
@@ -201,11 +203,17 @@ async def run(pool: asyncpg.Pool) -> dict:
         )
     ]
     out: dict[str, int | str] = {}
-    for a in audiences:
-        try:
-            out[a] = await _cluster_audience(llm, pool, a)
-        except LLMError as e:
-            out[a] = f"ошибка: {e}"
+    started, finished = time.monotonic(), False
+    try:
+        for a in audiences:
+            try:
+                out[a] = await _cluster_audience(llm, pool, a)
+            except LLMError as e:
+                out[a] = f"ошибка: {e}"
+        finished = True
+    finally:
+        await usage.record(pool, "cluster", llm, seconds=time.monotonic() - started,
+                           cancelled=not finished)
     return out
 
 
@@ -219,37 +227,43 @@ async def make_cards(
     clusters = await pool.fetch(
         "select id, audience, label, statement from clusters order by score desc limit $1", top
     )
-    done = 0
-    for i, c in enumerate(clusters, 1):
-        if on_progress is not None:
-            await on_progress(i, len(clusters))
-        signals = await pool.fetch(
-            """
-            select type, summary, evidence_quote, context, intensity
-              from signals where cluster_id = $1 order by intensity desc limit 40
-            """,
-            c["id"],
-        )
-        payload = "\n".join(
-            f"- [{s['type']}, острота {s['intensity']}] {s['summary']}\n"
-            f"  цитата: «{s['evidence_quote']}»\n  контекст: {s['context']}"
-            for s in signals
-        )
-        try:
-            card = await llm.structured(
-                SYSTEM_CARD,
-                f"Аудитория: {c['audience']}\nКластер: {c['label']}\n"
-                f"Формулировка: {c['statement']}\n\nСигналы:\n{payload}",
-                Card,
-                max_tokens=8000,
+    started, finished = time.monotonic(), False
+    try:
+        done = 0
+        for i, c in enumerate(clusters, 1):
+            if on_progress is not None:
+                await on_progress(i, len(clusters))
+            signals = await pool.fetch(
+                """
+                select type, summary, evidence_quote, context, intensity
+                  from signals where cluster_id = $1 order by intensity desc limit 40
+                """,
+                c["id"],
             )
-        except LLMError as e:
-            print(f"  ! карточка {c['id']}: {e}")
-            continue
-        await pool.execute(
-            "update clusters set card = $2, updated_at = now() where id = $1",
-            c["id"],
-            json.dumps(card.model_dump(), ensure_ascii=False),
-        )
-        done += 1
+            payload = "\n".join(
+                f"- [{s['type']}, острота {s['intensity']}] {s['summary']}\n"
+                f"  цитата: «{s['evidence_quote']}»\n  контекст: {s['context']}"
+                for s in signals
+            )
+            try:
+                card = await llm.structured(
+                    SYSTEM_CARD,
+                    f"Аудитория: {c['audience']}\nКластер: {c['label']}\n"
+                    f"Формулировка: {c['statement']}\n\nСигналы:\n{payload}",
+                    Card,
+                    max_tokens=8000,
+                )
+            except LLMError as e:
+                print(f"  ! карточка {c['id']}: {e}")
+                continue
+            await pool.execute(
+                "update clusters set card = $2, updated_at = now() where id = $1",
+                c["id"],
+                json.dumps(card.model_dump(), ensure_ascii=False),
+            )
+            done += 1
+        finished = True
+    finally:
+        await usage.record(pool, "cards", llm, seconds=time.monotonic() - started,
+                           cancelled=not finished)
     return done

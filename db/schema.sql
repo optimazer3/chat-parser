@@ -114,6 +114,24 @@ create table if not exists runs (
     error       text
 );
 
+-- ------------------------------------------------------------ расход модели
+-- Одна строка на операцию (разбор, группировка, карточки). Пользователю бота
+-- не показывается — только по скрытой команде /usage.
+create table if not exists llm_usage (
+    id                bigserial primary key,
+    ts                timestamptz not null default now(),
+    stage             text   not null,             -- extract | cluster | cards
+    model             text,
+    calls             int    not null default 0,
+    prompt_tokens     bigint not null default 0,
+    completion_tokens bigint not null default 0,
+    reasoning_tokens  bigint not null default 0,   -- входят в completion_tokens
+    threads           int    not null default 0,   -- для extract: обработано обсуждений
+    seconds           int    not null default 0,
+    cancelled         boolean not null default false
+);
+create index if not exists llm_usage_ts_idx on llm_usage (ts);
+
 -- ------------------------------------------------------------ защита данных
 -- Supabase публикует схему public через REST API (Data API). Без RLS любой,
 -- у кого есть anon-ключ проекта (он считается публичным), мог бы читать
@@ -128,3 +146,4 @@ alter table threads  enable row level security;
 alter table signals  enable row level security;
 alter table clusters enable row level security;
 alter table runs     enable row level security;
+alter table llm_usage enable row level security;

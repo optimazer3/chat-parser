@@ -28,15 +28,15 @@ from .handlers import router
 log = logging.getLogger("chat_parser.bot")
 
 COMMANDS = [
-    BotCommand(command="status", description="что собрано, что в очереди, что идёт"),
-    BotCommand(command="extract", description="разобрать сигналы (с оценкой токенов)"),
-    BotCommand(command="cluster", description="сгруппировать сигналы в боли"),
+    BotCommand(command="status", description="что загружено и что выполняется"),
+    BotCommand(command="extract", description="разобрать обсуждения"),
+    BotCommand(command="cluster", description="пересчитать боли"),
     BotCommand(command="top", description="топ болей"),
     BotCommand(command="pain", description="карточка боли по номеру"),
     BotCommand(command="signals", description="последние сигналы"),
     BotCommand(command="report", description="отчёт файлом"),
-    BotCommand(command="redo", description="переразобрать после правки промпта"),
-    BotCommand(command="retry", description="повторить упавшие треды"),
+    BotCommand(command="redo", description="разобрать всё заново"),
+    BotCommand(command="retry", description="повторить неудачные обсуждения"),
     BotCommand(command="run", description="полный цикл одной кнопкой"),
     BotCommand(command="chats", description="список чатов"),
     BotCommand(command="help", description="справка"),
@@ -64,7 +64,12 @@ async def scheduler(bot: Bot) -> None:
         try:
             # Потолок: если кто-то залил большой экспорт, ночной прогон не
             # сожжёт всю очередь разом — остаток разберётся в следующие ночи.
-            stats = await jobs.run_pipeline(_noop_progress, settings.auto_extract_limit)
+            stats = await jobs.run_job(
+                jobs.run_pipeline(_noop_progress, settings.auto_extract_limit)
+            )
+        except jobs.Cancelled:
+            await _broadcast(bot, "⏹ Ночной прогон остановлен. Продолжу завтра в то же время.")
+            continue
         except jobs.Busy:
             log.info("плановый прогон пропущен: занято")
             continue
@@ -115,6 +120,9 @@ async def run_bot() -> None:
         # Связь проверяем до сборки диспетчера: router — модульный синглтон,
         # и его можно подключить только к одному диспетчеру за процесс.
         me = await check_bot(bot)
+        # Схема идемпотентна: так новые таблицы появляются после обновления
+        # кода без ручного init-db.
+        await db.apply_schema()
         dp = Dispatcher()
         guard = AdminOnly(settings.admin_ids)
         dp.message.outer_middleware(guard)

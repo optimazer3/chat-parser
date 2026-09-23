@@ -8,7 +8,9 @@ import asyncpg
 
 from .config import settings
 
-EXPECTED_TABLES = ["chats", "messages", "cursors", "threads", "signals", "clusters", "runs"]
+EXPECTED_TABLES = [
+    "chats", "messages", "cursors", "threads", "signals", "clusters", "runs", "llm_usage",
+]
 
 _pool: asyncpg.Pool | None = None
 

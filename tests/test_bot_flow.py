@@ -106,6 +106,7 @@ async def harness(monkeypatch, tmp_path):
             super().__init__()
             self.mid = 1000
             self.sent: list[str] = []
+            self.log: list[str] = []
             self.documents = 0
 
         async def close(self):
@@ -135,6 +136,7 @@ async def harness(monkeypatch, tmp_path):
                         f"[{b.callback_data}]" for row in rm.inline_keyboard for b in row
                     )
                 self.sent.append(text)
+                self.log.append(text)
                 if name == "SendMessage":
                     self.mid += 1
                     return self._msg(bot, self.mid, method.text)
@@ -201,57 +203,126 @@ async def harness(monkeypatch, tmp_path):
     h.say, h.press, h.send_export = say, press, send_export
     yield h
     await db.close_pool()
+    # router — модульный синглтон, aiogram разрешает подключить его к одному
+    # диспетчеру. В проде бот стартует раз за процесс, в тестах — много раз.
+    router._parent_router = None
 
 
 async def test_full_flow_through_bot(harness, monkeypatch):
-    h = harness
+    from chat_parser.config import settings
 
-    assert await h.say("/status", frm=999) == ""  # чужих молча игнорируем
+    h = harness
+    everything = []  # всё, что бот сказал в обычном сценарии
+
+    async def say(text, frm=ADMIN):
+        out = await h.say(text, frm)
+        everything.append(out)
+        return out
+
+    async def press(data):
+        out = await h.press(data)
+        everything.append(out)
+        return out
+
+    assert await say("/status", frm=999) == ""  # чужих молча игнорируем
 
     out = await h.send_export()
-    assert "диалогов собрано: 3" in out
-    assert "В очереди <b>3 треда</b>" in out and "[ex:all]" in out
-    assert "Оценки расхода пока нет" in out
+    everything.append(out)
+    assert "Обсуждений в чате: 3" in out
+    assert "Ждут разбора: <b>3 обсуждения</b>" in out
+    assert "[ex:all]" in out and "[cancel]" in out  # меню можно закрыть
+    assert "после первого разбора" in out
 
-    out = await h.press("ex:all")
+    out = await press("ex:all")
     n_signals = await h.pool.fetchval("select count(*) from signals")
     assert n_signals > 0
-    assert f"сигналов: {n_signals}," in out
-    assert "очередь пуста" in out
-    assert "[cl]" in out
+    assert f"Найдено сигналов: <b>{n_signals}</b>" in out
+    assert "[stop:" in out  # пока шёл разбор, под прогрессом была кнопка ⏹
+    assert "Разобрано всё." in out and "[cl]" in out
 
-    out = await h.press("cl")
-    assert "Болей: <b>1</b>" in out
+    out = await press("cl")
+    assert "Болей найдено: <b>1</b>" in out
     assert "Нехватка оборудования" in out
 
-    out = await h.say("📊 Статус")
+    out = await say("📊 Статус")
     assert f"Сигналов: <b>{n_signals}</b>" in out
-    assert "ещё не синхронизирован" not in out  # импорт ставит время обновления
+    assert "ещё не загружен" not in out
 
     cid = await h.pool.fetchval("select id from clusters")
-    out = await h.say(f"/pain {cid}")
-    assert "возят прибор" in out
+    top = await say("🔝 Топ болей")
+    assert f"/pain_{cid}" in top and "говорят 4 человека в 1 чате" in top
+    assert "возят прибор" in await say(f"/pain_{cid}")  # нажимаемая ссылка из топа
+    assert "возят прибор" in await say(f"/pain {cid}")   # и набранная руками
+    assert "номера меняются" in await say("/pain_999999")
 
     before = h.session.documents
-    await h.say("📄 Отчёт")
+    await say("📄 Отчёт")
     assert h.session.documents == before + 1
 
-    out = await h.say("/redo")
+    out = await say("/redo")
     assert "[redo:yes]" in out
-    out = await h.press("redo:yes")
-    assert "Вернул в очередь 3 треда" in out
-    assert "По прошлому прогону" in out  # оценка появилась после пробы
+    out = await press("redo:yes")
+    assert "Вернул в очередь: 3 обсуждения" in out
+    assert "Все сразу — это" in out  # после первого разбора есть оценка времени
 
-    assert "Упавших тредов нет" in await h.say("/retry")
-    assert "выгрузка выключена" in await h.say("/addchat @x")
+    assert "Неудачных обсуждений нет" in await say("/retry")
+    assert "выгрузка выключена" in await say("/addchat @x")
+
+    # пользователю токены не показываем нигде в обычном сценарии
+    assert not any("токен" in text for text in everything)
+
+    # а скрытая статистика их знает — и по разбору, и по пересчёту болей
+    monkeypatch.setattr(settings, "llm_price_in", 0.8)
+    monkeypatch.setattr(settings, "llm_price_out", 3.2)
+    out = await h.say("/usage")
+    assert "≈" in out  # со стоимостью: суммы из Postgres приходят Decimal
+    assert "токенов" in out and "на одно обсуждение" in out and "на один пересчёт болей" in out
+    stages = {r["stage"] for r in await h.pool.fetch("select stage from llm_usage")}
+    assert stages == {"extract", "cluster", "cards"}
 
     # второй тяжёлый процесс не стартует, пока идёт первый
-    async with h.jobs.exclusive("разбор сигналов"):
-        assert "Сейчас идёт «разбор сигналов»" in await h.press("ex:all")
+    async with h.jobs.exclusive("разбор"):
+        assert "Сейчас идёт разбор" in await h.press("ex:all")
 
     # большая очередь -> /run сначала спрашивает
-    from chat_parser.config import settings
     monkeypatch.setattr(settings, "bot_confirm_threshold", 1)
     out = await h.say("/run")
-    assert "[run:all]" in out and "[run:20]" in out
+    assert "[run:all]" in out and "[run:20]" in out and "[cancel]" in out
     assert await h.pool.fetchval("select count(*) from threads where status='pending'") == 3
+
+
+async def test_stop_button_during_extract(harness, monkeypatch):
+    """Нажали «Разобрать» случайно — останавливаем, уже сделанное остаётся."""
+    import asyncio
+
+    from chat_parser.llm import LLM
+
+    h = harness
+    await h.send_export()
+
+    real = LLM.structured
+    gate = asyncio.Event()
+
+    async def slow(self, *a, **kw):
+        await gate.wait()  # модель «думает», пока мы не нажмём стоп
+        return await real(self, *a, **kw)
+
+    monkeypatch.setattr(LLM, "structured", slow)
+    run = asyncio.create_task(h.press("ex:all"))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if h.jobs.is_running():
+            break
+    job = h.jobs.current()
+    assert job is not None
+
+    out_stop = await h.press(f"stop:{job['id']}")
+    await asyncio.wait_for(run, 5)
+    assert not h.jobs.is_running()
+    assert "Остановлено" in "\n".join(h.session.log)
+    # ничего не разобрано — все обсуждения по-прежнему ждут
+    assert await h.pool.fetchval("select count(*) from threads where status='pending'") == 3
+    assert await h.pool.fetchval("select count(*) from signals") == 0
+    # старая кнопка ⏹ после завершения ничего не ломает
+    await h.press(f"stop:{job['id']}")
+    assert out_stop == "" or "Останавливаю" not in out_stop

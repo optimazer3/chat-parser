@@ -1,17 +1,20 @@
 """Команды и кнопки бота.
 
 Всё, что делается из консоли, доступно отсюда. Дорогие операции (разбор
-сигналов LLM'ом) никогда не запускаются на всю очередь без явного выбора:
-бот показывает размер очереди и оценку токенов и спрашивает, сколько брать.
+сигналов моделью) никогда не запускаются на всю очередь без явного выбора,
+а любую долгую операцию можно остановить кнопкой ⏹. Расход токенов
+пользователю не показывается — только по скрытой команде /usage.
 """
 
 from __future__ import annotations
 
+import re
 import tempfile
 import time
 import uuid
 from pathlib import Path
 
+import asyncpg
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -25,8 +28,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from .. import db
-from ..analyze import extract as extract_mod
+from .. import db, usage
 from ..config import settings
 from ..ingest import collector
 from ..ingest.client import build_client
@@ -56,28 +58,51 @@ MAIN_KB = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
-HELP = """<b>Мониторинг чатов рынка оптики</b>
+HELP = """👋 <b>Я нахожу боли и потребности рынка оптики</b>
 
-<b>Как пользоваться</b>
-1. Пришли сюда файлом <code>result.json</code> — экспорт чата из Telegram Desktop
-   (⋮ → Экспорт истории чата → формат JSON).
-2. Бот зальёт историю и предложит разобрать сигналы. Начни с 20 тредов —
-   после пробы он посчитает, сколько токенов уйдёт на всё.
-3. 🧩 Пересчитать боли — сгруппировать сигналы и написать карточки.
-4. 🔝 Топ болей, /pain &lt;номер&gt;, 📄 Отчёт — смотреть результат.
+Читаю переписку в чатах владельцев оптик, продавцов, врачей и покупателей
+и выписываю, на что люди жалуются, что ищут и каких решений им не хватает.
+Потом собираю это в список «болей» — от самых частых и острых к редким.
 
-<b>Команды</b>
-/status — что собрано, что в очереди, что сейчас выполняется
-/extract [N] — разобрать N тредов (без числа — меню с оценкой)
-/cluster — сгруппировать сигналы в боли и написать карточки
-/top [N] — топ болей
-/pain &lt;номер&gt; — карточка боли
-/signals [N] — последние сигналы
-/report — отчёт файлом
-/redo — переразобрать уже разобранное (после правки промпта)
-/retry — повторить треды, упавшие с ошибкой
-/run — полный цикл одной кнопкой
-/chats, /addchat, /models — чаты и модели
+<b>Как это работает</b>
+1️⃣ Ты присылаешь мне историю чата — файлом.
+2️⃣ Я делю переписку на <b>обсуждения</b>: вопрос и ответы на него.
+3️⃣ Нейросеть читает каждое обсуждение и выписывает <b>сигналы</b> — жалобы,
+запросы, вопросы, обходные пути. Каждый сигнал подтверждён дословной
+цитатой: если цитаты в переписке нет, сигнал выбрасывается.
+4️⃣ Похожие сигналы я собираю в <b>боли</b> и сортирую: сколько разных людей об
+этом говорят, в скольких чатах, насколько остро.
+
+<b>С чего начать</b>
+1. В Telegram Desktop на компьютере открой нужный чат → ⋮ справа вверху →
+   «Экспорт истории чата».
+2. Формат — <b>JSON</b> (не HTML!). Фото и видео сними — нужен только текст.
+3. Пришли мне получившийся файл <code>result.json</code>.
+4. Я спрошу, сколько обсуждений разобрать. Для начала выбери <b>20</b> —
+   это быстро и покажет, как всё работает.
+5. Нажми 🧩 <b>Пересчитать боли</b>, затем 🔝 <b>Топ болей</b>.
+
+<b>Кнопки внизу</b>
+📊 <b>Статус</b> — что загружено, сколько ждёт разбора, что выполняется
+🧠 <b>Разобрать</b> — отдать обсуждения нейросети (спрошу, сколько)
+🧩 <b>Пересчитать боли</b> — собрать сигналы в боли и описать каждую
+🔝 <b>Топ болей</b> — главные боли по группам людей
+📄 <b>Отчёт</b> — всё одним файлом
+❓ <b>Помощь</b> — это сообщение
+
+<b>Полезно знать</b>
+• Любую долгую операцию можно остановить кнопкой ⏹ — сделанное сохранится.
+• Меню можно закрыть кнопкой «Отмена» — ничего не запустится.
+• Раз в сутки я сам проверяю новые данные и присылаю сводку.
+• В топе рядом с каждой болью есть ссылка /pain_… — нажми, пришлю
+  подробности: кто страдает, как выкручиваются, цитаты, идеи решений.
+
+<b>Ещё команды</b>
+/signals — последние найденные сигналы
+/retry — повторить обсуждения, которые не получилось разобрать
+/redo — разобрать всё заново (после изменения настроек разбора)
+/run — всё за один раз: разбор, боли и отчёт
+/chats — какие чаты загружены
 """
 
 # Токен -> ссылка: callback_data ограничен 64 байтами, ссылку туда не засунуть.
@@ -87,31 +112,50 @@ _pending_joins: dict[str, str] = {}
 class LiveMessage:
     """Сообщение-прогресс, которое правится не чаще раза в interval секунд.
 
-    Telegram ограничивает частоту правок: обновлять на каждом треде — быстрый
-    путь к 429 и к тому, что прогресс вообще перестанет показываться.
+    Telegram ограничивает частоту правок: обновлять на каждом обсуждении —
+    быстрый путь к 429. Кнопка ⏹ держится под сообщением, пока идёт работа
+    (правка без reply_markup её бы сняла), и убирается в финале.
     """
 
-    def __init__(self, message: Message, interval: float = 3.0) -> None:
+    def __init__(
+        self, message: Message, markup: InlineKeyboardMarkup | None = None,
+        interval: float = 3.0,
+    ) -> None:
         self.message = message
+        self.markup = markup
         self.interval = interval
         self._last = 0.0
         self._shown = message.text or ""
 
-    async def set(self, text: str, force: bool = False) -> None:
-        if text == self._shown:
+    async def set(self, text: str, force: bool = False, final: bool = False) -> None:
+        force = force or final
+        if text == self._shown and not final:
             return
         now = time.monotonic()
         if not force and now - self._last < self.interval:
             return
         try:
-            await self.message.edit_text(text)
+            await self.message.edit_text(text, reply_markup=None if final else self.markup)
         except TelegramAPIError:
             # Итог терять нельзя: если правка не прошла, шлём отдельным сообщением.
-            if force:
+            if final:
                 await self.message.answer(text)
             return
         self._shown = text
         self._last = now
+
+
+def _stop_kb(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop:{job_id}")]]
+    )
+
+
+async def _start_live(message: Message, text: str) -> tuple[str, LiveMessage]:
+    """Сообщение с прогрессом и кнопкой ⏹ для новой операции."""
+    job_id = jobs.new_job_id()
+    kb = _stop_kb(job_id)
+    return job_id, LiveMessage(await message.answer(text, reply_markup=kb), markup=kb)
 
 
 def _kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -174,11 +218,14 @@ async def cmd_status(message: Message) -> None:
     text = fmt.fmt_status(list(chats), pending, await jobs.last_pipeline_at())
     text += f"\nСигналов: <b>{counts['s']}</b> · болей: <b>{counts['c']}</b>"
     if counts["f"]:
-        text += f" · упавших тредов: {counts['f']} (/retry)"
+        text += f" · не разобралось: {counts['f']} (/retry)"
     job = jobs.current()
     if job:
         progress = f": {fmt.esc(job['progress'])}" if job["progress"] else ""
-        text += f"\n\n⏳ Сейчас идёт «{fmt.esc(job['name'])}»{progress}"
+        text += f"\n\n⏳ Сейчас идёт {fmt.esc(job['name'])}{progress}"
+        # Кнопка и здесь: у ночного прогона нет своего сообщения с прогрессом.
+        await _reply_long(message, text, reply_markup=_stop_kb(job["id"]))
+        return
     await _reply_long(message, text)
 
 
@@ -187,39 +234,46 @@ async def cmd_status(message: Message) -> None:
 
 async def _extract_menu(message: Message, prefix: str = "") -> None:
     pending = await jobs.queue_size()
-    text = prefix + fmt.fmt_estimate(pending, await jobs.tokens_per_thread())
+    text = prefix + fmt.fmt_estimate(pending, await jobs.seconds_per_thread())
     choices = fmt.extract_choices(pending)
     if not choices:
         await message.answer(text)
         return
     await message.answer(
         text + "\n\nСколько разобрать?",
-        reply_markup=_kb([(label, f"ex:{value}") for label, value in choices]),
+        reply_markup=_kb(
+            [(label, f"ex:{value}") for label, value in choices], [("Отмена", "cancel")]
+        ),
     )
 
 
 async def _do_extract(message: Message, limit: int | None) -> None:
-    live = LiveMessage(await message.answer("🧠 Запускаю разбор…"))
+    job_id, live = await _start_live(message, "🧠 Запускаю разбор…")
+    seen = {"done": 0, "signals": 0}
+
+    async def progress(done: int, total: int, st: dict) -> None:
+        seen.update(done=done, signals=st["signals"])
+        await live.set(fmt.fmt_extract_progress(done, total, st))
+
     try:
-        stats = await jobs.run_extract(
-            lambda done, total, st: live.set(fmt.fmt_extract_progress(done, total, st)),
-            limit,
-        )
+        stats = await jobs.run_job(jobs.run_extract(progress, limit, job_id))
+    except jobs.Cancelled:
+        await live.set(fmt.fmt_stopped("разбор", seen), final=True)
+        return
     except jobs.Busy as e:
-        await live.set(_busy(e), force=True)
+        await live.set(_busy(e), final=True)
         return
     except Exception as e:  # noqa: BLE001 — показать причину, не ронять бота
-        await live.set(f"❌ Разбор упал: {type(e).__name__}: {fmt.esc(e)}", force=True)
+        await live.set(f"❌ Разбор не удался: {type(e).__name__}: {fmt.esc(e)}", final=True)
         return
 
-    lines = extract_mod.summary_lines(stats, retry_hint="/retry")
-    await live.set(fmt.fmt_extract_summary(lines), force=True)
+    await live.set(fmt.fmt_extract_result(stats), final=True)
     nxt = []
     if stats.get("pending_left"):
-        nxt.append(("🧠 Ещё 20", "ex:20"))
+        nxt.append(("🧠 Разобрать ещё 20", "ex:20"))
     nxt.append(("🧩 Пересчитать боли", "cl"))
-    retry = [("🔁 Повторить упавшие", "retry")] if stats["failed"] else []
-    await message.answer("Что дальше?", reply_markup=_kb(nxt, retry))
+    retry = [("🔁 Повторить неудачные", "retry")] if stats["failed"] else []
+    await message.answer("Что дальше?", reply_markup=_kb(nxt, retry, [("Отмена", "cancel")]))
 
 
 @router.message(Command("extract"))
@@ -254,12 +308,12 @@ async def cmd_redo(message: Message) -> None:
         "select count(*) from threads where status in ('extracted', 'failed')"
     )
     if not n:
-        await message.answer("Переразбирать нечего: разобранных тредов нет.")
+        await message.answer("Разбирать заново нечего: ещё ничего не разобрано.")
         return
     await message.answer(
-        f"Вернуть в очередь <b>{n}</b> уже разобранных тредов?\n"
-        "Их сигналы перезапишутся при следующем разборе — дублей не будет. "
-        "Нужно после правки промпта.",
+        f"Разобрать заново <b>{fmt.discussions(n)}</b>?\n"
+        "Они вернутся в очередь, а их сигналы перезапишутся при следующем разборе — "
+        "дублей не будет. Нужно, если поменялись настройки разбора.",
         reply_markup=_kb([(f"Да, вернуть {n}", "redo:yes"), ("Отмена", "cancel")]),
     )
 
@@ -271,10 +325,12 @@ async def _reset_and_menu(message: Message, kind: str) -> None:
         await message.answer(_busy(e))
         return
     if not n:
-        await message.answer("Упавших тредов нет." if kind == "failed" else "Возвращать нечего.")
+        await message.answer(
+            "Неудачных обсуждений нет — всё разобралось." if kind == "failed"
+            else "Возвращать нечего."
+        )
         return
-    what = "упавших " if kind == "failed" else ""
-    await _extract_menu(message, prefix=f"Вернул в очередь {what}{fmt.threads_word(n)}.\n")
+    await _extract_menu(message, prefix=f"Вернул в очередь: {fmt.discussions(n)}.\n")
 
 
 @router.callback_query(F.data == "redo:yes")
@@ -296,6 +352,17 @@ async def cb_retry(call: CallbackQuery) -> None:
     await _drop_markup(call)
     if call.message is not None:
         await _reset_and_menu(call.message, "failed")
+
+
+@router.callback_query(F.data.startswith("stop:"))
+async def cb_stop(call: CallbackQuery) -> None:
+    what = jobs.cancel(call.data.split(":", 1)[1])
+    if what is None:
+        await call.answer("Эта операция уже завершилась")
+        await _drop_markup(call)
+        return
+    # Итоговое сообщение напишет обработчик, который ждал операцию.
+    await call.answer("Останавливаю…")
 
 
 @router.callback_query(F.data == "cancel")
@@ -320,26 +387,29 @@ async def _send_top(message: Message, limit: int = 10) -> None:
 
 
 async def _do_cluster(message: Message) -> None:
-    live = LiveMessage(await message.answer("🧩 Запускаю группировку…"))
+    job_id, live = await _start_live(message, "🧩 Запускаю пересчёт болей…")
     try:
-        stats = await jobs.run_cluster(lambda text: live.set(text))
+        stats = await jobs.run_job(jobs.run_cluster(lambda text: live.set(text), job_id))
+    except jobs.Cancelled:
+        await live.set(fmt.fmt_stopped("пересчёт болей"), final=True)
+        return
     except jobs.Busy as e:
-        await live.set(_busy(e), force=True)
+        await live.set(_busy(e), final=True)
         return
     except Exception as e:  # noqa: BLE001
-        await live.set(f"❌ Группировка упала: {type(e).__name__}: {fmt.esc(e)}", force=True)
+        await live.set(f"❌ Пересчёт не удался: {type(e).__name__}: {fmt.esc(e)}", final=True)
         return
     if not stats["clusters_total"]:
         await live.set(
-            "Группировать пока нечего: нужно хотя бы 4 сигнала одной аудитории "
-            "и чтобы они повторялись. Разбери больше тредов — 🧠 Разобрать.",
-            force=True,
+            "Собирать пока нечего: нужно хотя бы 4 сигнала от одной группы людей, "
+            "и чтобы они повторялись. Разбери больше обсуждений — 🧠 Разобрать.",
+            final=True,
         )
         return
     await live.set(
-        f"✅ Болей: <b>{stats['clusters_total']}</b>, карточек: {stats['cards']}. "
+        f"✅ Болей найдено: <b>{stats['clusters_total']}</b>, описаний: {stats['cards']}. "
         "Отчёт обновлён.",
-        force=True,
+        final=True,
     )
     await _send_top(message)
 
@@ -368,16 +438,23 @@ async def cmd_top(message: Message, command: CommandObject | None = None) -> Non
     await _send_top(message, limit)
 
 
+@router.message(Command(re.compile(r"pain_(\d+)")))
 @router.message(Command("pain"))
 async def cmd_pain(message: Message, command: CommandObject) -> None:
-    arg = (command.args or "").strip().lstrip("#")
+    # /pain_12 — нажимаемая ссылка из топа; /pain 12 — если набрали руками
+    if command.regexp_match is not None:
+        arg = command.regexp_match.group(1)
+    else:
+        arg = (command.args or "").strip().lstrip("#")
     if not arg.isdigit():
-        await message.answer("Формат: /pain 12 (номер из 🔝 Топ болей)")
+        await message.answer("Открой 🔝 Топ болей и нажми на /pain_… рядом с нужной болью.")
         return
     pool = await db.get_pool()
     cluster = await pool.fetchrow("select * from clusters where id = $1", int(arg))
     if cluster is None:
-        await message.answer("Такой боли нет. Список: 🔝 Топ болей")
+        await message.answer(
+            "Такой боли уже нет — номера меняются после пересчёта. Открой свежий 🔝 Топ болей."
+        )
         return
     quotes = await pool.fetch(
         "select evidence_quote from signals where cluster_id = $1 "
@@ -420,15 +497,20 @@ async def cmd_report(message: Message) -> None:
 
 
 async def _do_run(message: Message, extract_limit: int | None) -> None:
-    live = LiveMessage(await message.answer("Запускаю полный цикл…"))
+    job_id, live = await _start_live(message, "Запускаю полный цикл…")
     since = await jobs.last_pipeline_at()
     try:
-        stats = await jobs.run_pipeline(lambda text: live.set(text), extract_limit)
+        stats = await jobs.run_job(
+            jobs.run_pipeline(lambda text: live.set(text), extract_limit, job_id)
+        )
+    except jobs.Cancelled:
+        await live.set(fmt.fmt_stopped("полный цикл"), final=True)
+        return
     except jobs.Busy as e:
-        await live.set(_busy(e), force=True)
+        await live.set(_busy(e), final=True)
         return
     except Exception as e:  # noqa: BLE001
-        await live.set(f"❌ Прогон упал: {type(e).__name__}: {fmt.esc(e)}", force=True)
+        await live.set(f"❌ Не удалось: {type(e).__name__}: {fmt.esc(e)}", final=True)
         return
 
     new_msgs, new_signals = await jobs.since_counts(since)
@@ -436,7 +518,7 @@ async def _do_run(message: Message, extract_limit: int | None) -> None:
     top = await pool.fetch(
         "select id, label, score, n_authors from clusters order by score desc limit 5"
     )
-    await live.set("✅ Готово", force=True)
+    await live.set("✅ Готово", final=True)
     await _reply_long(message, fmt.fmt_digest(stats, new_signals, new_msgs, list(top)))
     await _send_report(message)
 
@@ -445,11 +527,11 @@ async def _do_run(message: Message, extract_limit: int | None) -> None:
 async def cmd_run(message: Message) -> None:
     pending = await jobs.queue_size()
     if pending > settings.bot_confirm_threshold:
-        estimate = fmt.fmt_estimate(pending, await jobs.tokens_per_thread())
+        estimate = fmt.fmt_estimate(pending, await jobs.seconds_per_thread())
         await message.answer(
-            f"{estimate}\n\nПолный цикл разберёт всю очередь. Точно?",
+            f"{estimate}\n\nПолный цикл разберёт их все. Точно?",
             reply_markup=_kb(
-                [(f"Всё: {pending}", "run:all"), ("Только 20", "run:20")],
+                [(f"Все {fmt.fmt_num(pending)}", "run:all"), ("Только 20", "run:20")],
                 [("Отмена", "cancel")],
             ),
         )
@@ -602,7 +684,7 @@ async def on_document(message: Message, bot: Bot) -> None:
         size_mb = (doc.file_size or 0) / 1024 / 1024
         await message.answer(
             f"Файл {size_mb:.0f} МБ, а Telegram отдаёт ботам максимум 20 МБ.\n"
-            "Варианты: при экспорте выбери период покороче (например, последний год), "
+            "Варианты: при экспорте выбери период покороче (например, последние полгода), "
             "или залей через консоль: <code>chat-parser import-json путь\\к\\result.json</code>"
         )
         return
@@ -611,7 +693,7 @@ async def on_document(message: Message, bot: Bot) -> None:
     dest = Path(tempfile.gettempdir()) / f"tdesktop-{doc.file_unique_id}.json"
     try:
         await bot.download(doc, destination=dest)
-        await status.edit_text("📖 Разбираю файл и собираю диалоги…")
+        await status.edit_text("📖 Читаю переписку и делю её на обсуждения…")
         stats = await jobs.import_export(dest)
     except jobs.Busy as e:
         await status.edit_text(_busy(e))
@@ -626,10 +708,28 @@ async def on_document(message: Message, bot: Bot) -> None:
         dest.unlink(missing_ok=True)
 
     thr = stats.get("threads") or {}
+    dup = stats.get("duplicates", 0)
     await status.edit_text(
-        f"✅ <b>{fmt.esc(stats['title'])}</b>\n"
-        f"в файле: {stats.get('in_file', 0)} · добавлено: {stats['saved']} · "
-        f"уже были: {stats.get('duplicates', 0)} · служебных пропущено: {stats['skipped']}\n"
-        f"диалогов собрано: {thr.get('threads', 0)}"
+        f"✅ Загрузил чат <b>{fmt.esc(stats['title'])}</b>\n"
+        f"Сообщений: {fmt.fmt_num(stats.get('in_file', 0))}"
+        + (f" (новых: {fmt.fmt_num(stats['saved'])}, остальные уже были)" if dup else "")
+        + f"\nОбсуждений в чате: {fmt.fmt_num(thr.get('threads', 0))}"
     )
     await _extract_menu(message)
+
+
+# ------------------------------------------------ скрытая статистика расхода
+
+
+@router.message(Command("usage"))
+async def cmd_usage(message: Message) -> None:
+    """Расход токенов. Не в меню и не в справке — пользователю это не нужно."""
+    pool = await db.get_pool()
+    try:
+        report = await usage.report(pool)
+    except asyncpg.UndefinedTableError:
+        await message.answer("Учёт расхода ещё не включён: перезапусти бота — схема обновится.")
+        return
+    await _reply_long(
+        message, fmt.fmt_usage(report, settings.llm_price_in, settings.llm_price_out)
+    )

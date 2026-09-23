@@ -7,14 +7,15 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
-from .. import db
+from .. import db, usage
 from ..analyze import extract as extract_mod
 from ..cluster import llm_cluster
 from ..config import settings
@@ -24,6 +25,8 @@ from ..normalize import threads as threads_mod
 from ..report import build_md
 
 REPORT_PATH = Path("out/report.md")
+
+T = TypeVar("T")
 
 Progress = Callable[[str], Awaitable[None]]
 ExtractProgress = Callable[[int, int, dict], Awaitable[None]]
@@ -39,13 +42,33 @@ class Busy(RuntimeError):
         self.what = what
 
 
+class Cancelled(RuntimeError):
+    """Операцию остановили кнопкой."""
+
+
+def new_job_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
 @asynccontextmanager
-async def exclusive(name: str) -> AsyncIterator[dict[str, Any]]:
-    """Проверка и захват без await между ними — гонки в одном event loop нет."""
+async def exclusive(name: str, job_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
+    """Проверка и захват без await между ними — гонки в одном event loop нет.
+
+    Запоминаем задачу, в которой идёт операция, чтобы её можно было
+    остановить кнопкой (cancel).
+    """
     global _current
     if _current is not None:
         raise Busy(_current["name"])
-    _current = {"name": name, "progress": "", "since": datetime.now(timezone.utc)}
+    _current = {
+        "name": name,
+        "id": job_id or new_job_id(),
+        "task": asyncio.current_task(),
+        "progress": "",
+        "done": 0,
+        "signals": 0,
+        "since": datetime.now(timezone.utc),
+    }
     try:
         yield _current
     finally:
@@ -60,6 +83,34 @@ def is_running() -> bool:
     return _current is not None
 
 
+def cancel(job_id: str) -> str | None:
+    """Остановить операцию с этим id. None — такой операции уже нет."""
+    job = _current
+    if job is None or job["id"] != job_id or job["task"] is None:
+        return None
+    job["task"].cancel()
+    return job["name"]
+
+
+async def run_job(coro: Awaitable[T]) -> T:
+    """Запустить операцию отдельной задачей и дождаться её.
+
+    Отдельная задача нужна, чтобы кнопка «Остановить» отменяла именно
+    операцию, а не того, кто её ждёт: обработчик сообщения или ночной
+    планировщик. Остановка превращается в Cancelled; отмена самого
+    ожидающего (выключение бота) пробрасывается как есть.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        me = asyncio.current_task()
+        if task.cancelled() and not (me is not None and me.cancelling()):
+            raise Cancelled from None
+        task.cancel()
+        raise
+
+
 async def _noop(*_: Any) -> None:
     return None
 
@@ -72,36 +123,9 @@ async def queue_size() -> int:
     return await pool.fetchval("select count(*) from threads where status = 'pending'")
 
 
-def per_thread_from_stats(kind: str, stats: dict[str, Any]) -> int | None:
-    """Токенов на тред по статистике одного прошлого прогона."""
-    if kind == "pipeline":
-        stats = stats.get("extract") or {}
-    if not isinstance(stats, dict):
-        return None
-    tok = stats.get("tokens") or {}
-    spent = (tok.get("prompt") or 0) + (tok.get("completion") or 0)
-    processed = (stats.get("threads") or 0) + (stats.get("failed") or 0)
-    return spent // processed if spent and processed else None
-
-
-async def tokens_per_thread() -> int | None:
-    """Средний расход на тред по последнему прогону, где он измерен."""
-    pool = await db.get_pool()
-    rows = await pool.fetch(
-        """
-        select kind, stats from runs
-         where error is null and kind in ('extract', 'pipeline')
-         order by id desc limit 20
-        """
-    )
-    for r in rows:
-        stats = r["stats"]
-        if isinstance(stats, str):
-            stats = json.loads(stats)
-        value = per_thread_from_stats(r["kind"], stats or {})
-        if value:
-            return value
-    return None
+async def seconds_per_thread() -> float | None:
+    """Среднее время разбора одного обсуждения по последним разборам."""
+    return await usage.seconds_per_thread(await db.get_pool())
 
 
 async def last_pipeline_at() -> datetime | None:
@@ -141,18 +165,21 @@ async def import_export(path: Path) -> dict[str, Any]:
 
 async def reset_queue(kind: str) -> int:
     """kind: 'redo' — вернуть разобранные и упавшие; 'failed' — только упавшие."""
-    async with exclusive("возврат тредов в очередь"):
+    async with exclusive("возврат в очередь"):
         pool = await db.get_pool()
         if kind == "redo":
             return await extract_mod.reset_for_redo(pool)
         return await extract_mod.reset_failed(pool)
 
 
-async def run_extract(on_progress: ExtractProgress, limit: int | None) -> dict[str, Any]:
-    async with exclusive("разбор сигналов") as job:
+async def run_extract(
+    on_progress: ExtractProgress, limit: int | None, job_id: str | None = None
+) -> dict[str, Any]:
+    async with exclusive("разбор", job_id) as job:
 
         async def cb(done: int, total: int, stats: dict) -> None:
-            job["progress"] = f"{done}/{total}, сигналов {stats['signals']}"
+            job["progress"] = f"{done} из {total}"
+            job["done"], job["signals"] = done, stats["signals"]
             await on_progress(done, total, stats)
 
         pool = await db.get_pool()
@@ -161,17 +188,17 @@ async def run_extract(on_progress: ExtractProgress, limit: int | None) -> dict[s
         return stats
 
 
-async def run_cluster(progress: Progress) -> dict[str, Any]:
-    async with exclusive("группировка болей") as job:
+async def run_cluster(progress: Progress, job_id: str | None = None) -> dict[str, Any]:
+    async with exclusive("пересчёт болей", job_id) as job:
         pool = await db.get_pool()
-        job["progress"] = "группировка"
+        job["progress"] = "группировка сигналов"
         await progress("🧩 Группирую сигналы в боли…")
         clusters = await llm_cluster.run(pool)
         n = sum(v for v in clusters.values() if isinstance(v, int))
 
         async def cards_cb(i: int, total: int) -> None:
-            job["progress"] = f"карточки {i}/{total}"
-            await progress(f"📝 Болей: {n}. Пишу карточки: {i}/{total}…")
+            job["progress"] = f"описание болей {i} из {total}"
+            await progress(f"📝 Болей: {n}. Описываю каждую: {i} из {total}…")
 
         cards = await llm_cluster.make_cards(pool, on_progress=cards_cb)
         await build_md.build(pool, REPORT_PATH)
@@ -181,10 +208,10 @@ async def run_cluster(progress: Progress) -> dict[str, Any]:
 
 
 async def run_pipeline(
-    progress: Progress, extract_limit: int | None = None
+    progress: Progress, extract_limit: int | None = None, job_id: str | None = None
 ) -> dict[str, Any]:
-    """Полный цикл: выгрузка -> треды -> разбор -> боли -> отчёт."""
-    async with exclusive("полный цикл") as job:
+    """Полный цикл: выгрузка -> обсуждения -> разбор -> боли -> отчёт."""
+    async with exclusive("полный цикл", job_id) as job:
         started = datetime.now(timezone.utc)
         stats: dict[str, Any] = {}
         try:
@@ -202,23 +229,26 @@ async def run_pipeline(
             else:
                 stats["ingest"] = "пропущено: TG_API_ID/TG_API_HASH не заданы"
 
-            job["progress"] = "сборка тредов"
-            await progress("🧵 Собираю диалоги…")
+            job["progress"] = "сборка обсуждений"
+            await progress("🧵 Собираю обсуждения…")
             stats["threads"] = await threads_mod.build_all(pool)
 
             async def ex_cb(done: int, total: int, st: dict) -> None:
-                job["progress"] = f"разбор {done}/{total}"
-                await progress(f"🧠 Разбираю сигналы: {done}/{total} · сигналов {st['signals']}")
+                job["progress"] = f"разбор {done} из {total}"
+                job["done"], job["signals"] = done, st["signals"]
+                await progress(
+                    f"🧠 Разбираю обсуждения: {done} из {total} · сигналов {st['signals']}"
+                )
 
             stats["extract"] = await extract_mod.run(pool, extract_limit, on_progress=ex_cb)
 
-            job["progress"] = "группировка"
+            job["progress"] = "группировка сигналов"
             await progress(f"🧩 Сигналов: {stats['extract']['signals']}. Группирую в боли…")
             stats["cluster"] = await llm_cluster.run(pool)
 
             async def cards_cb(i: int, total: int) -> None:
-                job["progress"] = f"карточки {i}/{total}"
-                await progress(f"📝 Пишу карточки болей: {i}/{total}…")
+                job["progress"] = f"описание болей {i} из {total}"
+                await progress(f"📝 Описываю боли: {i} из {total}…")
 
             stats["cards"] = await llm_cluster.make_cards(pool, on_progress=cards_cb)
 
