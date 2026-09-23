@@ -77,3 +77,18 @@ def test_two_word_quote_is_dropped():
     ex = Extraction(has_signals=True, signals=[sig("возим туда-сюда")])
     good, dropped = validate(ex, SOURCE, {101, 102})
     assert good == [] and dropped == 1
+
+
+
+def test_link_points_to_message_with_the_quote():
+    """Модель назвала сообщения [101, 102], а цитата стоит в 102 — 102 первым:
+    по message_ids[0] строится ссылка под цитатой."""
+    ex = Extraction(has_signals=True, signals=[sig("он у нас один на два салона", ids=(101, 102))])
+    good, _ = validate(ex, SOURCE, {101, 102})
+    assert good[0].message_ids == [102, 101]
+
+
+def test_quote_message_added_even_if_model_forgot_it():
+    ex = Extraction(has_signals=True, signals=[sig("он у нас один на два салона", ids=(101,))])
+    good, _ = validate(ex, SOURCE, {101, 102})
+    assert good[0].message_ids == [102, 101]

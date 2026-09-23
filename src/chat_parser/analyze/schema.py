@@ -69,6 +69,10 @@ class Card(BaseModel):
     who: str = Field(description="Кто испытывает эту боль")
     when: str = Field(description="В какой момент она возникает")
     current_workarounds: list[str]
-    evidence: list[str] = Field(description="3-5 самых показательных цитат")
+    # Номера сигналов, а не текст: у сигнала цитата проверена и привязана
+    # к сообщению — под ней можно дать ссылку.
+    evidence_ids: list[int] = Field(
+        description="id 3-5 сигналов с самыми показательными цитатами"
+    )
     product_hypotheses: list[str]
     open_questions: list[str]

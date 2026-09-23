@@ -92,7 +92,9 @@ def build_bot() -> Bot:
     return Bot(
         token=settings.tg_bot_token,
         session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        # Превью ссылок выключено: под цитатами ссылки на сообщения, и Telegram
+        # иначе прилеплял бы к карточке боли большую плашку первой из них.
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
     )
 
 

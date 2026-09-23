@@ -8,6 +8,9 @@ from pathlib import Path
 
 import asyncpg
 
+from ..links import QUOTE_MESSAGE_SQL, message_link
+from ..quotes import pick_quotes
+
 AUDIENCE_RU = {
     "owner": "Владельцы оптик",
     "staff": "Персонал салонов",
@@ -16,12 +19,6 @@ AUDIENCE_RU = {
     "customer": "Покупатели",
     "unknown": "Не определено",
 }
-
-
-def _msg_link(username: str | None, chat_id: int, message_id: int) -> str:
-    if username:
-        return f"https://t.me/{username}/{message_id}"
-    return f"https://t.me/c/{str(chat_id).removeprefix('-100')}/{message_id}"
 
 
 async def build(pool: asyncpg.Pool, out: Path, top: int = 30) -> Path:
@@ -60,8 +57,25 @@ async def build(pool: asyncpg.Pool, out: Path, top: int = 30) -> Path:
                 "",
             ]
             card = c["card"]
+            card = json.loads(card) if isinstance(card, str) else card
+            signals = [
+                dict(r)
+                for r in await pool.fetch(
+                    f"""
+                    select s.id, s.evidence_quote, s.chat_id, {QUOTE_MESSAGE_SQL} as mid,
+                           c.username
+                      from signals s join chats c on c.id = s.chat_id
+                     where s.cluster_id = $1 order by s.intensity desc, s.id
+                    """,
+                    c["id"],
+                )
+            ]
+            quote_lines = []
+            for q in pick_quotes(card, signals):
+                link = message_link(q["chat_id"], q["username"], q["mid"])
+                tail = f" — [сообщение]({link})" if link else ""
+                quote_lines.append(f"> «{q['evidence_quote']}»{tail}")
             if card:
-                card = json.loads(card) if isinstance(card, str) else card
                 lines += [
                     f"**Кто:** {card['who']}",
                     "",
@@ -70,30 +84,18 @@ async def build(pool: asyncpg.Pool, out: Path, top: int = 30) -> Path:
                     "**Как выкручиваются сейчас:**",
                     *[f"- {w}" for w in card["current_workarounds"]],
                     "",
-                    "**Цитаты:**",
-                    *[f"> {q}" for q in card["evidence"]],
-                    "",
+                ]
+            if quote_lines:
+                lines += ["**Цитаты:**", *[q + "\n" for q in quote_lines]]
+            if card:
+                lines += [
                     "**Гипотезы решения:**",
                     *[f"- {h}" for h in card["product_hypotheses"]],
                     "",
-                    "**Что выяснить интервью:**",
+                    "**Что выяснить:**",
                     *[f"- {q}" for q in card["open_questions"]],
                     "",
                 ]
-            else:
-                quotes = await pool.fetch(
-                    """
-                    select s.evidence_quote, s.chat_id, s.message_ids[1] as mid, c.username
-                      from signals s join chats c on c.id = s.chat_id
-                     where s.cluster_id = $1 order by s.intensity desc limit 4
-                    """,
-                    c["id"],
-                )
-                lines += ["**Цитаты:**"]
-                for q in quotes:
-                    link = _msg_link(q["username"], q["chat_id"], q["mid"])
-                    lines.append(f"> «{q['evidence_quote']}» — [источник]({link})")
-                lines.append("")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines), encoding="utf-8")

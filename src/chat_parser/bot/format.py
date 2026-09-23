@@ -105,15 +105,36 @@ def fmt_top(clusters: list[Any]) -> str:
     return "\n".join(lines)
 
 
+TYPE_RU = {
+    "pain": "боль",
+    "need": "потребность",
+    "jtbd": "задача",
+    "question": "вопрос",
+    "workaround": "обходной путь",
+    "alternative": "чем пользуются",
+    "willingness_to_pay": "про деньги",
+    "feature_request": "хотят функцию",
+}
+
+
+def fmt_quote(q: Any) -> str:
+    """Цитата и под ней ссылка на сообщение, если у чата бывают ссылки."""
+    text = f"<blockquote>{esc(q['evidence_quote'])}</blockquote>"
+    link = q.get("link") if isinstance(q, dict) else None
+    if link:
+        text += f'\n<a href="{html.escape(link, quote=True)}">↗ сообщение в чате</a>'
+    return text
+
+
 def fmt_card(cluster: Any, quotes: list[Any]) -> str:
     lines = [
-        f"<b>#{cluster['id']} {esc(cluster['label'])}</b>",
+        f"<b>{esc(cluster['label'])}</b>",
         f"<i>{AUDIENCE_RU.get(cluster['audience'], cluster['audience'])}</i>",
         "",
         f"<blockquote>{esc(cluster['statement'])}</blockquote>",
         "",
-        f"вес {cluster['score']:.1f} · {cluster['n_authors']} чел. · "
-        f"{cluster['n_chats']} чат. · {cluster['n_signals']} сигн.",
+        f"Говорят {people(cluster['n_authors'])} в {chats_word(cluster['n_chats'])}, "
+        f"{signals_word(cluster['n_signals'])}.",
     ]
     card = cluster["card"]
     if card:
@@ -122,18 +143,16 @@ def fmt_card(cluster: Any, quotes: list[Any]) -> str:
         if card.get("current_workarounds"):
             lines.append("\n<b>Как выкручиваются:</b>")
             lines += [f"• {esc(w)}" for w in card["current_workarounds"]]
-        if card.get("evidence"):
-            lines.append("\n<b>Цитаты:</b>")
-            lines += [f"<blockquote>{esc(q)}</blockquote>" for q in card["evidence"]]
+    if quotes:
+        lines.append("\n<b>Цитаты:</b>")
+        lines += [fmt_quote(q) for q in quotes]
+    if card:
         if card.get("product_hypotheses"):
             lines.append("\n<b>Гипотезы:</b>")
             lines += [f"• {esc(h)}" for h in card["product_hypotheses"]]
         if card.get("open_questions"):
-            lines.append("\n<b>Выяснить интервью:</b>")
+            lines.append("\n<b>Выяснить:</b>")
             lines += [f"• {esc(q)}" for q in card["open_questions"]]
-    elif quotes:
-        lines.append("\n<b>Цитаты:</b>")
-        lines += [f"<blockquote>{esc(q['evidence_quote'])}</blockquote>" for q in quotes]
     return "\n".join(lines)
 
 
@@ -142,11 +161,13 @@ def fmt_signals(rows: list[Any]) -> str:
         return "Сигналов пока нет."
     lines = ["<b>Последние сигналы</b>", ""]
     for r in rows:
+        kind = TYPE_RU.get(r["type"], r["type"])
         lines.append(
-            f"<b>{esc(r['type'])}</b> · {AUDIENCE_RU.get(r['audience'], r['audience'])}"
-            f" · острота {r['intensity']}\n"
+            f"<b>{esc(kind)}</b> · {AUDIENCE_RU.get(r['audience'], r['audience'])}"
+            f" · острота {r['intensity']} из 5\n"
             f"{esc(r['summary'])}\n"
-            f"<blockquote>{esc(r['evidence_quote'])}</blockquote>"
+            + fmt_quote(r)
+            + "\n"
         )
     return "\n".join(lines)
 

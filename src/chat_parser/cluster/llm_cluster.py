@@ -235,13 +235,13 @@ async def make_cards(
                 await on_progress(i, len(clusters))
             signals = await pool.fetch(
                 """
-                select type, summary, evidence_quote, context, intensity
+                select id, type, summary, evidence_quote, context, intensity
                   from signals where cluster_id = $1 order by intensity desc limit 40
                 """,
                 c["id"],
             )
             payload = "\n".join(
-                f"- [{s['type']}, острота {s['intensity']}] {s['summary']}\n"
+                f"- [id {s['id']}] [{s['type']}, острота {s['intensity']}] {s['summary']}\n"
                 f"  цитата: «{s['evidence_quote']}»\n  контекст: {s['context']}"
                 for s in signals
             )
@@ -256,6 +256,9 @@ async def make_cards(
             except LLMError as e:
                 print(f"  ! карточка {c['id']}: {e}")
                 continue
+            # только сигналы этой боли: модель могла перепутать номер
+            own = {s["id"] for s in signals}
+            card.evidence_ids = [i for i in card.evidence_ids if i in own]
             await pool.execute(
                 "update clusters set card = $2, updated_at = now() where id = $1",
                 c["id"],

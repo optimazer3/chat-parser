@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import time
@@ -32,7 +33,9 @@ from .. import db, usage
 from ..config import settings
 from ..ingest import collector
 from ..ingest.client import build_client
+from ..links import QUOTE_MESSAGE_SQL, message_link
 from ..llm import build_llm
+from ..quotes import pick_quotes
 from . import format as fmt
 from . import jobs
 
@@ -456,12 +459,12 @@ async def cmd_pain(message: Message, command: CommandObject) -> None:
             "Такой боли уже нет — номера меняются после пересчёта. Открой свежий 🔝 Топ болей."
         )
         return
-    quotes = await pool.fetch(
-        "select evidence_quote from signals where cluster_id = $1 "
-        "order by intensity desc limit 4",
-        cluster["id"],
+    signals = await _signals_with_links(
+        "where s.cluster_id = $1 order by s.intensity desc, s.id", cluster["id"]
     )
-    await _reply_long(message, fmt.fmt_card(cluster, list(quotes)))
+    card = cluster["card"]
+    card = json.loads(card) if isinstance(card, str) else card
+    await _reply_long(message, fmt.fmt_card(cluster, pick_quotes(card, signals)))
 
 
 @router.message(Command("signals"))
@@ -469,15 +472,28 @@ async def cmd_signals(message: Message, command: CommandObject) -> None:
     limit = 10
     if command.args and command.args.strip().isdigit():
         limit = min(int(command.args.strip()), 30)
+    rows = await _signals_with_links("order by s.id desc limit $1", limit)
+    await _reply_long(message, fmt.fmt_signals(rows))
+
+
+async def _signals_with_links(tail: str, *args) -> list[dict]:
+    """Сигналы вместе со ссылкой на сообщение, где стоит цитата."""
     pool = await db.get_pool()
     rows = await pool.fetch(
-        """
-        select type, audience, summary, evidence_quote, intensity
-          from signals order by id desc limit $1
+        f"""
+        select s.id, s.type, s.audience, s.summary, s.evidence_quote, s.intensity,
+               s.chat_id, {QUOTE_MESSAGE_SQL} as mid, c.username
+          from signals s join chats c on c.id = s.chat_id
+        {tail}
         """,
-        limit,
+        *args,
     )
-    await _reply_long(message, fmt.fmt_signals(list(rows)))
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["link"] = message_link(d["chat_id"], d["username"], d["mid"])
+        out.append(d)
+    return out
 
 
 async def _send_report(message: Message) -> None:

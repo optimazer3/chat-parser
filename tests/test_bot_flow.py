@@ -93,8 +93,9 @@ async def harness(monkeypatch, tmp_path):
         if schema is Merging:
             return Merging(groups=[])
         if schema is Card:
+            ids = [int(x) for x in re.findall(r"\[id (\d+)\]", user)][:3]
             return Card(title="t", statement="s", who="владельцы", when="при открытии",
-                        current_workarounds=["возят прибор"], evidence=["цитата"],
+                        current_workarounds=["возят прибор"], evidence_ids=ids,
                         product_hypotheses=["аренда"], open_questions=["сколько салонов"])
         raise AssertionError(schema)
 
@@ -251,7 +252,24 @@ async def test_full_flow_through_bot(harness, monkeypatch):
     cid = await h.pool.fetchval("select id from clusters")
     top = await say("🔝 Топ болей")
     assert f"/pain_{cid}" in top and "говорят 4 человека в 1 чате" in top
-    assert "возят прибор" in await say(f"/pain_{cid}")  # нажимаемая ссылка из топа
+    card = await say(f"/pain_{cid}")  # нажимаемая ссылка из топа
+    assert "возят прибор" in card
+    # под цитатами — ссылки на сообщения приватной супергруппы
+    assert card.count('<a href="https://t.me/c/1234567890/') == 3
+    assert "<b>Выяснить:</b>" in card and "интервью" not in card
+    sig = await say("/signals")
+    assert '<a href="https://t.me/c/1234567890/' in sig
+
+    # сигнал «из старой версии»: модель поставила первым не то сообщение —
+    # ссылка всё равно ведёт туда, где цитата стоит на самом деле
+    await h.pool.execute(
+        "update signals set message_ids = array[2, 3], "
+        "evidence_quote = 'он у нас один на два салона' where id = "
+        "(select min(id) from signals)"
+    )
+    sig = await say("/signals 30")
+    assert '<a href="https://t.me/c/1234567890/3">' in sig
+    assert "pain" not in sig and "<b>боль</b>" in sig
     assert "возят прибор" in await say(f"/pain {cid}")   # и набранная руками
     assert "номера меняются" in await say("/pain_999999")
 
