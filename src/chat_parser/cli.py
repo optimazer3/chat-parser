@@ -16,7 +16,7 @@ from .config import settings
 from .llm import build_llm
 from .analyze import extract as extract_mod
 from .cluster import llm_cluster
-from .ingest import collector
+from .ingest import collector, tdesktop
 from .ingest.client import build_client
 from .normalize import threads as threads_mod
 from .report import build_md
@@ -186,17 +186,23 @@ def doctor() -> None:
                       f" сообщений {counts['msgs']}, тредов {counts['thr']},"
                       f" сигналов {counts['sig']}")
 
-        print("\n[bold]3. Telegram[/bold]")
-        me, err = await _probe(_probe_telegram())
-        if err:
-            print(f"  [red]FAIL[/red] {err}")
-            problems.append("Telegram")
-        elif me is None:
-            print("  [red]FAIL[/red] сессия не авторизована — python scripts/login.py")
-            problems.append("Telegram")
+        print("\n[bold]3. Telegram (выгрузка)[/bold]")
+        if not settings.telegram_ready:
+            print("  [yellow]—[/yellow]    TG_API_ID/TG_API_HASH не заданы, "
+                  "выгрузка из Telegram выключена.")
+            print("  [dim]Это не ошибка: историю можно залить вручную —[/dim]")
+            print("  [dim]chat-parser import-json <result.json>[/dim]")
         else:
-            print(f"  [green]OK[/green]   вошли как {me.first_name} "
-                  f"(@{me.username}), id {me.id}")
+            me, err = await _probe(_probe_telegram())
+            if err:
+                print(f"  [red]FAIL[/red] {err}")
+                problems.append("Telegram")
+            elif me is None:
+                print("  [red]FAIL[/red] сессия не авторизована — python scripts/login.py")
+                problems.append("Telegram")
+            else:
+                print(f"  [green]OK[/green]   вошли как {me.first_name} "
+                      f"(@{me.username}), id {me.id}")
 
         print("\n[bold]4. LLM[/bold]")
         print(f"  [dim]{settings.llm_base_url} · модель {settings.llm_model or '(не задана)'}[/dim]")
@@ -270,6 +276,39 @@ def ingest(
         for r in res:
             print(r)
         await db.log_run("ingest", {"mode": mode, "chats": res})
+
+    _run(go())
+
+
+@app.command("import-json")
+def import_json(
+    path: Path = typer.Argument(..., help="result.json из экспорта Telegram Desktop"),
+    chat_id: int = typer.Option(None, "--chat-id", help="Переопределить id чата"),
+    title: str = typer.Option(None, "--title", help="Переопределить название чата"),
+) -> None:
+    """Залить историю вручную, без API-ключей.
+
+    Telegram Desktop -> открыть чат -> ⋮ -> Экспорт истории чата -> формат JSON.
+    """
+
+    async def go():
+        if not path.is_file():
+            print(f"[red]Файл не найден:[/red] {path.resolve()}")
+            raise typer.Exit(1)
+        pool = await db.get_pool()
+        try:
+            stats = await tdesktop.import_file(pool, path, chat_id, title)
+        except ValueError as e:
+            print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from None
+        print(
+            f"[green]{stats['title']}[/green] (id {stats['chat_id']})\n"
+            f"  сообщений в файле: {stats.get('in_file', 0)}\n"
+            f"  добавлено: {stats['saved']}\n"
+            f"  уже были: {stats.get('duplicates', 0)}\n"
+            f"  пропущено служебных: {stats['skipped']}"
+        )
+        print("\nДальше: chat-parser threads && chat-parser extract --limit 50")
 
     _run(go())
 

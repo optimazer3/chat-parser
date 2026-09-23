@@ -4,8 +4,6 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 WHERE_TO_GET = {
-    "tg_api_id": "my.telegram.org -> API development tools",
-    "tg_api_hash": "my.telegram.org -> API development tools",
     "database_url": "Supabase -> Project Settings -> Database -> Connection string (URI, Session pooler)",
     "author_salt": 'python -c "import secrets; print(secrets.token_hex(16))"',
 }
@@ -15,8 +13,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- Telegram: аккаунт-сборщик (MTProto) ---
-    tg_api_id: int
-    tg_api_hash: str
+    # Необязательны: без них работает всё, кроме выгрузки из Telegram.
+    # Данные можно залить вручную: chat-parser import-json
+    tg_api_id: int | None = None
+    tg_api_hash: str = ""
     tg_session: str = "data/optics"
     tg_session_string: str = ""
 
@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     thread_gap_minutes: int = 10
     thread_max_messages: int = 80
     min_words_standalone: int = 8
+
+    @property
+    def telegram_ready(self) -> bool:
+        return bool(self.tg_api_id and self.tg_api_hash)
 
     @property
     def admin_ids(self) -> set[int]:

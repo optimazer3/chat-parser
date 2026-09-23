@@ -16,6 +16,7 @@ from .. import db
 from ..analyze import extract as extract_mod
 from ..cluster import llm_cluster
 from ..ingest import collector
+from ..config import settings
 from ..ingest.client import build_client
 from ..normalize import threads as threads_mod
 from ..report import build_md
@@ -52,16 +53,20 @@ async def run_pipeline(progress: Progress) -> dict[str, Any]:
     try:
         pool = await db.get_pool()
 
-        await progress("📥 Забираю новые сообщения…")
-        client = build_client()
-        await client.start()
-        try:
-            stats["ingest"] = await collector.sync_all(client, pool, "incremental")
-        finally:
-            await client.disconnect()
-        saved = sum(r.get("saved", 0) for r in stats["ingest"])
-
-        await progress(f"🧵 Новых сообщений: {saved}. Собираю диалоги…")
+        if settings.telegram_ready:
+            await progress("📥 Забираю новые сообщения…")
+            client = build_client()
+            await client.start()
+            try:
+                stats["ingest"] = await collector.sync_all(client, pool, "incremental")
+            finally:
+                await client.disconnect()
+            saved = sum(r.get("saved", 0) for r in stats["ingest"])
+            await progress(f"🧵 Новых сообщений: {saved}. Собираю диалоги…")
+        else:
+            # Без TG_API_ID работаем по тому, что залито вручную.
+            stats["ingest"] = "пропущено: TG_API_ID/TG_API_HASH не заданы"
+            await progress("🧵 Выгрузка выключена, работаю по залитым данным…")
         stats["threads"] = await threads_mod.build_all(pool)
 
         pending = await pool.fetchval("select count(*) from threads where status = 'pending'")

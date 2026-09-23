@@ -117,7 +117,7 @@ def _row(msg: Message, chat_id: int) -> tuple | None:
     )
 
 
-async def _save(conn: asyncpg.Connection, rows: list[tuple]) -> None:
+async def save_messages(conn: asyncpg.Connection, rows: list[tuple]) -> None:
     if not rows:
         return
     await conn.executemany(
@@ -195,7 +195,7 @@ async def sync_chat(
         if not rows:
             return
         async with pool.acquire() as conn, conn.transaction():
-            await _save(conn, rows)
+            await save_messages(conn, rows)
             new_oldest = min(oldest, seen_min) if oldest else seen_min
             new_newest = max(newest, seen_max) if newest else seen_max
             await conn.execute(

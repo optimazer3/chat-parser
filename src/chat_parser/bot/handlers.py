@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import uuid
+from pathlib import Path
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -14,13 +16,16 @@ from aiogram.types import (
 
 from .. import db
 from ..config import settings
-from ..ingest import collector
+from ..ingest import collector, tdesktop
 from ..ingest.client import build_client
 from ..llm import build_llm
 from . import format as fmt
 from . import jobs
 
 router = Router()
+
+# Bot API отдаёт боту файлы не больше 20 МБ. Экспорт живого чата легко больше.
+MAX_UPLOAD = 20 * 1024 * 1024
 
 HELP = """<b>Мониторинг чатов рынка оптики</b>
 
@@ -33,6 +38,9 @@ HELP = """<b>Мониторинг чатов рынка оптики</b>
 /signals [N] — последние сигналы (для калибровки промпта)
 /report — прислать отчёт файлом
 /models [фильтр] — модели, доступные на шлюзе
+
+Нет API-ключей Telegram? Пришли сюда файлом <code>result.json</code> из
+«Экспорт истории чата» в Telegram Desktop — залью вручную.
 """
 
 # Токен -> ссылка: callback_data ограничен 64 байтами, ссылку туда не засунуть.
@@ -257,3 +265,46 @@ async def cmd_models(message: Message, command: CommandObject) -> None:
         for m in shown
     )
     await _reply_long(message, head + body)
+
+
+@router.message(F.document)
+async def on_document(message: Message, bot: Bot) -> None:
+    """Приём result.json из экспорта Telegram Desktop прямо в чат."""
+    doc = message.document
+    if doc is None:
+        return
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await message.answer(
+            "Жду <code>result.json</code> из «Экспорт истории чата» "
+            "в Telegram Desktop (формат JSON)."
+        )
+        return
+    if (doc.file_size or 0) > MAX_UPLOAD:
+        size_mb = (doc.file_size or 0) / 1024 / 1024
+        await message.answer(
+            f"Файл {size_mb:.0f} МБ, а Telegram отдаёт ботам максимум 20 МБ.\n"
+            "Залей через консоль:\n<code>chat-parser import-json путь\\к\\result.json</code>"
+        )
+        return
+
+    status = await message.answer("⬇️ Скачиваю…")
+    dest = Path(tempfile.gettempdir()) / f"tdesktop-{doc.file_unique_id}.json"
+    try:
+        await bot.download(doc, destination=dest)
+        await status.edit_text("📖 Разбираю файл…")
+        stats = await tdesktop.import_file(await db.get_pool(), dest)
+    except ValueError as e:
+        await status.edit_text(f"❌ {fmt.esc(e)}")
+        return
+    except Exception as e:  # noqa: BLE001 — показать причину, не ронять бота
+        await status.edit_text(f"❌ {type(e).__name__}: {fmt.esc(e)}")
+        return
+    finally:
+        dest.unlink(missing_ok=True)
+
+    await status.edit_text(
+        f"✅ <b>{fmt.esc(stats['title'])}</b>\n"
+        f"в файле: {stats.get('in_file', 0)} · добавлено: {stats['saved']} · "
+        f"уже были: {stats.get('duplicates', 0)} · служебных пропущено: {stats['skipped']}\n\n"
+        "Дальше: /run"
+    )
