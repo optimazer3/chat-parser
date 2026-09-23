@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -161,7 +161,8 @@ async def harness(monkeypatch, tmp_path):
 
     pool = await db.get_pool()
     await pool.execute(
-        "drop table if exists runs, clusters, signals, threads, cursors, messages, chats cascade"
+        "drop table if exists runs, clusters, signals, threads, cursors, messages, chats, "
+        "llm_usage, chat_requests cascade"
     )
     await db.apply_schema()
 
@@ -284,7 +285,7 @@ async def test_full_flow_through_bot(harness, monkeypatch):
     assert "Все сразу — это" in out  # после первого разбора есть оценка времени
 
     assert "Неудачных обсуждений нет" in await say("/retry")
-    assert "выгрузка выключена" in await say("/addchat @x")
+    assert "Запомнил" in await say("/addchat @optika_pro")  # без ключей — в ожидание
 
     # пользователю токены не показываем нигде в обычном сценарии
     assert not any("токен" in text for text in everything)
@@ -344,3 +345,125 @@ async def test_stop_button_during_extract(harness, monkeypatch):
     # старая кнопка ⏹ после завершения ничего не ломает
     await h.press(f"stop:{job['id']}")
     assert out_stop == "" or "Останавливаю" not in out_stop
+
+
+async def test_add_chat_without_api_keys_is_remembered(harness):
+    h = harness
+    assert "Пришли ссылку на чат" in await h.say("➕ Добавить чат")
+
+    out = await h.say("https://t.me/Optika_Pro/")
+    assert "Запомнил: https://t.me/optika_pro" in out and "ключи Telegram API" in out
+    assert "уже в списке ожидания" in await h.say("@optika_pro")  # тот же чат иначе записан
+    assert "приватном чате" in await h.say("https://t.me/c/1234567890/55")
+
+    out = await h.say("/chats")
+    assert "Ждут подключения" in out and "https://t.me/optika_pro" in out
+    assert await h.pool.fetchval("select status from chat_requests") == "pending"
+
+
+@pytest.fixture
+def telegram_api(monkeypatch):
+    """Ключи «есть»: подменяем подключение и Telegram-часть сборщика."""
+    from chat_parser.bot import jobs
+    from chat_parser.config import settings
+    from chat_parser.ingest import collector
+
+    monkeypatch.setattr(settings, "tg_api_id", 20481234)
+    monkeypatch.setattr(settings, "tg_api_hash", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+    monkeypatch.setattr(settings, "join_pause", 0)
+
+    class FakeClient:
+        async def disconnect(self):
+            pass
+
+    async def connect_client():
+        return FakeClient()
+
+    joined: list[str] = []
+
+    async def register_chat(client, pool, ref, join=False):
+        if "+approval" in ref:
+            raise collector.JoinPending("заявка отправлена")
+        if "+" in ref and not join:
+            raise collector.NeedsJoin("«Закрытые оптики»: приватный чат, нужно вступить")
+        if join:
+            joined.append(ref)
+        chat_id = -1009000000000 - len(ref)
+        username = None if "+" in ref else ref.rsplit("/", 1)[-1]
+        await pool.execute(
+            "insert into chats (id, title, username, link) values ($1,$2,$3,$4) "
+            "on conflict (id) do nothing",
+            chat_id, "Оптики Про" if username else "Закрытые оптики", username, ref,
+        )
+        await pool.execute("insert into cursors (chat_id) values ($1) on conflict do nothing",
+                           chat_id)
+        return chat_id
+
+    async def sync_chat_full(client, pool, chat_id, on_progress=None):
+        t0 = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        for i, text in enumerate(
+            ["подскажите поставщика линз, нынешний задерживает на месяц",
+             "у нас так же, клиенты уходят к сетевым", "берём у двух сразу"], start=1):
+            await pool.execute(
+                "insert into messages (chat_id, message_id, ts, author_label, text) "
+                "values ($1,$2,$3,$4,$5) on conflict do nothing",
+                chat_id, i, t0 + timedelta(minutes=i), f"u:{i}", text,
+            )
+        await pool.execute("update cursors set backfill_done = true, newest_id = 3, "
+                           "last_run = now() where chat_id = $1", chat_id)
+        if on_progress:
+            await on_progress(3)
+        return {"chat_id": chat_id, "saved": 3}
+
+    monkeypatch.setattr(jobs, "connect_client", connect_client)
+    monkeypatch.setattr(collector, "register_chat", register_chat)
+    monkeypatch.setattr(collector, "sync_chat_full", sync_chat_full)
+    return joined
+
+
+async def test_add_public_chat_loads_history(harness, telegram_api):
+    h = harness
+    out = await h.say("t.me/optika_pro")
+    assert "Подключил чат <b>Оптики Про</b>" in out
+    assert "Загружено: <b>3 сообщения</b>" in out
+    assert "[stop:" in out  # во время загрузки была кнопка ⏹
+    assert "[ex:all]" in out  # сразу предлагает разобрать
+
+    chats = await h.say("/chats")
+    assert '<a href="https://t.me/optika_pro">Оптики Про</a>' in chats
+    assert "3 сообщения" in chats and "обсуждений: 1" in chats and "сообщ." not in chats
+    assert telegram_api == []  # в открытый чат вступать не пришлось
+
+
+async def test_private_invite_asks_before_joining(harness, telegram_api):
+    h = harness
+    out = await h.say("https://t.me/+Wfx5U9BAtSRiODVi")
+    assert "нужно вступить" in out and "[join:" in out and "[drop:" in out
+    assert telegram_api == []  # без подтверждения не вступаем
+
+    token = out.split("[join:")[1].split("]")[0]
+    out = await h.press(f"join:{token}")
+    assert "Подключил чат <b>Закрытые оптики</b>" in out
+    assert telegram_api == ["https://t.me/+Wfx5U9BAtSRiODVi"]
+
+
+async def test_join_request_waits_for_admin(harness, telegram_api):
+    h = harness
+    out = await h.say("https://t.me/+approvalAbcdef")
+    assert "заявку на вступление я отправил" in out
+    assert await h.pool.fetchval("select status from chat_requests") == "join_pending"
+
+
+async def test_saved_chats_connect_when_keys_appear(harness, telegram_api):
+    """Ссылки, сохранённые без ключей, подключаются сами, когда ключи есть."""
+    from chat_parser.bot import jobs
+
+    h = harness
+    await h.pool.execute("insert into chat_requests (link) values "
+                         "('https://t.me/optika_pro'), ('https://t.me/+approvalXyzxyz')")
+    res = await jobs.connect_saved_chats()
+    assert res["connected"] == ["Оптики Про"]
+    assert res["waiting"] == ["https://t.me/+approvalXyzxyz"]
+    assert await jobs.chats_without_history() == [
+        await h.pool.fetchval("select id from chats where username = 'optika_pro'")
+    ]

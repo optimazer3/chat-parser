@@ -85,6 +85,42 @@ async def scheduler(bot: Bot) -> None:
         await _broadcast(bot, fmt.fmt_digest(stats, new_signals, new_msgs, list(top)))
 
 
+async def connect_saved(bot: Bot) -> None:
+    """Ключи Telegram появились — подключить чаты, сохранённые кнопкой
+    «Добавить чат», и предложить загрузить их историю."""
+    try:
+        res = await jobs.run_job(jobs.connect_saved_chats())
+    except (jobs.Busy, jobs.Cancelled):
+        return  # подключатся в ночном цикле
+    except Exception as e:  # noqa: BLE001
+        await _broadcast(bot, f"❌ Не удалось подключить сохранённые чаты: {fmt.esc(e)}")
+        return
+    lines = []
+    if res["connected"]:
+        lines.append("🔌 Подключил сохранённые чаты:")
+        lines += [f"• {fmt.esc(t)}" for t in res["connected"]]
+    if res["waiting"]:
+        lines.append("\n⏳ Ждут одобрения админа чата:")
+        lines += [f"• {fmt.esc(x)}" for x in res["waiting"]]
+    if res["failed"]:
+        lines.append("\n❌ Не получилось:")
+        lines += [f"• {fmt.esc(link)} — {fmt.esc(err)}" for link, err in res["failed"]]
+    if not lines:
+        return
+    markup = None
+    if res["connected"]:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📥 Загрузить историю", callback_data="hist:all")
+        ]])
+    for admin in settings.admin_ids:
+        try:
+            await bot.send_message(admin, "\n".join(lines), reply_markup=markup)
+        except Exception as e:  # noqa: BLE001
+            log.warning("не доставлено %s: %s", admin, e)
+
+
 def build_bot() -> Bot:
     """Бот с прокси из TG_PROXY, если он задан."""
     proxy = aiogram_proxy(settings.tg_proxy)
@@ -134,6 +170,8 @@ async def run_bot() -> None:
         via = f", через прокси {settings.tg_proxy}" if settings.tg_proxy else ""
         log.info("бот @%s запущен%s, админов: %d", me.username, via, len(settings.admin_ids))
         task = asyncio.create_task(scheduler(bot))
+        if settings.telegram_ready and await jobs.pending_requests():
+            asyncio.create_task(connect_saved(bot))
         await dp.start_polling(bot)
     finally:
         if task is not None:

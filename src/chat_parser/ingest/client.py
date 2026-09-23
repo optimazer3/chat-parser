@@ -9,6 +9,10 @@ from ..config import settings
 from ..net import telethon_proxy
 
 
+class TelegramNotAuthorized(RuntimeError):
+    """Сессия Telegram не авторизована — нужен разовый вход через консоль."""
+
+
 class TelegramNotConfigured(RuntimeError):
     """TG_API_ID/TG_API_HASH не заданы — выгрузка из Telegram недоступна."""
 
@@ -40,4 +44,21 @@ def build_client() -> TelegramClient:
     # Ожидания короче порога Telethon проглатывает сам; всё длиннее ловим руками
     # и откладываем чат, чтобы воркер не висел.
     client.flood_sleep_threshold = 60
+    return client
+
+
+async def connect_client() -> TelegramClient:
+    """Подключиться без интерактива — для бота.
+
+    client.start() при неавторизованной сессии спрашивает номер телефона в
+    консоли, и бот молча висел бы. Здесь вместо этого понятная ошибка.
+    """
+    client = build_client()
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise TelegramNotAuthorized(
+            "сессия Telegram не авторизована — один раз выполни в консоли "
+            "python scripts/login.py и впиши полученную строку в TG_SESSION_STRING"
+        )
     return client

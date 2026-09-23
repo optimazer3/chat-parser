@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
@@ -155,6 +156,10 @@ async def register_chat(
     await pool.execute(
         "insert into cursors (chat_id) values ($1) on conflict (chat_id) do nothing", chat_id
     )
+    await pool.execute(
+        "update chats set link = coalesce(link, $2), is_active = true where id = $1",
+        chat_id, ref.strip(),
+    )
     return chat_id
 
 
@@ -164,8 +169,14 @@ async def sync_chat(
     chat_id: int,
     mode: str,
     limit: int | None = None,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
 ) -> dict:
     """Один проход по чату. Возвращает статистику."""
+    # Курсор дальше обновляется через UPDATE: без строки он молча не писался бы,
+    # и остановленная загрузка начиналась бы заново.
+    await pool.execute(
+        "insert into cursors (chat_id) values ($1) on conflict (chat_id) do nothing", chat_id
+    )
     cur = await pool.fetchrow("select * from cursors where chat_id = $1", chat_id)
     if cur and cur["retry_after"] and cur["retry_after"] > datetime.now(timezone.utc):
         return {"chat_id": chat_id, "skipped": "flood_wait", "until": cur["retry_after"]}
@@ -211,6 +222,8 @@ async def sync_chat(
             oldest, newest = new_oldest, new_newest
         saved += len(rows)
         rows = []
+        if on_progress is not None:
+            await on_progress(saved)
 
     try:
         async for msg in it:
@@ -254,6 +267,44 @@ async def sync_chat(
     return {"chat_id": chat_id, "mode": mode, "saved": saved}
 
 
+async def sync_chat_full(
+    client: TelegramClient,
+    pool: asyncpg.Pool,
+    chat_id: int,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
+) -> dict:
+    """История, если она ещё не загружена до конца, затем всё новое.
+
+    Раньше инкрементальная докачка молча пропускала чаты без курсора — и чат,
+    добавленный через бота, так и не получал историю. Остановленная на
+    середине загрузка продолжается с того же места: курсор пишется после
+    каждого батча.
+    """
+    cur = await pool.fetchrow("select backfill_done from cursors where chat_id = $1", chat_id)
+    total = {"chat_id": chat_id, "saved": 0}
+    base = 0
+
+    async def progress(n: int) -> None:
+        if on_progress is not None:
+            await on_progress(base + n)
+
+    if not (cur and cur["backfill_done"]):
+        res = await sync_chat(client, pool, chat_id, "backfill", on_progress=progress)
+        total["saved"] += res.get("saved", 0)
+        base = total["saved"]
+        for key in ("error", "flood_wait_until"):
+            if key in res:
+                total[key] = res[key]
+        if len(total) > 2:  # ошибка или флуд-пауза — докачку новых не начинаем
+            return total
+    res = await sync_chat(client, pool, chat_id, "incremental", on_progress=progress)
+    total["saved"] += res.get("saved", 0)
+    for key in ("error", "flood_wait_until"):
+        if key in res:
+            total[key] = res[key]
+    return total
+
+
 async def sync_all(
     client: TelegramClient, pool: asyncpg.Pool, mode: str, limit: int | None = None
 ) -> list[dict]:
@@ -263,6 +314,9 @@ async def sync_all(
     ]
     out = []
     for chat_id in ids:
-        out.append(await sync_chat(client, pool, chat_id, mode, limit))
+        if mode == "incremental" and limit is None:
+            out.append(await sync_chat_full(client, pool, chat_id))
+        else:
+            out.append(await sync_chat(client, pool, chat_id, mode, limit))
         await asyncio.sleep(settings.ingest_pause)
     return out

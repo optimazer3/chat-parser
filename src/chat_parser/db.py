@@ -10,6 +10,7 @@ from .config import settings
 
 EXPECTED_TABLES = [
     "chats", "messages", "cursors", "threads", "signals", "clusters", "runs", "llm_usage",
+    "chat_requests",
 ]
 
 _pool: asyncpg.Pool | None = None

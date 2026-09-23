@@ -14,6 +14,22 @@ create table if not exists chats (
     added_at      timestamptz not null default now()
 );
 
+-- ссылка, по которой чат добавили через бота (для /chats)
+alter table chats add column if not exists link text;
+
+-- Чаты, добавленные кнопкой «Добавить чат», пока нет ключей Telegram API
+-- или пока админ не одобрил заявку на вступление. Подключаются сами, как
+-- только это станет возможно.
+create table if not exists chat_requests (
+    id         bigserial primary key,
+    link       text not null unique,
+    status     text not null default 'pending',  -- pending | join_pending | done | failed
+    chat_id    bigint,
+    note       text,
+    added_at   timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
 -- ------------------------------------------------------------ сообщения
 -- Телефоны/почты/карты маскируются ещё на этапе записи (см. pii.py),
 -- реальные user_id не хранятся вообще — только солёный хэш.
@@ -147,3 +163,4 @@ alter table signals  enable row level security;
 alter table clusters enable row level security;
 alter table runs     enable row level security;
 alter table llm_usage enable row level security;
+alter table chat_requests enable row level security;

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import html
 import json
+from datetime import timedelta, timezone
 from typing import Any
+
+from ..config import settings
 
 LIMIT = 3800
 
@@ -16,6 +19,12 @@ AUDIENCE_RU = {
     "customer": "покупатели",
     "unknown": "не определено",
 }
+
+
+def when(ts: Any, with_year: bool = False) -> str:
+    """Время в часовом поясе пользователя: «23.09 в 18:01». В базе всё в UTC."""
+    local = ts.astimezone(timezone(timedelta(hours=settings.display_utc_offset)))
+    return local.strftime("%d.%m.%Y в %H:%M" if with_year else "%d.%m в %H:%M")
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -61,15 +70,19 @@ def fmt_status(chats: list[Any], pending: int, last_run: Any) -> str:
         lines.append("Чатов пока нет. Пришли мне файл result.json — как его получить, в ❓ Помощь.")
     for c in chats:
         flag = "✅" if c["backfill_done"] else "⏳"
-        when = f"обновлён {c['last_run']:%d.%m %H:%M}" if c["last_run"] else "ещё не загружен"
+        updated = f"обновлён {when(c['last_run'])}" if c["last_run"] else "ещё не загружен"
         lines.append(f"{flag} <b>{esc(c['title'])}</b>")
-        lines.append(f"   {c['msgs']} сообщ. · {when}")
+        lines.append(f"   {messages_word(c['msgs'])} · {updated}")
         if c["retry_after"]:
-            lines.append(f"   ⛔ флуд-пауза до {c['retry_after']:%d.%m %H:%M}")
+            lines.append(f"   ⛔ Telegram попросил паузу до {when(c['retry_after'])}")
     lines += ["", f"Ждут разбора: <b>{discussions(pending)}</b>"]
     if last_run:
-        lines.append(f"Последний полный прогон: {last_run:%d.%m %H:%M} UTC")
+        lines.append(f"Последнее полное обновление: {when(last_run)}")
     return "\n".join(lines)
+
+
+def messages_word(n: int) -> str:
+    return f"{fmt_num(n)} {plural(n, 'сообщение', 'сообщения', 'сообщений')}"
 
 
 def people(n: int) -> str:

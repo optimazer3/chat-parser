@@ -20,7 +20,7 @@ from ..analyze import extract as extract_mod
 from ..cluster import llm_cluster
 from ..config import settings
 from ..ingest import collector, tdesktop
-from ..ingest.client import build_client
+from ..ingest.client import connect_client
 from ..normalize import threads as threads_mod
 from ..report import build_md
 
@@ -218,11 +218,11 @@ async def run_pipeline(
             pool = await db.get_pool()
 
             if settings.telegram_ready:
-                job["progress"] = "выгрузка"
+                job["progress"] = "загрузка сообщений"
                 await progress("📥 Забираю новые сообщения…")
-                client = build_client()
-                await client.start()
+                client = await connect_client()
                 try:
+                    stats["requests"] = await _connect_requests(pool, client)
                     stats["ingest"] = await collector.sync_all(client, pool, "incremental")
                 finally:
                     await client.disconnect()
@@ -261,6 +261,140 @@ async def run_pipeline(
         except Exception as e:
             await db.log_run("pipeline", stats, error=f"{type(e).__name__}: {e}")
             raise
+
+
+# --------------------------------------------------------- добавление чатов
+
+
+async def save_chat_request(link: str) -> str:
+    """Запомнить чат до подключения. Возвращает статус: new | exists | connected."""
+    pool = await db.get_pool()
+    row = await pool.fetchrow("select status from chat_requests where link = $1", link)
+    if row is not None:
+        return "connected" if row["status"] == "done" else "exists"
+    await pool.execute("insert into chat_requests (link) values ($1)", link)
+    return "new"
+
+
+async def pending_requests() -> list[dict[str, Any]]:
+    pool = await db.get_pool()
+    return [
+        dict(r)
+        for r in await pool.fetch(
+            "select link, status, note from chat_requests "
+            "where status <> 'done' order by added_at"
+        )
+    ]
+
+
+async def _mark_request(pool, link: str, status: str, chat_id: int | None = None,
+                        note: str | None = None) -> None:
+    await pool.execute(
+        """
+        insert into chat_requests (link, status, chat_id, note) values ($1,$2,$3,$4)
+        on conflict (link) do update
+           set status = excluded.status, chat_id = coalesce(excluded.chat_id, chat_requests.chat_id),
+               note = excluded.note, updated_at = now()
+        """,
+        link, status, chat_id, note,
+    )
+
+
+async def connect_chat(link: str, join: bool) -> int:
+    """Подключить чат по ссылке. NeedsJoin/JoinPending пробрасываются наверх."""
+    async with exclusive("подключение чата"):
+        pool = await db.get_pool()
+        client = await connect_client()
+        try:
+            chat_id = await collector.register_chat(client, pool, link, join=join)
+        except collector.JoinPending as e:
+            await _mark_request(pool, link, "join_pending", note=str(e))
+            raise
+        finally:
+            await client.disconnect()
+        await _mark_request(pool, link, "done", chat_id)
+        return chat_id
+
+
+async def _connect_requests(pool, client) -> dict[str, list]:
+    """Подключить сохранённые чаты. Вступление разрешено: человек сам прислал
+    эту ссылку кнопкой «Добавить чат». Не больше join_per_run за раз и с паузой
+    между вступлениями — частые вступления злят антиспам Telegram."""
+    rows = await pool.fetch(
+        "select link from chat_requests where status in ('pending', 'join_pending') "
+        "order by added_at limit $1",
+        settings.join_per_run,
+    )
+    result: dict[str, list] = {"connected": [], "waiting": [], "failed": []}
+    for i, r in enumerate(rows):
+        if i:
+            await asyncio.sleep(settings.join_pause)
+        link = r["link"]
+        try:
+            chat_id = await collector.register_chat(client, pool, link, join=True)
+        except collector.JoinPending:
+            await _mark_request(pool, link, "join_pending", note="ждёт одобрения админа")
+            result["waiting"].append(link)
+            continue
+        except Exception as e:  # noqa: BLE001 — один чат не валит остальные
+            await _mark_request(pool, link, "failed", note=f"{type(e).__name__}: {e}")
+            result["failed"].append((link, str(e)))
+            continue
+        await _mark_request(pool, link, "done", chat_id)
+        title = await pool.fetchval("select title from chats where id = $1", chat_id)
+        result["connected"].append(title or link)
+    return result
+
+
+async def connect_saved_chats() -> dict[str, list]:
+    """Отдельно от полного цикла — при запуске бота, когда ключи появились."""
+    async with exclusive("подключение сохранённых чатов"):
+        pool = await db.get_pool()
+        client = await connect_client()
+        try:
+            return await _connect_requests(pool, client)
+        finally:
+            await client.disconnect()
+
+
+async def chats_without_history() -> list[int]:
+    pool = await db.get_pool()
+    return [
+        r["id"]
+        for r in await pool.fetch(
+            """
+            select c.id from chats c left join cursors cu on cu.chat_id = c.id
+             where c.is_active and not coalesce(cu.backfill_done, false)
+             order by c.id
+            """
+        )
+    ]
+
+
+async def run_history(
+    chat_ids: list[int], on_progress: Callable[[int], Awaitable[None]], job_id: str | None = None
+) -> dict[str, Any]:
+    """Загрузить историю чатов и сразу собрать обсуждения."""
+    async with exclusive("загрузка истории", job_id) as job:
+        pool = await db.get_pool()
+        client = await connect_client()
+        saved = 0
+        try:
+            for chat_id in chat_ids:
+                base = saved
+
+                async def cb(n: int, base: int = base) -> None:
+                    job["progress"] = f"загружено {n + base} сообщений"
+                    await on_progress(n + base)
+
+                res = await collector.sync_chat_full(client, pool, chat_id, on_progress=cb)
+                saved += res.get("saved", 0)
+        finally:
+            await client.disconnect()
+        threads = 0
+        for chat_id in chat_ids:
+            threads += (await threads_mod.build_for_chat(pool, chat_id)).get("threads", 0)
+        return {"saved": saved, "threads": threads, "chats": len(chat_ids)}
 
 
 def seconds_until(hour_utc: int, now: datetime | None = None) -> float:

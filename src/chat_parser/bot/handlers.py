@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import tempfile
@@ -32,8 +33,7 @@ from aiogram.types import (
 from .. import db, usage
 from ..config import settings
 from ..ingest import collector
-from ..ingest.client import build_client
-from ..links import QUOTE_MESSAGE_SQL, message_link
+from ..links import QUOTE_MESSAGE_SQL, BadChatRef, chat_link, message_link, normalize_chat_ref
 from ..llm import build_llm
 from ..quotes import pick_quotes
 from . import format as fmt
@@ -50,12 +50,14 @@ BTN_CLUSTER = "🧩 Пересчитать боли"
 BTN_TOP = "🔝 Топ болей"
 BTN_REPORT = "📄 Отчёт"
 BTN_HELP = "❓ Помощь"
+BTN_ADD = "➕ Добавить чат"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_EXTRACT)],
         [KeyboardButton(text=BTN_CLUSTER), KeyboardButton(text=BTN_TOP)],
-        [KeyboardButton(text=BTN_REPORT), KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_REPORT), KeyboardButton(text=BTN_ADD)],
+        [KeyboardButton(text=BTN_HELP)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -91,6 +93,7 @@ HELP = """👋 <b>Я нахожу боли и потребности рынка 
 🧩 <b>Пересчитать боли</b> — собрать сигналы в боли и описать каждую
 🔝 <b>Топ болей</b> — главные боли по группам людей
 📄 <b>Отчёт</b> — всё одним файлом
+➕ <b>Добавить чат</b> — прислать ссылку на чат, чтобы я читал его сам
 ❓ <b>Помощь</b> — это сообщение
 
 <b>Полезно знать</b>
@@ -105,12 +108,13 @@ HELP = """👋 <b>Я нахожу боли и потребности рынка 
 /retry — повторить обсуждения, которые не получилось разобрать
 /redo — разобрать всё заново (после изменения настроек разбора)
 /run — всё за один раз: разбор, боли и отчёт
-/chats — какие чаты загружены
+/chats — какие чаты загружены, со ссылками
+
+<b>Про «Добавить чат»</b>
+Чтобы я сам читал чаты, нужны ключи Telegram API в настройках. Пока их нет,
+я просто запомню ссылку и подключу чат сам, как только ключи появятся. Сейчас
+историю можно прислать файлом, как описано выше.
 """
-
-# Токен -> ссылка: callback_data ограничен 64 байтами, ссылку туда не засунуть.
-_pending_joins: dict[str, str] = {}
-
 
 class LiveMessage:
     """Сообщение-прогресс, которое правится не чаще раза в interval секунд.
@@ -572,86 +576,190 @@ async def cmd_chats(message: Message) -> None:
     pool = await db.get_pool()
     rows = await pool.fetch(
         """
-        select c.id, c.title, c.username, c.is_active, c.audience_hint,
-               (select count(*) from messages m where m.chat_id = c.id) msgs
-          from chats c order by c.id
+        select c.id, c.title, c.username, c.link, c.is_active, cu.last_run, cu.note,
+               (select count(*) from messages m where m.chat_id = c.id) msgs,
+               (select max(message_id) from messages m where m.chat_id = c.id) last_msg,
+               (select count(*) from threads t where t.chat_id = c.id) threads,
+               (select count(*) from threads t
+                 where t.chat_id = c.id and t.status = 'extracted') done,
+               (select count(*) from signals s where s.chat_id = c.id) signals
+          from chats c left join cursors cu on cu.chat_id = c.id
+         order by c.id
         """
     )
-    if not rows:
-        await message.answer("Чатов нет. Пришли сюда файлом result.json из Telegram Desktop.")
-        return
-    lines = []
-    for r in rows:
-        mark = "" if r["is_active"] else " (выключен)"
-        handle = f" @{r['username']}" if r["username"] else ""
-        hint = f" · {r['audience_hint']}" if r["audience_hint"] else ""
-        lines.append(
-            f"<b>{fmt.esc(r['title'])}</b>{handle}{hint}{mark}\n"
-            f"   <code>{r['id']}</code> · {r['msgs']} сообщ."
+    waiting = await jobs.pending_requests()
+    if not rows and not waiting:
+        await message.answer(
+            "Чатов пока нет. Пришли файл <code>result.json</code> с историей чата "
+            "или нажми ➕ Добавить чат."
         )
-    await _reply_long(message, "\n".join(lines))
+        return
+    lines = ["💬 <b>Чаты</b>", ""]
+    for r in rows:
+        link = chat_link(r["id"], r["username"], r["last_msg"], r["link"])
+        title = fmt.esc(r["title"] or "без названия")
+        name = f'<a href="{html.escape(link, quote=True)}">{title}</a>' if link else (
+            f"<b>{title}</b>"
+        )
+        updated = (f"обновлён {fmt.when(r['last_run'], with_year=True)}" if r["last_run"]
+                   else "история ещё не загружена")
+        lines.append(f"• {name}")
+        lines.append(f"   {fmt.messages_word(r['msgs'])} · {updated}")
+        lines.append(
+            f"   обсуждений: {fmt.fmt_num(r['threads'])}, разобрано: {fmt.fmt_num(r['done'])}, "
+            f"найдено сигналов: {fmt.fmt_num(r['signals'])}"
+        )
+        if not r["is_active"]:
+            lines.append(f"   ⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
+        lines.append("")
+    if waiting:
+        why = ("нужны ключи Telegram API в настройках" if not settings.telegram_ready
+               else "подключу при ближайшем обновлении")
+        lines.append(f"⏳ <b>Ждут подключения</b> ({why}):")
+        for w in waiting:
+            note = {"join_pending": " — ждёт одобрения админа чата",
+                    "failed": f" — не получилось: {fmt.esc(w['note'] or '')}"}.get(w["status"], "")
+            lines.append(f"• {fmt.esc(w['link'])}{note}")
+    await _reply_long(message, "\n".join(lines).rstrip())
+
+
+# ----------------------------------------------------------- добавление чата
+
+ADD_HINT = (
+    "Пришли ссылку на чат одним сообщением:\n"
+    "• <code>t.me/имя_чата</code> или <code>@имя_чата</code> — открытый чат\n"
+    "• <code>t.me/+…</code> — приглашение в закрытый чат"
+)
+LINK_FILTER = F.text.regexp(
+    r"^\s*(?:(?:https?://)?(?:www\.)?(?:t|telegram)\.me/\S+|@[A-Za-z][A-Za-z0-9_]{3,31})\s*$"
+)
+
+# Токен -> ссылка: callback_data ограничен 64 байтами, ссылку туда не засунуть.
+_pending_joins: dict[str, str] = {}
+
+
+@router.message(F.text == BTN_ADD)
+async def btn_add(message: Message) -> None:
+    await message.answer("➕ " + ADD_HINT)
 
 
 @router.message(Command("addchat"))
 async def cmd_addchat(message: Message, command: CommandObject) -> None:
+    if not (command.args or "").strip():
+        await message.answer(ADD_HINT)
+        return
+    await _add_chat(message, command.args)
+
+
+@router.message(LINK_FILTER)
+async def on_chat_link(message: Message) -> None:
+    await _add_chat(message, message.text or "")
+
+
+async def _add_chat(message: Message, raw: str) -> None:
+    try:
+        link = normalize_chat_ref(raw)
+    except BadChatRef as e:
+        await message.answer(f"🤔 {fmt.esc(e)}")
+        return
+
     if not settings.telegram_ready:
-        await message.answer(
-            "Автоматическая выгрузка выключена: в .env не заданы TG_API_ID и TG_API_HASH.\n\n"
-            "Пока без них — пришли сюда файлом <code>result.json</code>: "
-            "Telegram Desktop → чат → ⋮ → Экспорт истории чата → формат JSON."
-        )
+        status = await jobs.save_chat_request(link)
+        if status == "connected":
+            await message.answer("Этот чат уже подключён — он есть в /chats.")
+        elif status == "exists":
+            await message.answer("Этот чат уже в списке ожидания — подключу его, как только смогу.")
+        else:
+            await message.answer(
+                f"📝 Запомнил: {fmt.esc(link)}\n\n"
+                "Читать чаты сам я смогу, когда в настройках появятся ключи Telegram API "
+                "(TG_API_ID и TG_API_HASH). Как только они будут — подключу этот чат и "
+                "загружу его историю без твоего участия.\n\n"
+                "А пока историю можно прислать файлом: Telegram Desktop → чат → ⋮ → "
+                "Экспорт истории чата → формат JSON."
+            )
         return
-    ref = (command.args or "").strip()
-    if not ref:
-        await message.answer("Формат: /addchat @chat или /addchat https://t.me/+HASH")
-        return
-    await _add_chat(message, ref, join=False)
+    await _connect_and_load(message, link, join=False)
 
 
-async def _add_chat(message: Message, ref: str, join: bool) -> None:
-    pool = await db.get_pool()
+async def _connect_and_load(message: Message, link: str, join: bool) -> None:
+    status = await message.answer("🔌 Подключаюсь к чату…")
     try:
-        client = build_client()
-    except Exception as e:  # noqa: BLE001
-        await message.answer(f"❌ {fmt.esc(e)}")
-        return
-    await client.start()
-    try:
-        chat_id = await collector.register_chat(client, pool, ref, join=join)
-        title = await pool.fetchval("select title from chats where id = $1", chat_id)
-        await message.answer(
-            f"✅ Добавлен <b>{fmt.esc(title)}</b> (<code>{chat_id}</code>)\n"
-            "Первая выгрузка: /run"
-        )
+        chat_id = await jobs.connect_chat(link, join)
     except collector.NeedsJoin as e:
         token = uuid.uuid4().hex[:8]
-        _pending_joins[token] = ref
-        await message.answer(
-            f"{fmt.esc(e)}\n\n⚠️ Вступление — самое рискованное для аккаунта действие. "
-            "Держись в пределах 5–10 вступлений в сутки.",
-            reply_markup=_kb(
-                [("Вступить и добавить", f"join:{token}")], [("Отмена", f"drop:{token}")]
-            ),
+        _pending_joins[token] = link
+        await status.edit_text(
+            f"{fmt.esc(e)}\n\n⚠️ Вступление в чаты — самое рискованное для аккаунта "
+            "действие: Telegram может ограничить аккаунт, если вступать часто. "
+            "Держись в пределах 5–10 чатов в сутки.",
+            reply_markup=_kb([("Вступить и добавить", f"join:{token}")],
+                             [("Отмена", f"drop:{token}")]),
         )
-    except collector.JoinPending as e:
-        await message.answer(f"⏳ {fmt.esc(e)}")
-    except Exception as e:  # noqa: BLE001 — показать причину, не падать
-        await message.answer(f"❌ {type(e).__name__}: {fmt.esc(e)}")
-    finally:
-        await client.disconnect()
+        return
+    except collector.JoinPending:
+        await status.edit_text(
+            "⏳ Это закрытый чат с одобрением заявок: заявку на вступление я отправил. "
+            "Как только админ чата её одобрит, подключу чат сам — повторять не нужно."
+        )
+        return
+    except jobs.Busy as e:
+        await status.edit_text(_busy(e))
+        return
+    except Exception as e:  # noqa: BLE001 — показать причину, не ронять бота
+        await status.edit_text(f"❌ Не получилось подключить чат: {fmt.esc(e)}")
+        return
+
+    pool = await db.get_pool()
+    title = await pool.fetchval("select title from chats where id = $1", chat_id)
+    await status.edit_text(f"✅ Подключил чат <b>{fmt.esc(title)}</b>.")
+    await _load_history(message, [chat_id])
+
+
+async def _load_history(message: Message, chat_ids: list[int]) -> None:
+    job_id, live = await _start_live(message, "📥 Загружаю историю…")
+    seen = {"n": 0}
+
+    async def progress(n: int) -> None:
+        seen["n"] = n
+        await live.set(
+            f"📥 Загружаю историю: <b>{fmt.messages_word(n)}</b>\n\n"
+            "<i>Можно остановить — загруженное сохранится, а в следующий раз "
+            "загрузка продолжится с того же места.</i>"
+        )
+
+    try:
+        res = await jobs.run_job(jobs.run_history(chat_ids, progress, job_id))
+    except jobs.Cancelled:
+        await live.set(
+            f"⏹ <b>Загрузка остановлена</b>. Сохранено: {fmt.messages_word(seen['n'])}.\n"
+            "Продолжу с того же места при следующем обновлении.",
+            final=True,
+        )
+        return
+    except jobs.Busy as e:
+        await live.set(_busy(e), final=True)
+        return
+    except Exception as e:  # noqa: BLE001
+        await live.set(f"❌ Загрузка не удалась: {fmt.esc(e)}", final=True)
+        return
+    await live.set(
+        f"✅ Загружено: <b>{fmt.messages_word(res['saved'])}</b>\n"
+        f"Обсуждений в чате: {fmt.fmt_num(res['threads'])}",
+        final=True,
+    )
+    await _extract_menu(message)
 
 
 @router.callback_query(F.data.startswith("join:"))
 async def cb_join(call: CallbackQuery) -> None:
-    token = call.data.split(":", 1)[1]
-    ref = _pending_joins.pop(token, None)
-    if not ref or call.message is None:
-        await call.answer("Запрос устарел, повтори /addchat", show_alert=True)
+    link = _pending_joins.pop(call.data.split(":", 1)[1], None)
+    if not link or call.message is None:
+        await call.answer("Запрос устарел — пришли ссылку ещё раз", show_alert=True)
         return
     await call.answer()
     await _drop_markup(call)
-    await call.message.answer("Вступаю…")
-    await _add_chat(call.message, ref, join=True)
+    await _connect_and_load(call.message, link, join=True)
 
 
 @router.callback_query(F.data.startswith("drop:"))
@@ -659,6 +767,19 @@ async def cb_drop(call: CallbackQuery) -> None:
     _pending_joins.pop(call.data.split(":", 1)[1], None)
     await call.answer("Отменено")
     await _drop_markup(call)
+
+
+@router.callback_query(F.data == "hist:all")
+async def cb_history(call: CallbackQuery) -> None:
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is None:
+        return
+    ids = await jobs.chats_without_history()
+    if not ids:
+        await call.message.answer("Вся история уже загружена.")
+        return
+    await _load_history(call.message, ids)
 
 
 @router.message(Command("models"))
