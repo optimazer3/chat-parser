@@ -113,3 +113,18 @@ create table if not exists runs (
     stats       jsonb,
     error       text
 );
+
+-- ------------------------------------------------------------ защита данных
+-- Supabase публикует схему public через REST API (Data API). Без RLS любой,
+-- у кого есть anon-ключ проекта (он считается публичным), мог бы читать
+-- переписки. Включаем RLS без единой политики: ролям API (anon,
+-- authenticated) доступ закрыт полностью, а пайплайн ходит напрямую под
+-- владельцем таблиц, на которого RLS не распространяется.
+-- Заодно это гасит предупреждения «RLS Disabled in Public» в Security Advisor.
+alter table chats    enable row level security;
+alter table messages enable row level security;
+alter table cursors  enable row level security;
+alter table threads  enable row level security;
+alter table signals  enable row level security;
+alter table clusters enable row level security;
+alter table runs     enable row level security;
