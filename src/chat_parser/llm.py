@@ -92,9 +92,15 @@ class LLM:
         json_mode: str | None = None,
     ) -> None:
         self.model = model or settings.llm_model
+        key = api_key or settings.llm_api_key
+        if not key:
+            # Иначе SDK ругается на OPENAI_API_KEY, что сбивает с толку.
+            raise LLMError("LLM_API_KEY не задан в .env — ключ от шлюза (например, polza.ai)")
+        if not self.model:
+            raise LLMError("LLM_MODEL не задан в .env — список моделей: chat-parser models")
         self.client = AsyncOpenAI(
             base_url=base_url or settings.llm_base_url,
-            api_key=api_key or settings.llm_api_key,
+            api_key=key,
             timeout=180.0,
             max_retries=2,
         )
@@ -102,6 +108,8 @@ class LLM:
         self.mode: str | None = None if mode == "auto" else mode
         # Параметры, специфичные для провайдера (например, выключить «мышление»).
         self.extra_body: dict[str, Any] = settings.llm_extra_body_dict
+        # Сколько потрачено за жизнь клиента — для оценки стоимости прогона.
+        self.usage = {"calls": 0, "prompt": 0, "completion": 0, "reasoning": 0}
 
     async def list_models(self) -> list[str]:
         page = await self.client.models.list()
@@ -162,6 +170,7 @@ class LLM:
             temperature=0,
             **kwargs,
         )
+        self._count_usage(resp)
         choice = resp.choices[0]
         text = choice.message.content or ""
         if text.strip():
@@ -181,6 +190,16 @@ class LLM:
             + (f", рассуждений {thought} симв." if thought else "")
             + ")"
         )
+
+    def _count_usage(self, resp: Any) -> None:
+        self.usage["calls"] += 1
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        self.usage["prompt"] += getattr(u, "prompt_tokens", 0) or 0
+        self.usage["completion"] += getattr(u, "completion_tokens", 0) or 0
+        details = getattr(u, "completion_tokens_details", None)
+        self.usage["reasoning"] += (getattr(details, "reasoning_tokens", 0) or 0) if details else 0
 
     async def structured(
         self, system: str, user: str, schema: type[T], max_tokens: int = 8000

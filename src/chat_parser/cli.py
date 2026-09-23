@@ -407,13 +407,29 @@ def threads() -> None:
 
 
 @app.command()
-def extract(limit: int | None = typer.Option(None, help="Сколько тредов обработать")) -> None:
-    """Извлечь сигналы из тредов через Claude."""
+def extract(
+    limit: int | None = typer.Option(None, help="Сколько тредов обработать"),
+    redo: bool = typer.Option(
+        False, "--redo", help="Обработать заново уже разобранные треды (после правки промпта)"
+    ),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Повторить только упавшие треды"
+    ),
+) -> None:
+    """Извлечь сигналы из тредов через LLM."""
 
     async def go():
         pool = await db.get_pool()
-        stats = await extract_mod.run(pool, limit)
-        print(stats)
+        if redo:
+            n = await extract_mod.reset_for_redo(pool)
+            print(f"Возвращено в очередь тредов: {n} (их сигналы перезапишутся)")
+        elif retry_failed:
+            n = await extract_mod.reset_failed(pool)
+            print(f"Возвращено в очередь упавших тредов: {n}")
+        stats = await extract_mod.run(pool, limit, verbose=True)
+        print()
+        for line in extract_mod.summary_lines(stats):
+            print(line)
         if stats.get("drop_rate", 0) > 0.05:
             print("[yellow]Отбраковка цитат выше 5% — стоит править промпт.[/yellow]")
         await db.log_run("extract", stats)

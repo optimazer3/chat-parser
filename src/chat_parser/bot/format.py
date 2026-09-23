@@ -65,7 +65,7 @@ def fmt_top(clusters: list[Any]) -> str:
             lines.append(f"\n<u>{AUDIENCE_RU.get(current, current)}</u>")
         lines.append(
             f"<b>#{c['id']}</b> {esc(c['label'])}\n"
-            f"   вес {c['score']} · {c['n_authors']} чел. · "
+            f"   вес {c['score']:.1f} · {c['n_authors']} чел. · "
             f"{c['n_chats']} чат. · {c['n_signals']} сигн."
         )
     lines.append("\nПодробно: /pain &lt;номер&gt;")
@@ -79,7 +79,7 @@ def fmt_card(cluster: Any, quotes: list[Any]) -> str:
         "",
         f"<blockquote>{esc(cluster['statement'])}</blockquote>",
         "",
-        f"вес {cluster['score']} · {cluster['n_authors']} чел. · "
+        f"вес {cluster['score']:.1f} · {cluster['n_authors']} чел. · "
         f"{cluster['n_chats']} чат. · {cluster['n_signals']} сигн.",
     ]
     card = cluster["card"]
@@ -134,7 +134,7 @@ def fmt_digest(stats: dict[str, Any], new_signals: int, new_msgs: int, top: list
         lines.append("\n<b>Топ болей сейчас</b>")
         for c in top:
             lines.append(
-                f"<b>#{c['id']}</b> {esc(c['label'])} — вес {c['score']}, "
+                f"<b>#{c['id']}</b> {esc(c['label'])} — вес {c['score']:.1f}, "
                 f"{c['n_authors']} чел."
             )
         lines.append("\nПодробно: /pain &lt;номер&gt; · весь отчёт: /report")

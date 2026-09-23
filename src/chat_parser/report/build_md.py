@@ -54,7 +54,7 @@ async def build(pool: asyncpg.Pool, out: Path, top: int = 30) -> Path:
                 "",
                 f"> {c['statement']}",
                 "",
-                f"**Вес {c['score']}** · {c['n_authors']} чел. · "
+                f"**Вес {c['score']:.1f}** · {c['n_authors']} чел. · "
                 f"{c['n_chats']} чат(ов) · {c['n_signals']} сигнал(ов) · "
                 f"последний раз {c['last_seen']:%Y-%m-%d}",
                 "",

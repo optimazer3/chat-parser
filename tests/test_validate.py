@@ -63,3 +63,17 @@ def test_signal_with_only_foreign_ids_is_dropped():
     ex = Extraction(has_signals=True, signals=[sig("он у нас один на два салона", ids=(999,))])
     good, dropped = validate(ex, SOURCE, {101, 102})
     assert good == [] and dropped == 1
+
+
+def test_one_word_quote_is_dropped():
+    """Регрессия: «jacquemus» проходило как доказательство сигнала."""
+    source = "[m:1 | u:a | 2026-02-03 11:24] у кого есть похожая? jacquemus вроде\n"
+    ex = Extraction(has_signals=True, signals=[sig("jacquemus", ids=(1,))])
+    good, dropped = validate(ex, source, {1})
+    assert good == [] and dropped == 1
+
+
+def test_two_word_quote_is_dropped():
+    ex = Extraction(has_signals=True, signals=[sig("возим туда-сюда")])
+    good, dropped = validate(ex, SOURCE, {101, 102})
+    assert good == [] and dropped == 1

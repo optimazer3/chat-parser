@@ -13,6 +13,8 @@ from .schema import Extraction, Signal
 
 WS_RE = re.compile(r"\s+")
 MIN_QUOTE_CHARS = 8
+# Цитата из одного-двух слов («jacquemus») ничего не доказывает.
+MIN_QUOTE_WORDS = 3
 
 
 def norm(s: str) -> str:
@@ -28,7 +30,11 @@ def validate(
     dropped = 0
     for s in extraction.signals:
         quote = norm(s.evidence_quote)
-        if len(quote) < MIN_QUOTE_CHARS or quote not in haystack:
+        if (
+            len(quote) < MIN_QUOTE_CHARS
+            or len(quote.split()) < MIN_QUOTE_WORDS
+            or quote not in haystack
+        ):
             dropped += 1
             continue
         s.message_ids = [i for i in s.message_ids if i in allowed_ids]

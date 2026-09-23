@@ -189,3 +189,19 @@ async def test_final_error_shows_what_model_said(monkeypatch):
     monkeypatch.setattr(llm.client.chat.completions, "create", create)
     with pytest.raises(LLMError, match="не могу ответить"):
         await llm.structured("sys", "user", Outer)
+
+
+@pytest.mark.asyncio
+async def test_usage_is_accumulated(monkeypatch):
+    llm = _llm()
+
+    async def create(**kw):
+        r = _resp('{"ok": true, "items": []}')
+        r.usage = NS(prompt_tokens=100, completion_tokens=50,
+                     completion_tokens_details=NS(reasoning_tokens=40))
+        return r
+
+    monkeypatch.setattr(llm.client.chat.completions, "create", create)
+    await llm.structured("sys", "user", Outer)
+    await llm.structured("sys", "user", Outer)
+    assert llm.usage == {"calls": 2, "prompt": 200, "completion": 100, "reasoning": 80}

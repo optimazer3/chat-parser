@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     author_salt: str
     ingest_pause: float = 1.2
     extract_concurrency: int = 4
+    # Лимит ответа на один тред. «Думающие» модели изредка рассуждают дольше —
+    # тогда тред повторяется один раз с лимитом EXTRACT_MAX_TOKENS_RETRY.
+    extract_max_tokens: int = 8000
+    extract_max_tokens_retry: int = 24000
     cluster_batch: int = 120
     daily_run_hour_utc: int = 6
 
