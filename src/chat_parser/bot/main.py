@@ -52,71 +52,23 @@ async def _broadcast(bot: Bot, text: str) -> None:
             log.warning("не доставлено %s: %s", admin, e)
 
 
-async def _noop_progress(_: str) -> None:
-    return None
-
-
-async def scheduler(bot: Bot) -> None:
-    """Суточный прогон и дайджест в заданный час UTC."""
-    while True:
-        await asyncio.sleep(jobs.seconds_until(settings.daily_run_hour_utc))
-        since = await jobs.last_pipeline_at()
-        try:
-            # Потолок: если кто-то залил большой экспорт, ночной прогон не
-            # сожжёт всю очередь разом — остаток разберётся в следующие ночи.
-            stats = await jobs.run_job(
-                jobs.run_pipeline(_noop_progress, settings.auto_extract_limit)
-            )
-        except jobs.Cancelled:
-            await _broadcast(bot, "⏹ Ночной прогон остановлен. Продолжу завтра в то же время.")
-            continue
-        except jobs.Busy:
-            log.info("плановый прогон пропущен: занято")
-            continue
-        except Exception as e:  # noqa: BLE001
-            await _broadcast(bot, f"❌ Плановый прогон упал: {type(e).__name__}: {fmt.esc(e)}")
-            continue
-
-        new_msgs, new_signals = await jobs.since_counts(since)
-        pool = await db.get_pool()
-        top = await pool.fetch(
-            "select id, label, score, n_authors from clusters order by score desc limit 5"
-        )
-        await _broadcast(bot, fmt.fmt_digest(stats, new_signals, new_msgs, list(top)))
-
-
 async def connect_saved(bot: Bot) -> None:
     """Ключи Telegram появились — подключить чаты, сохранённые кнопкой
-    «Добавить чат», и предложить загрузить их историю."""
+    «Добавить чат», и предложить загрузить их историю. Токенов модели не
+    тратит: это только подключение, разбор — по кнопке."""
     try:
         res = await jobs.run_job(jobs.connect_saved_chats())
     except (jobs.Busy, jobs.Cancelled):
-        return  # подключатся в ночном цикле
+        return  # подключатся по кнопке в /chats или при следующем запуске
     except Exception as e:  # noqa: BLE001
         await _broadcast(bot, f"❌ Не удалось подключить сохранённые чаты: {fmt.esc(e)}")
         return
-    lines = []
-    if res["connected"]:
-        lines.append("🔌 Подключил сохранённые чаты:")
-        lines += [f"• {fmt.esc(t)}" for t in res["connected"]]
-    if res["waiting"]:
-        lines.append("\n⏳ Ждут одобрения админа чата:")
-        lines += [f"• {fmt.esc(x)}" for x in res["waiting"]]
-    if res["failed"]:
-        lines.append("\n❌ Не получилось:")
-        lines += [f"• {fmt.esc(link)} — {fmt.esc(err)}" for link, err in res["failed"]]
-    if not lines:
+    text, markup = fmt.fmt_connect_result(res)
+    if not text:
         return
-    markup = None
-    if res["connected"]:
-        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📥 Загрузить историю", callback_data="hist:all")
-        ]])
     for admin in settings.admin_ids:
         try:
-            await bot.send_message(admin, "\n".join(lines), reply_markup=markup)
+            await bot.send_message(admin, text, reply_markup=markup)
         except Exception as e:  # noqa: BLE001
             log.warning("не доставлено %s: %s", admin, e)
 
@@ -169,9 +121,9 @@ async def run_bot() -> None:
         await bot.set_my_commands(COMMANDS)
         via = f", через прокси {settings.tg_proxy}" if settings.tg_proxy else ""
         log.info("бот @%s запущен%s, админов: %d", me.username, via, len(settings.admin_ids))
-        task = asyncio.create_task(scheduler(bot))
+        # Расписания нет: всё, что тратит токены, запускается только вручную.
         if settings.telegram_ready and await jobs.pending_requests():
-            asyncio.create_task(connect_saved(bot))
+            task = asyncio.create_task(connect_saved(bot))
         await dp.start_polling(bot)
     finally:
         if task is not None:

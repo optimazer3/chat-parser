@@ -196,7 +196,7 @@ def fmt_digest(stats: dict[str, Any], new_signals: int, new_msgs: int, top: list
     if ext.get("pending_left"):
         lines.append(
             f"Ещё ждут разбора: <b>{discussions(ext['pending_left'])}</b> — "
-            "доразберутся в следующие ночи или сразу по кнопке 🧠 Разобрать"
+            "разобрать их — кнопка 🧠 Разобрать"
         )
     if top:
         lines.append("\n<b>Топ болей сейчас</b>")
@@ -358,3 +358,25 @@ def fmt_usage(report: dict[str, Any], price_in: float = 0.0, price_out: float = 
         lines += ["", "<i>Чтобы видеть стоимость, задай в .env LLM_PRICE_IN и LLM_PRICE_OUT "
                   "— цену за 1 млн токенов запроса и ответа.</i>"]
     return "\n".join(lines)
+
+
+def fmt_connect_result(res: dict[str, list]) -> tuple[str, Any]:
+    """Итог подключения сохранённых чатов: (текст, кнопки)."""
+    lines = []
+    if res["connected"]:
+        lines.append("🔌 Подключил сохранённые чаты:")
+        lines += [f"• {esc(t)}" for t in res["connected"]]
+    if res["waiting"]:
+        lines.append("\n⏳ Ждут одобрения админа чата:")
+        lines += [f"• {esc(x)}" for x in res["waiting"]]
+    if res["failed"]:
+        lines.append("\n❌ Не получилось:")
+        lines += [f"• {esc(link)} — {esc(err)}" for link, err in res["failed"]]
+    markup = None
+    if res["connected"]:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📥 Загрузить историю", callback_data="hist:all")
+        ]])
+    return "\n".join(lines).strip(), markup

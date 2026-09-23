@@ -11,7 +11,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -96,8 +96,8 @@ async def run_job(coro: Awaitable[T]) -> T:
     """Запустить операцию отдельной задачей и дождаться её.
 
     Отдельная задача нужна, чтобы кнопка «Остановить» отменяла именно
-    операцию, а не того, кто её ждёт: обработчик сообщения или ночной
-    планировщик. Остановка превращается в Cancelled; отмена самого
+    операцию, а не того, кто её ждёт: обработчик сообщения или фоновую
+    задачу бота. Остановка превращается в Cancelled; отмена самого
     ожидающего (выключение бота) пробрасывается как есть.
     """
     task = asyncio.ensure_future(coro)
@@ -395,12 +395,3 @@ async def run_history(
         for chat_id in chat_ids:
             threads += (await threads_mod.build_for_chat(pool, chat_id)).get("threads", 0)
         return {"saved": saved, "threads": threads, "chats": len(chat_ids)}
-
-
-def seconds_until(hour_utc: int, now: datetime | None = None) -> float:
-    """Секунды до ближайшего наступления указанного часа UTC."""
-    now = now or datetime.now(timezone.utc)
-    target = now.replace(hour=hour_utc % 24, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()

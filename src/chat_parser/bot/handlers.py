@@ -99,7 +99,7 @@ HELP = """👋 <b>Я нахожу боли и потребности рынка 
 <b>Полезно знать</b>
 • Любую долгую операцию можно остановить кнопкой ⏹ — сделанное сохранится.
 • Меню можно закрыть кнопкой «Отмена» — ничего не запустится.
-• Раз в сутки я сам проверяю новые данные и присылаю сводку.
+• Сам я ничего не запускаю и токены не трачу — только по твоей команде.
 • В топе рядом с каждой болью есть ссылка /pain_… — нажми, пришлю
   подробности: кто страдает, как выкручиваются, цитаты, идеи решений.
 
@@ -230,7 +230,8 @@ async def cmd_status(message: Message) -> None:
     if job:
         progress = f": {fmt.esc(job['progress'])}" if job["progress"] else ""
         text += f"\n\n⏳ Сейчас идёт {fmt.esc(job['name'])}{progress}"
-        # Кнопка и здесь: у ночного прогона нет своего сообщения с прогрессом.
+        # Кнопка и здесь: у фоновой операции (подключение сохранённых чатов при
+        # запуске) нет своего сообщения с прогрессом.
         await _reply_long(message, text, reply_markup=_stop_kb(job["id"]))
         return
     await _reply_long(message, text)
@@ -612,15 +613,21 @@ async def cmd_chats(message: Message) -> None:
         if not r["is_active"]:
             lines.append(f"   ⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
         lines.append("")
+    markup = None
     if waiting:
         why = ("нужны ключи Telegram API в настройках" if not settings.telegram_ready
-               else "подключу при ближайшем обновлении")
+               else "подключу по кнопке ниже")
         lines.append(f"⏳ <b>Ждут подключения</b> ({why}):")
         for w in waiting:
             note = {"join_pending": " — ждёт одобрения админа чата",
                     "failed": f" — не получилось: {fmt.esc(w['note'] or '')}"}.get(w["status"], "")
             lines.append(f"• {fmt.esc(w['link'])}{note}")
-    await _reply_long(message, "\n".join(lines).rstrip())
+        if settings.telegram_ready:
+            markup = _kb([("🔌 Подключить сейчас", "connect:saved")])
+    if markup is not None:
+        await _reply_long(message, "\n".join(lines).rstrip(), reply_markup=markup)
+    else:
+        await _reply_long(message, "\n".join(lines).rstrip())
 
 
 # ----------------------------------------------------------- добавление чата
@@ -767,6 +774,25 @@ async def cb_drop(call: CallbackQuery) -> None:
     _pending_joins.pop(call.data.split(":", 1)[1], None)
     await call.answer("Отменено")
     await _drop_markup(call)
+
+
+@router.callback_query(F.data == "connect:saved")
+async def cb_connect_saved(call: CallbackQuery) -> None:
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is None:
+        return
+    status = await call.message.answer("🔌 Подключаю сохранённые чаты…")
+    try:
+        res = await jobs.run_job(jobs.connect_saved_chats())
+    except jobs.Busy as e:
+        await status.edit_text(_busy(e))
+        return
+    except Exception as e:  # noqa: BLE001
+        await status.edit_text(f"❌ Не получилось: {fmt.esc(e)}")
+        return
+    text, markup = fmt.fmt_connect_result(res)
+    await status.edit_text(text or "Подключать нечего.", reply_markup=markup)
 
 
 @router.callback_query(F.data == "hist:all")

@@ -467,3 +467,19 @@ async def test_saved_chats_connect_when_keys_appear(harness, telegram_api):
     assert await jobs.chats_without_history() == [
         await h.pool.fetchval("select id from chats where username = 'optika_pro'")
     ]
+
+
+async def test_connect_saved_chats_by_button(harness, telegram_api):
+    """Без ночного прогона ожидающие чаты подключаются кнопкой в /chats."""
+    h = harness
+    await h.pool.execute("insert into chat_requests (link) values ('https://t.me/optika_pro')")
+    out = await h.say("/chats")
+    assert "подключу по кнопке ниже" in out and "[connect:saved]" in out
+
+    out = await h.press("connect:saved")
+    assert "Подключил сохранённые чаты" in out and "Оптики Про" in out
+    assert "[hist:all]" in out
+
+    out = await h.press("hist:all")
+    assert "Загружено: <b>3 сообщения</b>" in out and "[ex:all]" in out
+    assert "Ждут подключения" not in await h.say("/chats")

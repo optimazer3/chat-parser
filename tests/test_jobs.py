@@ -1,17 +1,5 @@
-from datetime import datetime, timezone
 
 from chat_parser.bot.format import chunks
-from chat_parser.bot.jobs import seconds_until
-
-
-def test_seconds_until_later_today():
-    now = datetime(2026, 3, 1, 4, 0, tzinfo=timezone.utc)
-    assert seconds_until(6, now) == 2 * 3600
-
-
-def test_seconds_until_rolls_over_midnight_and_month_end():
-    now = datetime(2026, 3, 31, 7, 0, tzinfo=timezone.utc)
-    assert seconds_until(6, now) == 23 * 3600
 
 
 def test_chunks_respect_telegram_limit():
@@ -73,7 +61,7 @@ async def test_stop_button_cancels_only_its_job():
 @pytest.mark.asyncio
 async def test_stop_does_not_kill_the_waiter():
     """Остановка — это Cancelled у ожидающего, а не отмена его самого:
-    так кнопка не убьёт ни обработчик, ни ночной планировщик."""
+    так кнопка не убьёт ни обработчик, ни фоновую задачу бота."""
     started = asyncio.Event()
 
     async def long_job():
@@ -81,13 +69,13 @@ async def test_stop_does_not_kill_the_waiter():
             started.set()
             await asyncio.sleep(60)
 
-    async def scheduler_like():
+    async def background_like():
         try:
             await jobs.run_job(long_job())
         except jobs.Cancelled:
             return "пережил остановку"
 
-    sched = asyncio.create_task(scheduler_like())
+    sched = asyncio.create_task(background_like())
     await started.wait()
     jobs.cancel("job1")
     assert await sched == "пережил остановку"
@@ -152,3 +140,16 @@ def test_extract_result_has_no_technical_numbers():
 def test_stopped_message_says_what_is_kept():
     text = fmt_stopped("разбор", {"done": 7, "signals": 12})
     assert "7 обсуждений" in text and "сохранено" in text
+
+
+
+def test_nothing_runs_on_schedule():
+    """Только ручной запуск: у бота нет планировщика и в справке нет обещаний."""
+    from chat_parser.bot import main
+    from chat_parser.bot.handlers import HELP
+    from chat_parser.config import settings
+
+    assert not hasattr(main, "scheduler")
+    assert not hasattr(jobs, "seconds_until")
+    assert not hasattr(settings, "daily_run_hour_utc")
+    assert "сутки" not in HELP and "только по твоей команде" in HELP
