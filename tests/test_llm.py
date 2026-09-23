@@ -120,3 +120,72 @@ async def test_pinned_mode_does_not_fall_back(monkeypatch):
     monkeypatch.setattr(LLM, "_raw", fake_raw)
     with pytest.raises(APIStatusError):
         await _llm("json_schema").structured("sys", "user", Outer)
+
+
+# ---------- «думающие» модели и пустые ответы ----------
+
+from types import SimpleNamespace as NS  # noqa: E402
+
+from chat_parser.llm import TokenBudgetExhausted  # noqa: E402
+
+
+def _resp(content, finish="stop", reasoning=None):
+    msg = NS(content=content, reasoning_content=reasoning, model_extra={})
+    return NS(choices=[NS(message=msg, finish_reason=finish)], usage=None)
+
+
+@pytest.mark.asyncio
+async def test_budget_eaten_by_reasoning_fails_fast(monkeypatch):
+    """Лимит съели рассуждения -> понятная ошибка сразу, без перебора режимов."""
+    llm = _llm()
+    calls = []
+
+    async def create(**kw):
+        calls.append(kw.get("response_format"))
+        return _resp("", finish="length", reasoning="думаю " * 50)
+
+    monkeypatch.setattr(llm.client.chat.completions, "create", create)
+    with pytest.raises(TokenBudgetExhausted, match="рассуждения"):
+        await llm.structured("sys", "user", Outer, max_tokens=200)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_tries_next_mode(monkeypatch):
+    llm = _llm()
+    answers = iter([_resp("", finish="stop"), _resp('{"ok": true, "items": []}')])
+
+    async def create(**kw):
+        return next(answers)
+
+    monkeypatch.setattr(llm.client.chat.completions, "create", create)
+    result = await llm.structured("sys", "user", Outer)
+    assert result.ok is True
+    assert llm.mode == "json_object"
+
+
+@pytest.mark.asyncio
+async def test_extra_body_reaches_request(monkeypatch):
+    llm = _llm()
+    llm.extra_body = {"enable_thinking": False}
+    seen = {}
+
+    async def create(**kw):
+        seen.update(kw)
+        return _resp('{"ok": true, "items": []}')
+
+    monkeypatch.setattr(llm.client.chat.completions, "create", create)
+    await llm.structured("sys", "user", Outer)
+    assert seen["extra_body"] == {"enable_thinking": False}
+
+
+@pytest.mark.asyncio
+async def test_final_error_shows_what_model_said(monkeypatch):
+    llm = _llm()
+
+    async def create(**kw):
+        return _resp("Извините, я не могу ответить в формате JSON")
+
+    monkeypatch.setattr(llm.client.chat.completions, "create", create)
+    with pytest.raises(LLMError, match="не могу ответить"):
+        await llm.structured("sys", "user", Outer)

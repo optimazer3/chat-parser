@@ -31,6 +31,30 @@ class LLMError(RuntimeError):
     pass
 
 
+class TokenBudgetExhausted(LLMError):
+    """Модель упёрлась в max_tokens, не выдав ответа.
+
+    Типично для «думающих» моделей (Qwen3, DeepSeek-R1 и т.п.): лимит
+    съедают рассуждения. Другой режим JSON тут не поможет, поэтому ошибка
+    летит сразу, без перебора режимов.
+    """
+
+
+class EmptyResponse(ValueError):
+    """Модель вернула пустой content по другой причине — пробуем другой режим."""
+
+
+def reasoning_text(message: Any) -> str:
+    """Рассуждения модели, если шлюз их отдаёт отдельным полем."""
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(message, name, None)
+        if value is None:
+            value = (getattr(message, "model_extra", None) or {}).get(name)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def harden_schema(model: type[BaseModel]) -> dict[str, Any]:
     """JSON Schema под strict-режим: никаких лишних полей, всё обязательно."""
 
@@ -76,6 +100,8 @@ class LLM:
         )
         mode = json_mode or settings.llm_json_mode
         self.mode: str | None = None if mode == "auto" else mode
+        # Параметры, специфичные для провайдера (например, выключить «мышление»).
+        self.extra_body: dict[str, Any] = settings.llm_extra_body_dict
 
     async def list_models(self) -> list[str]:
         page = await self.client.models.list()
@@ -127,6 +153,8 @@ class LLM:
         elif mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
 
+        if self.extra_body:
+            kwargs["extra_body"] = self.extra_body
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,  # type: ignore[arg-type]
@@ -134,7 +162,25 @@ class LLM:
             temperature=0,
             **kwargs,
         )
-        return resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        text = choice.message.content or ""
+        if text.strip():
+            return text
+
+        thought = len(reasoning_text(choice.message))
+        if choice.finish_reason == "length":
+            raise TokenBudgetExhausted(
+                f"модель израсходовала весь лимит max_tokens={max_tokens}"
+                + (f" на рассуждения ({thought} симв.)" if thought else "")
+                + " и не успела ответить. Похоже на «думающую» модель: увеличь "
+                "лимит или выключи рассуждения через LLM_EXTRA_BODY — "
+                "подробности покажет chat-parser llm-test"
+            )
+        raise EmptyResponse(
+            f"пустой ответ (finish_reason={choice.finish_reason}, режим {mode}"
+            + (f", рассуждений {thought} симв." if thought else "")
+            + ")"
+        )
 
     async def structured(
         self, system: str, user: str, schema: type[T], max_tokens: int = 8000
@@ -142,6 +188,7 @@ class LLM:
         """Возвращает провалидированный объект или бросает LLMError."""
         modes = [self.mode] if self.mode else list(MODES)
         last: Exception | None = None
+        last_text = ""
 
         for mode in modes:
             try:
@@ -151,15 +198,19 @@ class LLM:
                     last = e
                     continue  # режим не поддерживается — пробуем более слабый
                 raise
+            except EmptyResponse as e:
+                last = e
+                continue  # чинить нечего — пробуем другой режим
 
             try:
                 obj = schema.model_validate_json(extract_json(text))
                 self.mode = mode
                 return obj
             except (ValidationError, ValueError, json.JSONDecodeError) as e:
-                last = e
+                last, last_text = e, text
 
             # Одна попытка починить ответ в том же режиме.
+            text2 = ""
             try:
                 text2 = await self._raw(
                     system, user, schema, mode, max_tokens, repair=(text, str(last))
@@ -169,8 +220,10 @@ class LLM:
                 return obj
             except (ValidationError, ValueError, json.JSONDecodeError, APIStatusError) as e:
                 last = e
+                last_text = text2 or last_text
 
-        raise LLMError(f"не удалось получить валидный JSON ({self.model}): {last}")
+        tail = f"\nначало ответа модели: {last_text[:300]!r}" if last_text else ""
+        raise LLMError(f"не удалось получить валидный JSON ({self.model}): {last}{tail}")
 
 
 def build_llm(model: str | None = None) -> LLM:

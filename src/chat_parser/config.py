@@ -1,4 +1,7 @@
+import json
+import re
 from pathlib import Path
+from typing import Any
 
 from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -7,6 +10,16 @@ WHERE_TO_GET = {
     "database_url": "Supabase -> Project Settings -> Database -> Connection string (URI, Session pooler)",
     "author_salt": 'python -c "import secrets; print(secrets.token_hex(16))"',
 }
+
+
+# Значения-заглушки из прежних версий .env.example: их копировали вместе
+# с файлом, и код принимал их за настоящие ключи.
+PLACEHOLDER_API_IDS = {1234567}
+SUPABASE_DIRECT_RE = re.compile(r"@db\.([a-z0-9]+)\.supabase\.co\b")
+
+
+def is_placeholder_hash(value: str) -> bool:
+    return bool(value) and set(value.lower()) == {"x"}
 
 
 class Settings(BaseSettings):
@@ -34,6 +47,9 @@ class Settings(BaseSettings):
     llm_model_synth: str = ""  # для кластеризации/карточек; пусто -> llm_model
     llm_json_mode: str = "auto"  # auto | json_schema | json_object | text
     llm_max_context_tokens: int = 32000  # для нарезки батчей кластеризации
+    # JSON с параметрами конкретного провайдера, уходит в запрос как есть.
+    # Например, выключить рассуждения у «думающих» моделей.
+    llm_extra_body: str = ""
 
     # --- Прочее ---
     author_salt: str
@@ -48,8 +64,39 @@ class Settings(BaseSettings):
     min_words_standalone: int = 8
 
     @property
+    def telegram_placeholders(self) -> bool:
+        return self.tg_api_id in PLACEHOLDER_API_IDS or is_placeholder_hash(self.tg_api_hash)
+
+    @property
     def telegram_ready(self) -> bool:
-        return bool(self.tg_api_id and self.tg_api_hash)
+        return (
+            bool(self.tg_api_id and self.tg_api_hash) and not self.telegram_placeholders
+        )
+
+    @property
+    def supabase_direct_ref(self) -> str | None:
+        """project ref, если в DATABASE_URL прямое подключение db.<ref>.supabase.co.
+
+        У новых проектов оно работает только по IPv6 и с обычного
+        домашнего интернета не резолвится.
+        """
+        m = SUPABASE_DIRECT_RE.search(self.database_url)
+        return m.group(1) if m else None
+
+    @property
+    def llm_extra_body_dict(self) -> dict[str, Any]:
+        if not self.llm_extra_body.strip():
+            return {}
+        try:
+            value = json.loads(self.llm_extra_body)
+        except json.JSONDecodeError as e:
+            raise SystemExit(
+                f"LLM_EXTRA_BODY — невалидный JSON: {e}\n"
+                f'пример: LLM_EXTRA_BODY={{"enable_thinking": false}}'
+            ) from None
+        if not isinstance(value, dict):
+            raise SystemExit("LLM_EXTRA_BODY должен быть JSON-объектом: {...}")
+        return value
 
     @property
     def admin_ids(self) -> set[int]:

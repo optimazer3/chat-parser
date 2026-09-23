@@ -23,6 +23,12 @@ from .report import build_md
 
 app = typer.Typer(no_args_is_help=True, help="Мониторинг чатов рынка оптики")
 
+DOCTOR_TIMEOUT = 25
+LLM_TIMEOUT = 150
+# «Думающие» модели тратят токены на рассуждения до ответа — 200 им не
+# хватало даже на «pong».
+PING_MAX_TOKENS = 4000
+
 
 def _run(coro):
     async def wrapper():
@@ -52,6 +58,65 @@ def models(grep: str = typer.Option("", help="Показать только id, 
     _run(go())
 
 
+@app.command("llm-test")
+def llm_test(
+    max_tokens: int = typer.Option(PING_MAX_TOKENS, help="Лимит токенов на ответ"),
+) -> None:
+    """Показать сырой ответ модели — когда doctor говорит «нет JSON»."""
+
+    async def go():
+        from .llm import reasoning_text
+
+        llm = build_llm()
+        print(f"[dim]{settings.llm_base_url} · {llm.model} · max_tokens={max_tokens}[/dim]")
+        if llm.extra_body:
+            print(f"[dim]LLM_EXTRA_BODY: {json.dumps(llm.extra_body, ensure_ascii=False)}[/dim]")
+        kwargs = {"extra_body": llm.extra_body} if llm.extra_body else {}
+        resp = await llm.client.chat.completions.create(
+            model=llm.model,
+            messages=[
+                {"role": "system", "content": "Ответь строго одним JSON-объектом."},
+                {"role": "user", "content": 'Верни {"ok": true, "answer": "pong"}'},
+            ],
+            max_tokens=max_tokens,
+            temperature=0,
+            **kwargs,
+        )
+        choice = resp.choices[0]
+        usage = resp.usage
+        reasoning_tokens = None
+        details = getattr(usage, "completion_tokens_details", None) if usage else None
+        if details is not None:
+            reasoning_tokens = getattr(details, "reasoning_tokens", None)
+        thought = reasoning_text(choice.message)
+        content = choice.message.content or ""
+
+        print(f"\nfinish_reason:    [bold]{choice.finish_reason}[/bold]")
+        if usage:
+            print(f"токенов:          запрос {usage.prompt_tokens}, "
+                  f"ответ {usage.completion_tokens}"
+                  + (f", из них рассуждения {reasoning_tokens}" if reasoning_tokens else ""))
+        print(f"рассуждения:      {len(thought)} симв." if thought else "рассуждения:      нет")
+        print(f"content ({len(content)} симв.):")
+        print(f"  {content[:800]!r}")
+
+        print()
+        if content.strip():
+            print("[green]Модель отвечает текстом.[/green] Если doctor всё равно ругается — "
+                  "пришли этот вывод целиком.")
+        elif choice.finish_reason == "length":
+            print("[yellow]Ответ пустой: лимит съели рассуждения.[/yellow] Варианты:")
+            print("  1) выключить рассуждения — в .env, например:")
+            print('       LLM_EXTRA_BODY={"enable_thinking": false}')
+            print("     точное имя параметра зависит от шлюза, смотри документацию polza.ai;")
+            print("  2) взять ту же модель без режима рассуждений: chat-parser models --grep qwen")
+            print(f"  3) проверить с большим лимитом: chat-parser llm-test --max-tokens {max_tokens * 4}")
+        else:
+            print("[yellow]Ответ пустой.[/yellow] Пришли этот вывод целиком.")
+
+    _run(go())
+
+
 @app.command("init-db")
 def init_db() -> None:
     """Накатить схему в Supabase. Идемпотентно, повторный запуск безопасен."""
@@ -67,7 +132,6 @@ def init_db() -> None:
     _run(go())
 
 
-DOCTOR_TIMEOUT = 25
 TG_CONNECT_TIMEOUT = 15
 
 
@@ -134,7 +198,7 @@ async def _probe_llm():
         "Ты отвечаешь строго одним JSON-объектом.",
         "Верни ok=true и answer=\"pong\".",
         _Ping,
-        max_tokens=200,
+        max_tokens=PING_MAX_TOKENS,
     )
     return llm.mode, available
 
@@ -171,8 +235,16 @@ def doctor() -> None:
         res, err = await _probe(_probe_db())
         if err:
             print(f"  [red]FAIL[/red] {err}")
-            print("  [dim]подсказка: в Supabase бери Session pooler (порт 5432),")
-            print("  [dim]прямое подключение у новых проектов только по IPv6[/dim]")
+            ref = settings.supabase_direct_ref
+            if ref:
+                print("  [yellow]В DATABASE_URL прямое подключение (db.….supabase.co) —[/yellow]")
+                print("  [yellow]у новых проектов оно работает только по IPv6.[/yellow]")
+                print("  Нужен Session pooler: Supabase -> кнопка Connect вверху проекта")
+                print("  -> Connection String -> Method: Session pooler. В той строке")
+                print(f"  логин будет [bold]postgres.{ref}[/bold], а хост — …pooler.supabase.com")
+            else:
+                print("  [dim]подсказка: в Supabase бери Session pooler (порт 5432),[/dim]")
+                print("  [dim]прямое подключение у новых проектов только по IPv6[/dim]")
             problems.append("БД")
         else:
             ver, missing, counts = res
@@ -187,7 +259,13 @@ def doctor() -> None:
                       f" сигналов {counts['sig']}")
 
         print("\n[bold]3. Telegram (выгрузка)[/bold]")
-        if not settings.telegram_ready:
+        if settings.telegram_placeholders:
+            print("  [yellow]—[/yellow]    В TG_API_ID/TG_API_HASH заглушки из примера "
+                  "(1234567 / xxxx…) — считаю, что ключей нет.")
+            print("  [dim]Очисти эти две строки в .env или впиши настоящие ключи.[/dim]")
+            print("  [dim]Пока ключей нет, историю можно залить вручную —[/dim]")
+            print("  [dim]chat-parser import-json <result.json>[/dim]")
+        elif not settings.telegram_ready:
             print("  [yellow]—[/yellow]    TG_API_ID/TG_API_HASH не заданы, "
                   "выгрузка из Telegram выключена.")
             print("  [dim]Это не ошибка: историю можно залить вручную —[/dim]")
@@ -210,9 +288,10 @@ def doctor() -> None:
             print("  [red]FAIL[/red] LLM_MODEL не задан — посмотри: chat-parser models")
             problems.append("LLM_MODEL")
         else:
-            res, err = await _probe(_probe_llm(), 60)
+            res, err = await _probe(_probe_llm(), LLM_TIMEOUT)
             if err:
                 print(f"  [red]FAIL[/red] {err}")
+                print("  [dim]сырой ответ модели покажет: chat-parser llm-test[/dim]")
                 problems.append("LLM")
             else:
                 mode, available = res
