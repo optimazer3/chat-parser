@@ -19,16 +19,16 @@ from pathlib import Path
 import asyncpg
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, Filter
 from aiogram.types import (
     CallbackQuery,
-    ForceReply,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    User,
 )
 
 from .. import clock, db, usage
@@ -60,7 +60,7 @@ BTN_TIME = "⏰ Время отчёта"
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "4"
+KEYBOARD_VERSION = "5"
 
 # Прежние кнопки (статус, разобрать, отчёт…) убраны с клавиатуры, но их
 # обработчики оставлены: у кого-то в Telegram ещё может висеть старая.
@@ -196,18 +196,68 @@ async def _drop_markup(call: CallbackQuery) -> None:
 # ------------------------------------------------------------- справка/статус
 
 
+# ------------------------------------------------ ответ на подсказку бота
+#
+# «Пришли время», «пришли @ник и сведения» — бот ждёт следующее сообщение.
+# ForceReply здесь нельзя: в Telegram он занимает место клавиатуры бота, и
+# кнопки внизу пропадают до следующего /start.
+
+AWAIT_SECONDS = 15 * 60
+_awaiting: dict[int, tuple[str, float]] = {}  # кто -> (чего ждём, до какого момента)
+KEYBOARD_TEXTS = {BTN_STATUS, BTN_EXTRACT, BTN_CLUSTER, BTN_TOP, BTN_REPORT, BTN_HELP,
+                  BTN_ADD, BTN_TOP_MONTH, BTN_CHATS, BTN_PERSON, BTN_TIME}
+CANCEL_KB = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel")]]
+)
+
+
+def _await_answer(user: User | None, what: str) -> None:
+    if user is not None:
+        _awaiting[user.id] = (what, time.monotonic() + AWAIT_SECONDS)
+
+
+class AwaitingAnswer(Filter):
+    """Это ответ на подсказку. Нажали кнопку внизу или команду — ждать перестаём."""
+
+    async def __call__(self, message: Message) -> bool | dict:
+        item = _awaiting.pop(message.from_user.id, None) if message.from_user else None
+        if item is None:
+            return False
+        what, deadline = item
+        text = (message.text or "").strip()
+        if (time.monotonic() > deadline or not text or text.startswith("/")
+                or text in KEYBOARD_TEXTS):
+            return False
+        return {"awaiting": what}
+
+
+@router.message(F.text, AwaitingAnswer())
+async def on_awaited_answer(message: Message, awaiting: str) -> None:
+    text = (message.text or "").strip()
+    if awaiting == "time":
+        await _time_answer(message, text)
+    elif awaiting == "person":
+        await _person_info(message, text)
+    elif awaiting.startswith(("edit:", "note:")):
+        kind, label = awaiting.split(":", 1)
+        await _person_edit(message, "✏️" if kind == "edit" else "📝", label, text)
+
+
 EDIT_PROMPT_RE = r"^(✏️|📝) .*?(u:[0-9a-f]{8})"
 
 
 @router.message(F.reply_to_message.text.regexp(EDIT_PROMPT_RE))
 async def on_person_edit_reply(message: Message) -> None:
-    """Ответ на «✏️ Компания и роль для u:…» или «📝 Заметка для u:…»."""
+    """Ответили на «✏️ Компания и роль для u:…» или «📝 Заметка для u:…» сами."""
     m = re.match(EDIT_PROMPT_RE, message.reply_to_message.text or "")
-    text = (message.text or "").strip()
-    if not m or not text:
+    if m:
+        await _person_edit(message, m.group(1), m.group(2), (message.text or "").strip())
+
+
+async def _person_edit(message: Message, kind: str, label: str, text: str) -> None:
+    if not text:
         await message.answer("Не понял ответ — напиши текстом.")
         return
-    kind, label = m.group(1), m.group(2)
     pool = await db.get_pool()
     if kind == "✏️":
         company, role = people.split_company_role(text)
@@ -231,15 +281,20 @@ PERSON_EXAMPLES = (
 
 @router.message(F.reply_to_message.text.startswith(TIME_PROMPT))
 async def on_time_reply(message: Message) -> None:
+    await _time_answer(message, message.text or "")
+
+
+async def _time_answer(message: Message, text: str) -> None:
     from . import live
 
-    parsed = live.parse_time(message.text or "")
+    parsed = live.parse_time(text)
     if parsed is None:
         await message.answer(
-            f"{TIME_PROMPT}\n\nНе понял «{fmt.esc(message.text or '')}». Ответь на это "
-            "сообщение временем, например <b>21:30</b> или <b>9:00</b>.",
-            reply_markup=ForceReply(input_field_placeholder="21:30", selective=True),
+            f"{TIME_PROMPT}\n\nНе понял «{fmt.esc(text)}». Напиши время, например "
+            "<b>21:30</b> или <b>9:00</b>.",
+            reply_markup=CANCEL_KB,
         )
+        _await_answer(message.from_user, "time")
         return
     await _apply_time(message, *parsed)
 
@@ -429,6 +484,7 @@ async def cb_stop(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "cancel")
 async def cb_cancel(call: CallbackQuery) -> None:
+    _awaiting.pop(call.from_user.id, None)
     await call.answer("Отменено")
     await _drop_markup(call)
 
@@ -1185,10 +1241,11 @@ async def cb_time(call: CallbackQuery) -> None:
     value = call.data.split(":", 1)[1]
     if value == "custom":
         await call.message.answer(
-            f"{TIME_PROMPT}\n\nОтветь на это сообщение временем по {clock.tz_label()}, "
-            "например <b>21:30</b> или <b>9</b>.",
-            reply_markup=ForceReply(input_field_placeholder="21:30", selective=True),
+            f"{TIME_PROMPT}\n\nНапиши время по {clock.tz_label()}, например <b>21:30</b> "
+            "или <b>9</b>.",
+            reply_markup=CANCEL_KB,
         )
+        _await_answer(call.from_user, "time")
         return
     parsed = live.parse_time(value[:2] + ":" + value[2:])
     if parsed:
@@ -1224,14 +1281,14 @@ async def cmd_who(message: Message, command: CommandObject) -> None:
 @router.message(F.text == BTN_PERSON)
 async def btn_person(message: Message) -> None:
     await message.answer(
-        f"{PERSON_PROMPT}\n\nОтветь на это сообщение: @username, а дальше через запятую — "
+        f"{PERSON_PROMPT}\n\nПришли одним сообщением @username, а дальше через запятую — "
         f"компания, роль и заметка, что знаешь:\n{PERSON_EXAMPLES}\n\n"
         "Можно по строкам: первая — @username, потом компания, роль, заметка. "
         "Вместо @username подойдёт /who_… из подписи под цитатой. "
         "Не присланное не меняется.",
-        reply_markup=ForceReply(input_field_placeholder="@username Компания, роль, заметка",
-                                selective=True),
+        reply_markup=CANCEL_KB,
     )
+    _await_answer(message.from_user, "person")
 
 
 # «@ivan_optika Оптика Люкс, владелец» и без ответа на подсказку. Один
@@ -1245,12 +1302,12 @@ async def _person_info(message: Message, text: str) -> None:
     parsed = people.parse_person_info(text)
     if parsed is None:
         await message.answer(
-            f"{PERSON_PROMPT}\n\nНе вижу @username в начале. Ответь на это сообщение так:\n"
+            f"{PERSON_PROMPT}\n\nНе вижу @username в начале. Напиши так:\n"
             f"{PERSON_EXAMPLES}\n\nЕсли ника нет — открой карточку человека через /who_… "
             "под его цитатой или в 👥 списке участников чата.",
-            reply_markup=ForceReply(input_field_placeholder="@username Компания, роль",
-                                    selective=True),
+            reply_markup=CANCEL_KB,
         )
+        _await_answer(message.from_user, "person")
         return
     username, label, rest = parsed
     if label is None:
@@ -1295,17 +1352,13 @@ async def cb_person_edit(call: CallbackQuery) -> None:
     name = await pool.fetchval("select name from authors where author_label = $1", label)
     who = f" ({fmt.esc(name)})" if name else ""
     if kind == "pe":
-        text = (f"✏️ Компания и роль для {label}{who}\n\nОтветь на это сообщение одной "
-                "строкой через запятую, например: <i>Оптика Люкс, владелец</i>\n"
+        text = (f"✏️ Компания и роль для {label}{who}\n\nНапиши одной строкой через "
+                "запятую, например: <i>Оптика Люкс, владелец</i>\n"
                 "Только компания — без запятой. Стереть — «-».")
-        hint = "Оптика Люкс, владелец"
     else:
-        text = (f"📝 Заметка для {label}{who}\n\nОтветь на это сообщение текстом заметки. "
-                "Стереть — «-».")
-        hint = "например: знакомы по выставке"
-    await call.message.answer(
-        text, reply_markup=ForceReply(input_field_placeholder=hint, selective=True)
-    )
+        text = f"📝 Заметка для {label}{who}\n\nНапиши текст заметки. Стереть — «-»."
+    await call.message.answer(text, reply_markup=CANCEL_KB)
+    _await_answer(call.from_user, ("edit:" if kind == "pe" else "note:") + label)
 
 
 @router.callback_query(F.data.startswith("pa:"))

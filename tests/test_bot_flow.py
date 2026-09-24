@@ -155,6 +155,8 @@ async def harness(monkeypatch, tmp_path):
             if name in ("SendMessage", "EditMessageText"):
                 text = method.text
                 rm = getattr(method, "reply_markup", None)
+                # ForceReply и ReplyKeyboardRemove в Telegram прячут кнопки внизу
+                assert type(rm).__name__ not in ("ForceReply", "ReplyKeyboardRemove"), text
                 if rm is not None and hasattr(rm, "inline_keyboard"):
                     self.labels += [b.text for row in rm.inline_keyboard for b in row]
                     text += " " + " ".join(
@@ -184,6 +186,9 @@ async def harness(monkeypatch, tmp_path):
     dp.message.outer_middleware(guard)
     dp.callback_query.outer_middleware(guard)
     dp.include_router(router)
+
+    from chat_parser.bot import handlers
+    handlers._awaiting.clear()
 
     pool = await db.get_pool()
     await pool.execute(
@@ -748,17 +753,18 @@ async def test_people_and_companies(evening):
     assert "✅ Сохранил." in out and "Компания: Оптика Люкс" in out and "Роль: владелец" in out
     assert "[pa:" not in out
 
-    # Марии нейросеть ничего не подсказала — вносим руками ответом на сообщение
+    # Марии нейросеть ничего не подсказала — вносим руками: кнопка, потом ответ
     assert "[pa:" not in await h.say("/who_bbbbbbbb")
     prompt = await h.press("pe:bbbbbbbb")
-    assert "✏️ Компания и роль для u:bbbbbbbb (Мария)" in prompt
-    out = await h.say("Линзы Плюс, продавец", reply_to=prompt)
+    assert "✏️ Компания и роль для u:bbbbbbbb (Мария)" in prompt and "[cancel]" in prompt
+    out = await h.say("Линзы Плюс, продавец")
     assert "Компания: Линзы Плюс" in out and "Роль: продавец" in out
+    await h.press("pn:bbbbbbbb")
+    assert "Заметка: знакомы по выставке" in await h.say("знакомы по выставке")
     prompt = await h.press("pn:bbbbbbbb")
-    assert "Заметка: знакомы по выставке" in await h.say("знакомы по выставке", reply_to=prompt)
-    assert "Заметка:" not in await h.say("-", reply_to=prompt)
-    prompt = await h.press("pe:bbbbbbbb")
-    out = await h.say("-", reply_to=prompt)
+    assert "Заметка:" not in await h.say("-", reply_to=prompt)  # и через «Ответить»
+    await h.press("pe:bbbbbbbb")
+    out = await h.say("-")
     assert "Компания: — не указано" in out and "Роль: — не указано" in out
     assert "нет в базе" in await h.say("/who_deadbeef")
 
@@ -845,9 +851,9 @@ async def test_report_time(harness, monkeypatch):
 
     prompt = await h.press("rt:custom")
     assert prompt.startswith("⏰ Во сколько присылать итоги дня?")
-    out = await h.say("25:00", reply_to=prompt)
+    out = await h.say("25:00")
     assert "Не понял «25:00»" in out
-    out = await h.say("21:45", reply_to=out)  # отвечают на повторную подсказку
+    out = await h.say("21:45")  # после ошибки бот ждёт ответ снова
     assert "<b>21:45</b>" in out and "сегодня в 21:45" in out
 
     # время уже прошло, а сегодняшних итогов не было — предлагаем прислать сейчас
@@ -950,7 +956,7 @@ async def test_person_info_by_username(evening):
 
     prompt = await h.say("👤 Инфо о человеке")
     assert prompt.startswith("👤 Информация о человеке") and "@ivan_optika Оптика Люкс" in prompt
-    out = await h.say("@ivan_optika Оптика Люкс, владелец, знакомы по выставке", reply_to=prompt)
+    out = await h.say("@ivan_optika Оптика Люкс, владелец, знакомы по выставке")
     assert "✅ Сохранил." in out and "👤 <b>Иван Петров</b> (@ivan_optika)" in out
     assert "Компания: Оптика Люкс" in out and "Роль: владелец" in out
     assert "Заметка: знакомы по выставке" in out
@@ -962,9 +968,13 @@ async def test_person_info_by_username(evening):
     assert "Заметка: знакомы по выставке" in out
     out = await h.say("/who_bbbbbbbb Линзы Плюс")
     assert "👤 <b>Мария</b>" in out and "Компания: Линзы Плюс" in out
-    out = await h.say("@olga", reply_to=prompt)  # только ник — просто карточка
+    await h.say("👤 Инфо о человеке")
+    out = await h.say("@olga")  # в ответ на подсказку один ник — просто карточка
     assert "Ольга Смирнова" in out and "Сохранил" not in out
-    assert "Не вижу @username" in await h.say("Иван Петров, Оптика Люкс", reply_to=prompt)
+    await h.say("👤 Инфо о человеке")
+    assert "Не вижу @username" in await h.say("Иван Петров, Оптика Люкс")
+    out = await h.say("@maria_opt Линзы Плюс")  # после подсказки об ошибке ждём снова
+    assert "Не нашёл @maria_opt" in out
 
     # ещё не писал в чатах — нашёлся в Telegram, сведения записаны заранее
     out = await h.say("@petr_lens Линзы Центр, закупщик")
@@ -980,3 +990,33 @@ async def test_person_info_by_username(evening):
     assert "— Иван Петров · Оптика Люкс, продавец /who_aaaaaaaa" in await h.say("/signals 30")
     # один @ник без текста — по-прежнему добавление чата
     assert "Подключил чат" in await h.say("@optika_pro")
+
+
+async def test_prompts_keep_keyboard_and_can_be_left(harness, monkeypatch):
+    """Бот ждёт ответ на подсказку, но кнопки внизу работают как обычно:
+    нажал другую кнопку, команду или «Отмена» — ждать перестаёт."""
+    from chat_parser.bot import handlers, live
+
+    h = harness
+    await h.press("rt:custom")
+    assert "Чатов пока нет" in await h.say("💬 Список чатов")  # кнопка сработала как обычно
+    assert await h.say("21:30") == ""  # это уже не ответ на подсказку
+    assert await live.report_time() == (22, 0)
+
+    await h.press("rt:custom")
+    await h.say("/status")
+    assert await h.say("21:30") == ""
+
+    await h.press("rt:custom")
+    await h.press("cancel")
+    assert await h.say("21:30") == ""
+
+    await h.press("rt:custom")
+    monkeypatch.setattr(handlers, "AWAIT_SECONDS", -1)  # прошло больше 15 минут
+    await h.press("rt:custom")
+    assert await h.say("21:30") == ""
+
+    monkeypatch.setattr(handlers, "AWAIT_SECONDS", 900)
+    await h.press("rt:custom")
+    assert "<b>21:30</b>" in await h.say("21:30")
+    assert await live.report_time() == (21, 30)
