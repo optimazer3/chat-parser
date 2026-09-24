@@ -1,6 +1,7 @@
 """Вечерний разбор чатов и итоги дня.
 
-Раз в день, в REPORT_HOUR по местному времени, аккаунт-сборщик забирает
+Раз в день, в выбранное время (кнопка ⏰ в боте; по умолчанию REPORT_HOUR
+по местному времени), аккаунт-сборщик забирает
 переписку за последние сутки (для контекста — ещё сутки до них), собирает
 обсуждения, разбирает те, что шли сегодня, раскладывает сигналы по болям и
 присылает один отчёт. Автоматический разбор идёт в дневной бюджет
@@ -9,8 +10,10 @@ LIVE_DAILY_BUDGET. Архив, залитый из файлов, не трога
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -35,8 +38,10 @@ ENABLED_KEY = "live_enabled"
 BUDGET_HIT_KEY = "live_budget_hit"
 LAST_RUN_KEY = "live_last_run"
 ERRORS_KEY = "live_errors"
-REPORT_DATE_KEY = "daily_report_date"
-REPORT_AT_KEY = "daily_report_at"
+REPORT_DATE_KEY = "daily_report_date"   # за какой день отчёт уже отправлен
+REPORT_AT_KEY = "daily_report_at"       # когда закрыт период прошлого отчёта
+REPORT_TIME_KEY = "report_time"         # «21:30», выбранное в боте
+NEXT_REPORT_KEY = "report_next_at"      # когда присылать следующий
 DAY = timedelta(hours=24)
 CONTEXT = timedelta(hours=48)  # сутки отчёта + сутки до них для контекста
 
@@ -73,10 +78,87 @@ async def budget_hit_today() -> datetime | None:
 
 
 async def _period_start(now: datetime) -> datetime:
-    """С прошлого отчёта, но не дальше суток назад."""
+    """С прошлого отчёта (после смены времени между отчётами бывает больше
+    суток), но не дальше двух суток назад. Первый отчёт — за сутки."""
     raw = await db.get_setting(REPORT_AT_KEY)
     last = datetime.fromisoformat(raw) if raw else None
-    return max(last, now - DAY) if last else now - DAY
+    return max(last, now - CONTEXT) if last else now - DAY
+
+
+# ------------------------------------------------------------ расписание
+
+# Время поменяли в боте — цикл отчёта просыпается и пересчитывает ожидание.
+schedule_changed = asyncio.Event()
+
+TIME_RE = re.compile(r"(?:в\s*)?(\d{1,2})(?:\s*[:.\-ч ]\s*(\d{2}))?(?:\s*(?:ч|час|часа|часов))?")
+
+
+def parse_time(text: str) -> tuple[int, int] | None:
+    """«21:30», «21.30», «9», «в 9:05» -> (час, минута). Иначе None."""
+    m = TIME_RE.fullmatch(text.strip().lower())
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+async def report_time() -> tuple[int, int]:
+    raw = await db.get_setting(REPORT_TIME_KEY)
+    if raw:
+        hour, minute = raw.split(":")
+        return int(hour), int(minute)
+    return settings.report_hour % 24, 0
+
+
+async def _sent_today() -> bool:
+    return await db.get_setting(REPORT_DATE_KEY) == clock.now().date().isoformat()
+
+
+async def next_report_at() -> datetime:
+    raw = await db.get_setting(NEXT_REPORT_KEY)
+    if raw:
+        return datetime.fromisoformat(raw)
+    # Расписания ещё нет: сегодняшний отчёт, если его не было, — даже если
+    # время уже прошло (бот был выключен), тогда он придёт сразу.
+    hour, minute = await report_time()
+    today = clock.at_time(hour, minute)
+    return today + DAY if await _sent_today() else today
+
+
+async def report_due(at: datetime | None = None) -> bool:
+    """Время отчёта наступило. Бот был выключен — отчёт досылается при запуске."""
+    return (at or clock.now()) >= await next_report_at()
+
+
+async def _advance(pending: datetime) -> None:
+    """Отчёт за pending отправлен (или отменён) — следующий по расписанию,
+    не раньше следующего дня: даже если время успели поменять на более позднее."""
+    hour, minute = await report_time()
+    pending = pending.astimezone(clock.tz())
+    nxt = clock.next_at(hour, minute, max(clock.now(), pending))
+    if nxt.date() <= pending.date():
+        nxt += DAY
+    await db.set_setting(NEXT_REPORT_KEY, nxt.isoformat())
+
+
+async def skip_pending() -> None:
+    """Вечерний отчёт остановили кнопкой ⏹ — сегодня больше не пытаемся."""
+    await _advance(await next_report_at())
+
+
+async def set_report_time(hour: int, minute: int) -> tuple[datetime, bool]:
+    """Новое время. Возвращает (когда следующий отчёт, пропадает ли сегодняшний).
+    Сегодняшний пропадает, если его ещё не было, а новое время уже прошло."""
+    sent = await _sent_today()
+    today = clock.at_time(hour, minute)
+    passed = today <= clock.now()
+    nxt = today + DAY if passed or sent else today
+    await db.set_setting(REPORT_TIME_KEY, f"{hour:02d}:{minute:02d}")
+    await db.set_setting(NEXT_REPORT_KEY, nxt.isoformat())
+    schedule_changed.set()
+    return nxt, passed and not sent
 
 
 # ------------------------------------------------------------ вечерний проход
@@ -200,20 +282,18 @@ async def day_highlights(since: datetime, until: datetime, fresh: datetime) -> l
 # ------------------------------------------------------------ дневной отчёт
 
 
-async def report_due(at: datetime | None = None) -> bool:
-    """Сегодняшний отчёт ещё не отправлен, а его время уже наступило.
-    Так отчёт досылается, если в REPORT_HOUR бот был выключен."""
-    local = (at or clock.now()).astimezone(clock.tz())
-    if local.hour < settings.report_hour:
-        return False
-    return await db.get_setting(REPORT_DATE_KEY) != local.date().isoformat()
+async def build_report(mark_sent: bool = True, catch_up: bool = False) -> str:
+    """Проход и отчёт.
 
-
-async def build_report(mark_sent: bool = True) -> str:
-    """Вечерний проход и отчёт. mark_sent=False — «показать сейчас»:
-    вечерний отчёт всё равно придёт."""
+    mark_sent=True — отчёт по расписанию: следующий будет в следующее время.
+    catch_up=True — сегодняшние итоги, которые пропали из-за смены времени:
+    считаются отправленными, расписание не трогают.
+    mark_sent=False — «показать сейчас», отчёт по расписанию всё равно придёт.
+    """
     async with jobs.exclusive("итоги дня") as job:
         pool = await db.get_pool()
+        # какой отчёт по расписанию закрываем — до того, как время успеют поменять
+        pending = await next_report_at() if mark_sent and not catch_up else None
         now = datetime.now(timezone.utc)
         since = await _period_start(now)
         fresh = now - CONTEXT
@@ -253,6 +333,11 @@ async def build_report(mark_sent: bool = True) -> str:
             "backlog": backlog,
         }
         if mark_sent:
-            await db.set_setting(REPORT_DATE_KEY, clock.now().date().isoformat())
+            day = clock.now()
+            if pending is not None:
+                # отчёт за запланированный день: после полуночи досылается вчерашний
+                day = min(day, pending.astimezone(clock.tz()))
+                await _advance(pending)
+            await db.set_setting(REPORT_DATE_KEY, day.date().isoformat())
             await db.set_setting(REPORT_AT_KEY, until.isoformat())
         return daily.render(data, notes)

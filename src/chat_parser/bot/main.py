@@ -61,23 +61,31 @@ async def send_report(bot: Bot, mark_sent: bool = True) -> str:
 
 
 async def report_loop(bot: Bot) -> None:
-    """Отчёт в REPORT_HOUR по местному времени. Если в это время бот был
-    выключен — досылается сразу после запуска."""
+    """Итоги дня в выбранное время. Если в это время бот был выключен —
+    досылаются сразу после запуска. Смена времени в боте будит цикл."""
+    live.schedule_changed = asyncio.Event()  # событие привязывается к своему циклу asyncio
     while True:
+        live.schedule_changed.clear()
         try:
             if await live.report_due():
                 await send_report(bot)
+            wait = (await live.next_report_at() - clock.now()).total_seconds()
         except jobs.Busy:
-            await asyncio.sleep(60)  # идёт другая операция — отчёт чуть позже
-            continue
+            wait = 60  # идёт другая операция — отчёт чуть позже
         except jobs.Cancelled:
-            pass
+            try:
+                await live.skip_pending()  # остановили кнопкой ⏹ — сегодня не повторяем
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("не удалось сдвинуть расписание: %s", e)
+                wait = 60
         except Exception as e:  # noqa: BLE001
             log.warning("дневной отчёт не собрался: %s: %s", type(e).__name__, e)
-            await asyncio.sleep(300)
-            continue
-        wait = (clock.next_at(settings.report_hour) - clock.now()).total_seconds()
-        await asyncio.sleep(max(wait, 1) + 1)
+            wait = 300
+        try:
+            await asyncio.wait_for(live.schedule_changed.wait(), timeout=max(wait, 1) + 1)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def announce_keyboard(bot: Bot) -> None:
@@ -85,13 +93,14 @@ async def announce_keyboard(bot: Bot) -> None:
     Telegram остаётся старая, пока бот не пришлёт другую."""
     if await db.get_setting(KEYBOARD_KEY) == KEYBOARD_VERSION:
         return
+    at = clock.hhmm(*await live.report_time())
     for admin in settings.admin_ids:
         try:
             await bot.send_message(
                 admin,
-                "Обновил кнопки внизу. Теперь каждый вечер в "
-                f"{settings.report_hour}:00 я сам разбираю переписку за день и присылаю "
-                "итоги. Подробности — /help",
+                f"Обновил кнопки внизу. Итоги дня приходят в {at} ({clock.tz_label()}) — "
+                "поменять время можно кнопкой ⏰ Время отчёта. Кнопка 👤 Инфо о человеке — "
+                "записать, из какой компании человек и кем работает. Подробности — /help",
                 reply_markup=MAIN_KB,
             )
         except Exception as e:  # noqa: BLE001

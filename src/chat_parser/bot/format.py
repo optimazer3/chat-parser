@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+from datetime import datetime
 from typing import Any
 
 from .. import clock, people
@@ -18,6 +19,19 @@ AUDIENCE_RU = {
     "customer": "покупатели",
     "unknown": "не определено",
 }
+
+
+def when_next(at: datetime) -> str:
+    """«сегодня в 22:00», «завтра в 9:00» — для времени следующего отчёта."""
+    local, today = at.astimezone(clock.tz()), clock.now().date()
+    hm = clock.hhmm(local.hour, local.minute)
+    if local <= clock.now():
+        return "в ближайшие минуты"
+    if local.date() == today:
+        return f"сегодня в {hm}"
+    if (local.date() - today).days == 1:
+        return f"завтра в {hm}"
+    return f"{local:%d.%m} в {hm}"
 
 
 def when(ts: Any, with_year: bool = False) -> str:
@@ -410,6 +424,8 @@ def fmt_person(c: dict[str, Any]) -> str:
     if c.get("chats"):
         lines += ["", "<b>Пишет в чатах:</b>"]
         lines += [f"• {esc(ch['title'])} — {messages_word(ch['n'])}" for ch in c["chats"]]
+    else:
+        lines += ["", "В подключённых чатах пока нет сообщений."]
     lines.append(f"\nСигналов от участника: {c.get('signals', 0)}")
     if c.get("pains"):
         lines.append("<b>Боли участника:</b>")

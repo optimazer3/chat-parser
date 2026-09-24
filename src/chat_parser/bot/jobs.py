@@ -310,6 +310,41 @@ async def refresh_names(chat_id: int) -> int:
         return len(items)
 
 
+class NotAPerson(ValueError):
+    """По @username нашёлся чат или канал, а не человек."""
+
+
+async def find_person(username: str) -> str | None:
+    """Псевдоним участника по @username: сначала среди тех, кто писал в чатах,
+    потом в самом Telegram — так можно записать человека, который ещё не
+    писал. Не нашёлся — None."""
+    from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
+    from telethon.tl.types import User
+
+    from ..people import find_by_username, upsert_authors
+    from ..pii import author_hash, author_label
+
+    pool = await db.get_pool()
+    label = await find_by_username(pool, username)
+    if label or not settings.telegram_ready:
+        return label
+    async with exclusive("поиск участника"):
+        client = await connect_client()
+        try:
+            entity = await client.get_entity(username)
+        except (ValueError, UsernameInvalidError, UsernameNotOccupiedError):
+            return None
+        finally:
+            await client.disconnect()
+    if not isinstance(entity, User):
+        raise NotAPerson(username)
+    h = author_hash(entity.id, settings.author_salt)
+    name = " ".join(x for x in (entity.first_name, entity.last_name) if x) or None
+    async with pool.acquire() as conn:
+        await upsert_authors(conn, [(h, author_label(h), name, entity.username or username)])
+    return author_label(h)
+
+
 async def delete_request(request_id: int) -> str | None:
     pool = await db.get_pool()
     return await pool.fetchval(

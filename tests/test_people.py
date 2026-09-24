@@ -1,7 +1,9 @@
 from chat_parser.analyze.schema import Extraction, PersonHint
 from chat_parser.analyze.validate import validate_people
 from chat_parser.bot.format import fmt_person, fmt_quote
-from chat_parser.people import display, split_company_role, who_command
+from chat_parser.people import (
+    display, parse_fields, parse_person_info, split_company_role, who_command,
+)
 
 SOURCE = (
     "[m:10 | u:aaaaaaaa | 2026-09-24 11:00] у меня два салона в Казани, оптика Люкс\n"
@@ -66,3 +68,47 @@ def test_person_card_shows_hint_with_quote():
     assert "Компания: — не указано" in text
     assert "по словам самого участника:</b> владелец, Оптика Люкс" in text
     assert "у меня два салона" in text and "/pain_5" in text and "12 сообщений" in text
+
+
+def test_person_info_line():
+    assert parse_person_info("@ivan_optika Оптика Люкс, владелец") == (
+        "ivan_optika", None, "Оптика Люкс, владелец")
+    assert parse_person_info("@ivan_optika, Оптика Люкс")[2] == "Оптика Люкс"
+    assert parse_person_info("https://t.me/ivan_optika: Оптика")[:2] == ("ivan_optika", None)
+    assert parse_person_info("/who_ab12cd34 Линзы Плюс") == (None, "u:ab12cd34", "Линзы Плюс")
+    assert parse_person_info("@ivan") == ("ivan", None, "")
+    assert parse_person_info("Иван Петров, Оптика Люкс") is None
+
+
+def test_person_fields():
+    assert parse_fields("Оптика Люкс, владелец, знакомы по выставке, общались про линзы") == (
+        "Оптика Люкс", "владелец", "знакомы по выставке, общались про линзы")
+    assert parse_fields("роль: оптометрист") == (None, "оптометрист", None)
+    assert parse_fields("Заметка: знакомы, давно") == (None, None, "знакомы, давно")
+    assert parse_fields("Оптика Люкс, , звонить после обеда") == (
+        "Оптика Люкс", None, "звонить после обеда")
+    assert parse_fields("Оптика Люкс\n\nвладелец\nзаметка раз\nзаметка два") == (
+        "Оптика Люкс", "владелец", "заметка раз\nзаметка два")
+    assert parse_fields("") == (None, None, None)
+
+
+def test_report_time_input():
+    from chat_parser.bot.live import parse_time
+
+    assert parse_time("21:30") == (21, 30) and parse_time("21.30") == (21, 30)
+    assert parse_time("9") == (9, 0) and parse_time("в 9:05") == (9, 5)
+    assert parse_time("22 ч") == (22, 0)
+    assert parse_time("24:00") is None and parse_time("21:60") is None
+    assert parse_time("вечером") is None
+
+
+def test_next_time_with_minutes():
+    from datetime import datetime
+
+    from chat_parser import clock
+
+    at = datetime(2026, 9, 24, 15, 0, tzinfo=clock.tz())
+    assert clock.next_at(21, 30, at) == datetime(2026, 9, 24, 21, 30, tzinfo=clock.tz())
+    assert clock.next_at(9, 0, at) == datetime(2026, 9, 25, 9, 0, tzinfo=clock.tz())
+    assert clock.next_at(15, 0, at).day == 25  # строго после
+    assert clock.hhmm(9, 5) == "9:05"

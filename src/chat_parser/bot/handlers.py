@@ -55,10 +55,12 @@ BTN_HELP = "❓ Помощь"
 BTN_ADD = "➕ Добавить чат"
 BTN_TOP_MONTH = "🔝 Топ болей за месяц"
 BTN_CHATS = "💬 Список чатов"
+BTN_PERSON = "👤 Инфо о человеке"
+BTN_TIME = "⏰ Время отчёта"
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "3"
+KEYBOARD_VERSION = "4"
 
 # Прежние кнопки (статус, разобрать, отчёт…) убраны с клавиатуры, но их
 # обработчики оставлены: у кого-то в Telegram ещё может висеть старая.
@@ -66,12 +68,14 @@ MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_TOP_MONTH)],
         [KeyboardButton(text=BTN_CHATS), KeyboardButton(text=BTN_ADD)],
+        [KeyboardButton(text=BTN_PERSON), KeyboardButton(text=BTN_TIME)],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-def help_text() -> str:
+def help_text(at: str = "22:00") -> str:
+    """at — во сколько приходят итоги дня, «21:30»."""
     budget = (f"не больше {settings.live_daily_budget:g} ₽ в день"
               if settings.live_daily_budget > 0 else "без дневного лимита")
     return f"""👋 <b>Я слежу за чатами рынка оптики</b>
@@ -80,13 +84,13 @@ def help_text() -> str:
 на что люди жалуются, что ищут и каких решений им не хватает.
 
 <b>Как это работает</b>
-• Каждый вечер в <b>{settings.report_hour}:00</b> я забираю переписку подключённых
+• Каждый день в <b>{at}</b> ({clock.tz_label()}) я забираю переписку подключённых
   чатов за сутки (для контекста — и за сутки до них), разбираю её и присылаю
   <b>итоги дня</b>: главное за день, что было в каждом чате, новые боли, самые
-  острые жалобы и всплески — с цитатами и ссылками на сообщения. Днём я не пишу.
+  острые жалобы и всплески — с цитатами и ссылками на сообщения. В остальное
+  время я не пишу.
 • Под каждой цитатой видно, кто её сказал. Кто из какой компании и кем
-  работает — можно внести в карточку человека, я и сам подскажу, если человек
-  рассказал о себе.
+  работает — можно записать, я и сам подскажу, если человек рассказал о себе.
 • Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.
 • На автоматический разбор трачу {budget}.
 
@@ -95,9 +99,12 @@ def help_text() -> str:
    ссылка /pain_… — нажми, пришлю подробности, цитаты и идеи решений.
 💬 <b>Список чатов</b> — за чем я слежу; там же участники каждого чата и удаление.
 ➕ <b>Добавить чат</b> — пришли ссылку на чат, и я начну за ним следить.
+👤 <b>Инфо о человеке</b> — пришли @username и через запятую компанию, роль,
+   заметку: <i>@ivan_optika Оптика Люкс, владелец</i>.
+⏰ <b>Время отчёта</b> — во сколько присылать итоги дня.
 
 <b>Полезно знать</b>
-• Топ пополняется вечером, вместе с итогами дня.
+• Топ пополняется вместе с итогами дня.
 • Историю чата можно прислать и файлом: Telegram Desktop → чат → ⋮ →
   «Экспорт истории чата» → формат JSON → пришли мне <code>result.json</code>.
 • Сам я разбираю только переписку последних суток. Архив из файла — вручную: /extract.
@@ -213,11 +220,43 @@ async def on_person_edit_reply(message: Message) -> None:
     await _send_person(message, label, prefix="✅ Сохранил.\n\n")
 
 
+TIME_PROMPT = "⏰ Во сколько присылать итоги дня?"
+PERSON_PROMPT = "👤 Информация о человеке"
+PERSON_EXAMPLES = (
+    "<i>@ivan_optika Оптика Люкс, владелец, знакомы по выставке</i>\n"
+    "<i>@maria_opt Линзы Плюс</i>\n"
+    "<i>@olga_lens роль: оптометрист</i>"
+)
+
+
+@router.message(F.reply_to_message.text.startswith(TIME_PROMPT))
+async def on_time_reply(message: Message) -> None:
+    from . import live
+
+    parsed = live.parse_time(message.text or "")
+    if parsed is None:
+        await message.answer(
+            f"{TIME_PROMPT}\n\nНе понял «{fmt.esc(message.text or '')}». Ответь на это "
+            "сообщение временем, например <b>21:30</b> или <b>9:00</b>.",
+            reply_markup=ForceReply(input_field_placeholder="21:30", selective=True),
+        )
+        return
+    await _apply_time(message, *parsed)
+
+
+@router.message(F.reply_to_message.text.startswith(PERSON_PROMPT))
+async def on_person_info_reply(message: Message) -> None:
+    await _person_info(message, message.text or "")
+
+
 @router.message(CommandStart())
 @router.message(Command("help"))
 @router.message(F.text == BTN_HELP)
 async def cmd_help(message: Message) -> None:
-    await message.answer(help_text(), reply_markup=MAIN_KB)
+    from . import live
+
+    at = clock.hhmm(*await live.report_time())
+    await message.answer(help_text(at), reply_markup=MAIN_KB)
 
 
 @router.message(Command("status"))
@@ -1028,9 +1067,10 @@ async def cmd_live(message: Message) -> None:
     lines = [f"📡 Отслеживание: <b>{'включено' if on else 'на паузе'}</b>"]
     if not settings.telegram_ready:
         lines.append("Нужны ключи Telegram API — без них читать чаты я не могу.")
+    at = clock.hhmm(*await live.report_time())
     lines.append(
-        f"Каждый вечер в {settings.report_hour}:00 забираю переписку за сутки, разбираю "
-        "её и присылаю итоги дня."
+        f"Каждый день в {at} ({clock.tz_label()}) забираю переписку за сутки, разбираю "
+        "её и присылаю итоги дня. Поменять время — кнопка ⏰ Время отчёта."
     )
     spent = await live.spent_today()
     if live.budget_enabled():
@@ -1044,8 +1084,8 @@ async def cmd_live(message: Message) -> None:
 
         lines.append(f"Последний разбор: {fmt.when(datetime.fromisoformat(raw))}")
     sent = await db.get_setting(live.REPORT_DATE_KEY) == clock.now().date().isoformat()
-    lines.append(f"Итоги дня: в {settings.report_hour}:00"
-                 + (" (сегодня уже отправлены)" if sent else ""))
+    lines.append(f"Следующие итоги: {fmt.when_next(await live.next_report_at())}"
+                 + (" (сегодняшние уже отправлены)" if sent else ""))
     toggle = ("⏸ Поставить на паузу", "live:off") if on else ("▶️ Включить", "live:on")
     await message.answer(
         "\n".join(lines), reply_markup=_kb([toggle], [("📤 Итоги дня сейчас", "live:report")])
@@ -1068,17 +1108,20 @@ async def cb_live_toggle(call: CallbackQuery) -> None:
         )
 
 
-@router.callback_query(F.data == "live:report")
+@router.callback_query(F.data.in_({"live:report", "live:catchup"}))
 async def cb_live_report(call: CallbackQuery) -> None:
+    """live:report — показать сейчас (по расписанию всё равно придут);
+    live:catchup — сегодняшние, пропавшие из-за смены времени."""
     from . import live
 
     await call.answer()
     await _drop_markup(call)
     if call.message is None:
         return
+    catch_up = call.data == "live:catchup"
     status = await call.message.answer("📤 Собираю итоги дня…")
     try:
-        text = await jobs.run_job(live.build_report(mark_sent=False))
+        text = await jobs.run_job(live.build_report(mark_sent=catch_up, catch_up=catch_up))
     except jobs.Busy as e:
         await status.edit_text(_busy(e))
         return
@@ -1109,9 +1152,136 @@ async def _send_person(message: Message, label: str, prefix: str = "") -> None:
     await _reply_long(message, prefix + fmt.fmt_person(c), reply_markup=_kb(*rows))
 
 
+TIME_PRESETS = ("08:00", "09:00", "12:00", "18:00", "20:00", "21:00", "22:00", "23:00")
+
+
+@router.message(F.text == BTN_TIME)
+@router.message(Command("time"))
+async def cmd_time(message: Message) -> None:
+    from . import live
+
+    hour, minute = await live.report_time()
+    current = f"{hour:02d}:{minute:02d}"
+    nxt = await live.next_report_at()
+    buttons = [(("✓ " if t == current else "") + clock.hhmm(int(t[:2]), int(t[3:])),
+                "rt:" + t.replace(":", "")) for t in TIME_PRESETS]
+    await message.answer(
+        f"⏰ Итоги дня приходят в <b>{clock.hhmm(hour, minute)}</b> ({clock.tz_label()}), "
+        f"следующие — {fmt.when_next(nxt)}.\n\nВо сколько присылать? Выбери или нажми "
+        "«✍️ Другое время» и напиши своё, например 21:30.",
+        reply_markup=_kb(buttons[:4], buttons[4:],
+                         [("✍️ Другое время", "rt:custom"), ("Отмена", "cancel")]),
+    )
+
+
+@router.callback_query(F.data.startswith("rt:"))
+async def cb_time(call: CallbackQuery) -> None:
+    from . import live
+
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is None:
+        return
+    value = call.data.split(":", 1)[1]
+    if value == "custom":
+        await call.message.answer(
+            f"{TIME_PROMPT}\n\nОтветь на это сообщение временем по {clock.tz_label()}, "
+            "например <b>21:30</b> или <b>9</b>.",
+            reply_markup=ForceReply(input_field_placeholder="21:30", selective=True),
+        )
+        return
+    parsed = live.parse_time(value[:2] + ":" + value[2:])
+    if parsed:
+        await _apply_time(call.message, *parsed)
+
+
+async def _apply_time(message: Message, hour: int, minute: int) -> None:
+    from . import live
+
+    nxt, skipped = await live.set_report_time(hour, minute)
+    at = clock.hhmm(hour, minute)
+    text = (f"✅ Итоги дня теперь приходят в <b>{at}</b> ({clock.tz_label()}). "
+            f"Следующие — {fmt.when_next(nxt)}.")
+    if skipped:
+        await message.answer(
+            text + f"\n\nВремя {at} сегодня уже прошло, поэтому сегодняшних итогов по "
+            "расписанию не будет. Прислать их сейчас?",
+            reply_markup=_kb([("📤 Прислать итоги за сегодня", "live:catchup")]),
+        )
+    else:
+        await message.answer(text)
+
+
 @router.message(Command(re.compile(r"who_([0-9a-f]{8})")))
 async def cmd_who(message: Message, command: CommandObject) -> None:
-    await _send_person(message, "u:" + command.regexp_match.group(1))
+    label = "u:" + command.regexp_match.group(1)
+    if (command.args or "").strip():  # «/who_1a2b3c4d Оптика Люкс, владелец»
+        await _save_person(message, label, command.args)
+    else:
+        await _send_person(message, label)
+
+
+@router.message(F.text == BTN_PERSON)
+async def btn_person(message: Message) -> None:
+    await message.answer(
+        f"{PERSON_PROMPT}\n\nОтветь на это сообщение: @username, а дальше через запятую — "
+        f"компания, роль и заметка, что знаешь:\n{PERSON_EXAMPLES}\n\n"
+        "Можно по строкам: первая — @username, потом компания, роль, заметка. "
+        "Вместо @username подойдёт /who_… из подписи под цитатой. "
+        "Не присланное не меняется.",
+        reply_markup=ForceReply(input_field_placeholder="@username Компания, роль, заметка",
+                                selective=True),
+    )
+
+
+# «@ivan_optika Оптика Люкс, владелец» и без ответа на подсказку. Один
+# @ник без текста — это добавление чата (LINK_FILTER).
+@router.message(F.text.regexp(r"^\s*@[A-Za-z][A-Za-z0-9_]{3,31}[\s,:;—–-]+\S"))
+async def on_person_line(message: Message) -> None:
+    await _person_info(message, message.text or "")
+
+
+async def _person_info(message: Message, text: str) -> None:
+    parsed = people.parse_person_info(text)
+    if parsed is None:
+        await message.answer(
+            f"{PERSON_PROMPT}\n\nНе вижу @username в начале. Ответь на это сообщение так:\n"
+            f"{PERSON_EXAMPLES}\n\nЕсли ника нет — открой карточку человека через /who_… "
+            "под его цитатой или в 👥 списке участников чата.",
+            reply_markup=ForceReply(input_field_placeholder="@username Компания, роль",
+                                    selective=True),
+        )
+        return
+    username, label, rest = parsed
+    if label is None:
+        try:
+            label = await jobs.find_person(username)
+        except jobs.Busy as e:
+            await message.answer(_busy(e) + "\nИскать человека в Telegram смогу, когда закончу.")
+            return
+        except jobs.NotAPerson:
+            await message.answer(f"@{fmt.esc(username)} — это чат или канал, а не человек.")
+            return
+        except Exception as e:  # noqa: BLE001 — сеть, FloodWait
+            await message.answer(f"❌ Не получилось найти @{fmt.esc(username)}: {fmt.esc(e)}")
+            return
+        if label is None:
+            where = ("ни среди участников чатов, ни в Telegram" if settings.telegram_ready
+                     else "среди участников подключённых чатов")
+            await message.answer(f"🤔 Не нашёл @{fmt.esc(username)} {where}. Проверь ник.")
+            return
+    await _save_person(message, label, rest)
+
+
+async def _save_person(message: Message, label: str, rest: str) -> None:
+    company, role, note = people.parse_fields(rest)
+    if not (company or role or note):
+        await _send_person(message, label)
+        return
+    if not await people.update_info(await db.get_pool(), label, company, role, note):
+        await message.answer("Такого участника нет в базе.")
+        return
+    await _send_person(message, label, prefix="✅ Сохранил.\n\n")
 
 
 @router.callback_query(F.data.startswith("pe:") | F.data.startswith("pn:"))

@@ -130,6 +130,7 @@ async def harness(monkeypatch, tmp_path):
             self.mid = 1000
             self.sent: list[str] = []
             self.log: list[str] = []
+            self.labels: list[str] = []  # подписи кнопок последнего ответа
             self.documents = 0
 
         async def close(self):
@@ -155,6 +156,7 @@ async def harness(monkeypatch, tmp_path):
                 text = method.text
                 rm = getattr(method, "reply_markup", None)
                 if rm is not None and hasattr(rm, "inline_keyboard"):
+                    self.labels += [b.text for row in rm.inline_keyboard for b in row]
                     text += " " + " ".join(
                         f"[{b.callback_data}]" for row in rm.inline_keyboard for b in row
                     )
@@ -201,6 +203,7 @@ async def harness(monkeypatch, tmp_path):
         from aiogram.types import Update
         h.counter += 1
         session.sent.clear()
+        session.labels.clear()
         await dp.feed_update(bot, Update(update_id=h.counter, **update_kwargs))
         return "\n".join(session.sent)
 
@@ -401,9 +404,23 @@ def telegram_api(monkeypatch):
     monkeypatch.setattr(settings, "tg_api_hash", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
     monkeypatch.setattr(settings, "join_pause", 0)
 
+    from telethon.tl.types import Channel, ChatPhotoEmpty
+    from telethon.tl.types import User as TgUser
+
     class FakeClient:
         async def disconnect(self):
             pass
+
+        async def get_entity(self, ref):
+            known = {
+                "petr_lens": TgUser(id=555, first_name="Пётр", last_name="Смирнов",
+                                    username="petr_lens"),
+                "optika_news": Channel(id=9, title="Новости оптики", photo=ChatPhotoEmpty(),
+                                       date=None, username="optika_news"),
+            }
+            if ref not in known:
+                raise ValueError(f'No user has "{ref}" as username')
+            return known[ref]
 
     async def connect_client():
         return FakeClient()
@@ -654,7 +671,8 @@ async def test_evening_report(evening, monkeypatch):
 
     # «Итоги дня сейчас» из /live: считает с прошлого отчёта и не сбивает вечерний
     out = await h.say("/live")
-    assert "включено" in out and "сегодня уже отправлены" in out and "[live:report]" in out
+    assert "включено" in out and "сегодняшние уже отправлены" in out and "[live:report]" in out
+    assert "Следующие итоги: завтра в 22:00" in out
     await h.press("live:report")
     again = "\n".join(h.session.log[-1:])
     assert "Оптики Про</a>: сегодня тишина" in again and "Новых сигналов нет" in again
@@ -798,3 +816,167 @@ async def test_new_keyboard_is_sent_once(harness):
     await main.announce_keyboard(h.bot)
     await main.announce_keyboard(h.bot)
     assert len(h.session.sent) == 1
+
+
+# ---------------------------------------------------------- время отчёта
+
+
+async def test_report_time(harness, monkeypatch):
+    from chat_parser import clock, db
+    from chat_parser.bot import live
+
+    h = harness
+    fixed = clock.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr(clock, "now", lambda: fixed)
+    live.schedule_changed.clear()
+
+    out = await h.say("⏰ Время отчёта")
+    assert "приходят в <b>22:00</b> (МСК), следующие — сегодня в 22:00" in out
+    assert "[rt:2100]" in out and "[rt:custom]" in out and "[cancel]" in out
+
+    out = await h.press("rt:2100")
+    assert "теперь приходят в <b>21:00</b> (МСК). Следующие — сегодня в 21:00." in out
+    assert live.schedule_changed.is_set()  # цикл отчёта проснётся и пересчитает ожидание
+    assert await live.report_time() == (21, 0)
+    assert not await live.report_due(fixed)
+    assert await live.report_due(fixed.replace(hour=21, minute=1))
+    await h.say("⏰ Время отчёта")
+    assert "✓ 21:00" in h.session.labels and "22:00" in h.session.labels
+
+    prompt = await h.press("rt:custom")
+    assert prompt.startswith("⏰ Во сколько присылать итоги дня?")
+    out = await h.say("25:00", reply_to=prompt)
+    assert "Не понял «25:00»" in out
+    out = await h.say("21:45", reply_to=out)  # отвечают на повторную подсказку
+    assert "<b>21:45</b>" in out and "сегодня в 21:45" in out
+
+    # время уже прошло, а сегодняшних итогов не было — предлагаем прислать сейчас
+    out = await h.say("9", reply_to=prompt)
+    assert "Следующие — завтра в 9:00" in out and "9:00 сегодня уже прошло" in out
+    assert "[live:catchup]" in out
+    out = await h.press("live:catchup")
+    assert "📊 <b>Итоги дня" in out
+    assert await db.get_setting(live.REPORT_DATE_KEY) == fixed.date().isoformat()
+    tomorrow_9 = fixed.replace(hour=9) + timedelta(days=1)
+    assert await live.next_report_at() == tomorrow_9  # расписание не сдвинулось
+
+    # сегодняшние уже пришли — более позднее время сегодня второго отчёта не даст
+    out = await h.press("rt:2300")
+    assert "Следующие — завтра в 23:00" in out and "уже прошло" not in out
+    assert "Каждый день в <b>23:00</b> (МСК)" in await h.say("/help")
+
+
+async def test_schedule_edge_cases(harness, monkeypatch):
+    from chat_parser import clock, db
+    from chat_parser.bot import live
+
+    t = {"now": clock.now().replace(hour=20, minute=0, second=0, microsecond=0)}
+    day1 = t["now"]
+    monkeypatch.setattr(clock, "now", lambda: t["now"])
+    slot = day1.replace(hour=23, minute=30)
+    await live.set_report_time(23, 30)
+
+    # бот был выключен в 23:30 и запущен в 00:10 — вчерашние итоги приходят сразу,
+    # а сегодняшние — в 23:30, как обычно
+    t["now"] = day1 + timedelta(hours=4, minutes=10)
+    assert await live.report_due()
+    await live.build_report()
+    assert await db.get_setting(live.REPORT_DATE_KEY) == day1.date().isoformat()
+    assert await live.next_report_at() == slot + timedelta(days=1)
+    assert not await live.report_due()
+
+    # отчёт остановили кнопкой ⏹ — в этот день больше не пытаемся
+    t["now"] = slot + timedelta(days=1, minutes=1)
+    assert await live.report_due()
+    await live.skip_pending()
+    assert await live.next_report_at() == slot + timedelta(days=2)
+
+    # время поменяли на более позднее, пока шёл отчёт, — второго в тот же день нет
+    t["now"] = slot + timedelta(days=2, minutes=1)
+    real = live.collect_day
+
+    async def collect_and_change(job, now):
+        await live.set_report_time(23, 59)
+        return await real(job, now)
+
+    monkeypatch.setattr(live, "collect_day", collect_and_change)
+    await live.build_report()
+    assert await live.next_report_at() == day1.replace(hour=23, minute=59) + timedelta(days=3)
+
+
+async def test_report_loop_wakes_on_new_time(harness, monkeypatch):
+    import asyncio
+
+    from chat_parser import clock, db
+    from chat_parser.bot import live, main
+
+    sent = []
+
+    async def fake_send(bot, mark_sent=True):
+        sent.append(clock.now())
+        await live.skip_pending()
+
+    monkeypatch.setattr(main, "send_report", fake_send)
+    fixed = clock.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr(clock, "now", lambda: fixed)
+    await live.set_report_time(21, 0)
+
+    loop = asyncio.create_task(main.report_loop(harness.bot))
+    try:
+        await asyncio.sleep(0.2)
+        assert sent == []  # до 21:00 ещё шесть часов — цикл спит
+        # время «наступило»: так бывает, если его перенесли на уже прошедшее
+        await db.set_setting(live.NEXT_REPORT_KEY, (fixed - timedelta(minutes=1)).isoformat())
+        live.schedule_changed.set()
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if sent:
+                break
+        assert len(sent) == 1
+    finally:
+        loop.cancel()
+
+
+# ------------------------------------------------------ сведения о людях
+
+
+async def test_person_info_by_username(evening):
+    from chat_parser.bot import live
+    from chat_parser.config import settings
+    from chat_parser.pii import author_hash, author_label
+
+    h = evening
+    await live.build_report(mark_sent=False)  # участники уже писали, их ники в базе
+
+    prompt = await h.say("👤 Инфо о человеке")
+    assert prompt.startswith("👤 Информация о человеке") and "@ivan_optika Оптика Люкс" in prompt
+    out = await h.say("@ivan_optika Оптика Люкс, владелец, знакомы по выставке", reply_to=prompt)
+    assert "✅ Сохранил." in out and "👤 <b>Иван Петров</b> (@ivan_optika)" in out
+    assert "Компания: Оптика Люкс" in out and "Роль: владелец" in out
+    assert "Заметка: знакомы по выставке" in out
+    assert "по словам самого участника" not in out  # внесли сами — подсказка не нужна
+
+    # и без ответа на подсказку; регистр ника не важен; не присланное не меняется
+    out = await h.say("@IVAN_OPTIKA роль: продавец")
+    assert "Компания: Оптика Люкс" in out and "Роль: продавец" in out
+    assert "Заметка: знакомы по выставке" in out
+    out = await h.say("/who_bbbbbbbb Линзы Плюс")
+    assert "👤 <b>Мария</b>" in out and "Компания: Линзы Плюс" in out
+    out = await h.say("@olga", reply_to=prompt)  # только ник — просто карточка
+    assert "Ольга Смирнова" in out and "Сохранил" not in out
+    assert "Не вижу @username" in await h.say("Иван Петров, Оптика Люкс", reply_to=prompt)
+
+    # ещё не писал в чатах — нашёлся в Telegram, сведения записаны заранее
+    out = await h.say("@petr_lens Линзы Центр, закупщик")
+    assert "👤 <b>Пётр Смирнов</b> (@petr_lens)" in out and "Компания: Линзы Центр" in out
+    assert "пока нет сообщений" in out
+    label = author_label(author_hash(555, settings.author_salt))
+    assert await h.pool.fetchval(
+        "select role from authors where author_label = $1", label) == "закупщик"
+    out = await h.say("@nobody_here Оптика")
+    assert "Не нашёл @nobody_here ни среди участников чатов, ни в Telegram" in out
+    assert "чат или канал" in await h.say("@optika_news Новости")
+
+    assert "— Иван Петров · Оптика Люкс, продавец /who_aaaaaaaa" in await h.say("/signals 30")
+    # один @ник без текста — по-прежнему добавление чата
+    assert "Подключил чат" in await h.say("@optika_pro")

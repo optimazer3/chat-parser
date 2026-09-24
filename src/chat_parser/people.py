@@ -10,6 +10,18 @@ import asyncpg
 
 LABEL_RE = re.compile(r"^u:[0-9a-f]{8}$")
 
+# Кого описывают: @username, t.me/username, /who_1a2b3c4d или u:1a2b3c4d
+IDENT_RE = re.compile(
+    r"^\s*(?:@|(?:https?://)?(?:www\.)?t(?:elegram)?\.me/)([A-Za-z][A-Za-z0-9_]{3,31})"
+    r"(?![A-Za-z0-9_])"
+    r"|^\s*(?:/who_|u:)([0-9a-f]{8})(?![0-9a-f])"
+)
+FIELD_RE = re.compile(
+    r"^(компания|роль|должность|заметка|примечание)\s*[:\-—–]\s*(.*)$", re.I | re.S
+)
+FIELD_KEYS = {"компания": "company", "роль": "role", "должность": "role",
+              "заметка": "note", "примечание": "note"}
+
 
 def who_command(label: str) -> str:
     """u:ab12cd34 -> /who_ab12cd34 — нажимаемая команда карточки участника."""
@@ -43,6 +55,74 @@ def split_company_role(text: str) -> tuple[str | None, str | None]:
         company, role = text.split(",", 1)
         return company.strip() or None, role.strip() or None
     return text or None, None
+
+
+def parse_person_info(text: str) -> tuple[str | None, str | None, str] | None:
+    """«@ivan Оптика Люкс, владелец» -> ("ivan", None, "Оптика Люкс, владелец").
+    Второе — псевдоним u:…, если человека указали через /who_…. Нет — None."""
+    m = IDENT_RE.match(text or "")
+    if not m:
+        return None
+    label = "u:" + m.group(2) if m.group(2) else None
+    rest = text[m.end():].strip().lstrip(",:;—–-").strip()
+    return m.group(1), label, rest
+
+
+def parse_fields(text: str) -> tuple[str | None, str | None, str | None]:
+    """Компания, роль, заметка — через запятую или по строкам, по порядку.
+    Можно подписать: «роль: оптометрист», «заметка: …». Заметка забирает всё
+    до конца. Пустое место («Оптика Люкс, , заметка») — поле не меняется."""
+    text = (text or "").strip()
+    if not text:
+        return None, None, None
+    multiline = "\n" in text
+    parts = ([p.strip() for p in text.splitlines() if p.strip()] if multiline
+             else [p.strip() for p in text.split(",")])
+    fields: dict[str, str] = {}
+    for i, part in enumerate(parts):
+        fm = FIELD_RE.match(part)
+        if fm:
+            key, value = FIELD_KEYS[fm.group(1).lower()], fm.group(2).strip()
+        else:
+            key = next((k for k in ("company", "role") if k not in fields), "note")
+            value = part
+        if key == "note":
+            tail = [value] + parts[i + 1:]
+            fields["note"] = ("\n" if multiline else ", ").join(p for p in tail if p)
+            break
+        fields[key] = value
+    return (fields.get("company") or None, fields.get("role") or None,
+            fields.get("note") or None)
+
+
+async def find_by_username(pool: asyncpg.Pool, username: str) -> str | None:
+    return await pool.fetchval(
+        "select author_label from authors where lower(username) = lower($1) "
+        "order by updated_at desc limit 1",
+        username.lstrip("@"),
+    )
+
+
+async def update_info(pool: asyncpg.Pool, label: str, company: str | None,
+                      role: str | None, note: str | None) -> bool:
+    """Записать то, что прислали; не присланное не трогать. Внесли компанию
+    или роль — подсказка нейросети больше не нужна."""
+    res = await pool.execute(
+        """
+        update authors
+           set company = coalesce($2, company), role = coalesce($3, role),
+               note = coalesce($4, note),
+               company_hint = case when $2::text is null and $3::text is null
+                                   then company_hint end,
+               role_hint = case when $2::text is null and $3::text is null then role_hint end,
+               hint_quote = case when $2::text is null and $3::text is null
+                                 then hint_quote end,
+               updated_at = now()
+         where author_label = $1
+        """,
+        label, company, role, note,
+    )
+    return not res.endswith(" 0")
 
 
 async def set_company_role(pool: asyncpg.Pool, label: str, company: str | None,
