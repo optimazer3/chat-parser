@@ -143,13 +143,16 @@ def test_stopped_message_says_what_is_kept():
 
 
 
-def test_nothing_runs_on_schedule():
-    """Только ручной запуск: у бота нет планировщика и в справке нет обещаний."""
-    from chat_parser.bot import main
-    from chat_parser.bot.handlers import HELP
+def test_only_evening_run_no_polling():
+    """Разбор идёт раз в день вечером, опроса каждые N минут нет."""
+    from chat_parser.bot import live, main
+    from chat_parser.bot.handlers import MAIN_KB, help_text
     from chat_parser.config import settings
 
-    assert not hasattr(main, "scheduler")
-    assert not hasattr(jobs, "seconds_until")
-    assert not hasattr(settings, "daily_run_hour_utc")
-    assert "сутки" not in HELP and "только по твоей команде" in HELP
+    assert not hasattr(main, "live_loop") and hasattr(main, "report_loop")
+    assert not hasattr(settings, "live_poll_minutes")
+    assert f"{settings.report_hour}:00" in help_text()
+    assert [b.text for row in MAIN_KB.keyboard for b in row] == [
+        "🔝 Топ болей за месяц", "💬 Список чатов", "➕ Добавить чат",
+    ]
+    assert live.DAY.total_seconds() == 24 * 3600 and live.CONTEXT.total_seconds() == 48 * 3600

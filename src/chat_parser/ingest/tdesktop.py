@@ -22,6 +22,7 @@ import asyncpg
 
 from ..config import settings
 from ..pii import author_hash, author_label, mask_text
+from ..people import upsert_authors
 from .collector import save_messages
 
 CHUNK = 1000
@@ -137,6 +138,20 @@ def parse_messages(data: dict[str, Any], chat_id: int, salt: str) -> tuple[list[
     return rows, skipped
 
 
+def export_authors(data: dict[str, Any], salt: str) -> list[tuple]:
+    """(hash, label, имя, username) по полям from/from_id экспорта. Username в
+    экспорте нет — только отображаемое имя."""
+    seen: dict[str, tuple] = {}
+    for msg in data.get("messages", []):
+        if not isinstance(msg, dict) or msg.get("type") != "message":
+            continue
+        h = author_hash(parse_from_id(msg.get("from_id")), salt)
+        name = msg.get("from")
+        if h and isinstance(name, str) and name.strip():
+            seen[h] = (h, author_label(h), name.strip(), None)
+    return list(seen.values())
+
+
 async def import_file(
     pool: asyncpg.Pool,
     path: Path,
@@ -174,6 +189,8 @@ async def import_file(
         )
         for i in range(0, len(rows), CHUNK):
             await save_messages(conn, rows[i : i + CHUNK])
+        # имена авторов — для карточек участников (в модель не уходят)
+        await upsert_authors(conn, export_authors(data, settings.author_salt))
         after = await conn.fetchval(
             "select count(*) from messages where chat_id = $1", chat_id
         )

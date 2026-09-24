@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime
 from collections.abc import Awaitable, Callable
 
 import asyncpg
 
-from .. import usage
+from .. import people, usage
 from ..config import settings
 from ..llm import LLM, LLMError, TokenBudgetExhausted, build_llm
 from ..normalize.chunker import load_thread_text
 from .prompts import SYSTEM_EXTRACT
 from .schema import Extraction
-from .validate import validate
+from .validate import validate, validate_people
 
 
 async def extract_one(llm: LLM, text: str) -> Extraction:
@@ -106,7 +107,14 @@ async def run(
     limit: int | None = None,
     verbose: bool = False,
     on_progress: OnProgress | None = None,
+    *,
+    ended_after: datetime | None = None,
+    ended_before: datetime | None = None,
+    usage_source: str = "manual",
 ) -> dict:
+    """ended_after/ended_before — только обсуждения, закончившиеся в этом
+    промежутке: так автоматический разбор берёт свежие затихшие обсуждения
+    и не трогает архив. usage_source='live' — расход идёт в дневной бюджет."""
     llm = build_llm()
     started = time.monotonic()
     rows = await pool.fetch(
@@ -114,10 +122,14 @@ async def run(
         select chat_id, root_id, message_ids, started_at
           from threads
          where status = 'pending'
+           and ($2::timestamptz is null or ended_at >= $2)
+           and ($3::timestamptz is null or ended_at <= $3)
          order by started_at desc
          limit $1
         """,
         limit or 1_000_000,
+        ended_after,
+        ended_before,
     )
     sem = asyncio.Semaphore(settings.extract_concurrency)
     stats = {"threads": 0, "signals": 0, "dropped": 0, "empty": 0, "failed": 0}
@@ -163,6 +175,8 @@ async def run(
                 return
 
             signals, dropped = validate(extraction, text, set(ids))
+            for label, company, role, quote, mid in validate_people(extraction, text):
+                await people.save_hint(pool, chat_id, label, company, role, quote, mid)
             stats["dropped"] += dropped
             stats["threads"] += 1
             if not signals:
@@ -219,7 +233,7 @@ async def run(
         # И при остановке кнопкой: токены до остановки тоже потрачены.
         await usage.record(
             pool, "extract", llm, threads=done,
-            seconds=time.monotonic() - started, cancelled=not finished,
+            seconds=time.monotonic() - started, cancelled=not finished, source=usage_source,
         )
     judged = stats["signals"] + stats["dropped"]
     stats["drop_rate"] = round(stats["dropped"] / judged, 3) if judged else 0.0

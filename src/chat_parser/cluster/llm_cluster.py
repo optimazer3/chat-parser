@@ -194,7 +194,7 @@ async def _cluster_audience(llm: LLM, pool: asyncpg.Pool, audience: str) -> int:
     return await _persist(pool, audience, drafts)
 
 
-async def run(pool: asyncpg.Pool) -> dict:
+async def run(pool: asyncpg.Pool, usage_source: str = "manual") -> dict:
     llm = build_llm(settings.synth_model)
     audiences = [
         r["audience"]
@@ -213,7 +213,7 @@ async def run(pool: asyncpg.Pool) -> dict:
         finished = True
     finally:
         await usage.record(pool, "cluster", llm, seconds=time.monotonic() - started,
-                           cancelled=not finished)
+                           cancelled=not finished, source=usage_source)
     return out
 
 
@@ -221,12 +221,21 @@ async def make_cards(
     pool: asyncpg.Pool,
     top: int = 15,
     on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+    usage_source: str = "manual",
+    only_ids: list[int] | None = None,
 ) -> int:
-    """Развёрнутая карточка для топовых кластеров."""
+    """Развёрнутая карточка для топовых кластеров (или только для only_ids)."""
     llm = build_llm(settings.synth_model)
-    clusters = await pool.fetch(
-        "select id, audience, label, statement from clusters order by score desc limit $1", top
-    )
+    if only_ids is not None:
+        clusters = await pool.fetch(
+            "select id, audience, label, statement from clusters where id = any($1::bigint[])",
+            only_ids,
+        )
+    else:
+        clusters = await pool.fetch(
+            "select id, audience, label, statement from clusters order by score desc limit $1",
+            top,
+        )
     started, finished = time.monotonic(), False
     try:
         done = 0
@@ -268,5 +277,66 @@ async def make_cards(
         finished = True
     finally:
         await usage.record(pool, "cards", llm, seconds=time.monotonic() - started,
-                           cancelled=not finished)
+                           cancelled=not finished, source=usage_source)
     return done
+
+
+STATS_SQL = """
+select count(*) as n_signals,
+       count(distinct author_label) as n_authors,
+       count(distinct chat_id) as n_chats,
+       avg(intensity)::float as mean_intensity,
+       avg((type = 'willingness_to_pay')::int)::float as wtp_share,
+       min(ts) as first_seen, max(ts) as last_seen
+  from signals where cluster_id = $1
+"""
+
+
+async def refresh_stats(pool: asyncpg.Pool, cluster_ids: list[int] | None = None) -> int:
+    """Пересчитать счётчики болей; боли, где осталось меньше двух сигналов,
+    убрать (так бывает после удаления чата). Возвращает число убранных."""
+    ids = cluster_ids
+    if ids is None:
+        ids = [r["id"] for r in await pool.fetch("select id from clusters")]
+    removed = 0
+    async with pool.acquire() as conn, conn.transaction():
+        for cid in ids:
+            agg = await conn.fetchrow(STATS_SQL, cid)
+            if not agg or agg["n_signals"] < MIN_CLUSTER_SIGNALS or not agg["last_seen"]:
+                await conn.execute("update signals set cluster_id = null where cluster_id = $1", cid)
+                await conn.execute("delete from clusters where id = $1", cid)
+                removed += 1
+                continue
+            await conn.execute(
+                """
+                update clusters set n_signals = $2, n_authors = $3, n_chats = $4, score = $5,
+                                    first_seen = $6, last_seen = $7, updated_at = now()
+                 where id = $1
+                """,
+                cid, agg["n_signals"], agg["n_authors"], agg["n_chats"],
+                score(agg["n_authors"], agg["n_chats"], agg["mean_intensity"] or 0.0,
+                      agg["wtp_share"] or 0.0, agg["last_seen"]),
+                agg["first_seen"], agg["last_seen"],
+            )
+    return removed
+
+
+async def add_clusters(pool: asyncpg.Pool, audience: str, drafts: list[Draft]) -> list[int]:
+    """Добавить новые боли, не трогая существующие (в отличие от полного пересчёта)."""
+    created = []
+    async with pool.acquire() as conn, conn.transaction():
+        for d in drafts:
+            if len(d.signal_ids) < MIN_CLUSTER_SIGNALS:
+                continue
+            cid = await conn.fetchval(
+                "insert into clusters (audience, label, statement) values ($1,$2,$3) returning id",
+                audience, d.label[:200], d.statement,
+            )
+            await conn.execute(
+                "update signals set cluster_id = $1 where id = any($2::bigint[]) "
+                "and cluster_id is null",
+                cid, d.signal_ids,
+            )
+            created.append(cid)
+    await refresh_stats(pool, created)
+    return created

@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 import asyncpg
+
+from .config import settings
 
 log = logging.getLogger("chat_parser.usage")
 
@@ -26,6 +29,7 @@ async def record(
     threads: int = 0,
     seconds: float = 0,
     cancelled: bool = False,
+    source: str = "manual",
 ) -> None:
     """Никогда не бросает: сбой учёта не должен ронять разбор."""
     u = getattr(llm, "usage", None) or {}
@@ -35,8 +39,8 @@ async def record(
         await pool.execute(
             """
             insert into llm_usage (stage, model, calls, prompt_tokens, completion_tokens,
-                                   reasoning_tokens, threads, seconds, cancelled)
-            values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                                   reasoning_tokens, threads, seconds, cancelled, source)
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             """,
             stage,
             getattr(llm, "model", None),
@@ -47,9 +51,29 @@ async def record(
             threads,
             int(seconds),
             cancelled,
+            source,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("не записан расход модели (%s): %s — выполни chat-parser init-db", stage, e)
+
+
+def cost(prompt_tokens: int, completion_tokens: int) -> float:
+    """Стоимость по ценам из .env (за 1 млн токенов). Без цен — 0."""
+    return (prompt_tokens * settings.llm_price_in
+            + completion_tokens * settings.llm_price_out) / 1_000_000
+
+
+async def spent_since(pool: asyncpg.Pool, since: datetime, source: str | None = None) -> float:
+    row = await pool.fetchrow(
+        """
+        select coalesce(sum(prompt_tokens), 0)::bigint p,
+               coalesce(sum(completion_tokens), 0)::bigint c
+          from llm_usage
+         where ts >= $1 and ($2::text is null or source = $2)
+        """,
+        since, source,
+    )
+    return cost(row["p"], row["c"])
 
 
 async def seconds_per_thread(pool: asyncpg.Pool) -> float | None:

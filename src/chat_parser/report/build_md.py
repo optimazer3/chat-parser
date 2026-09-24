@@ -8,6 +8,7 @@ from pathlib import Path
 
 import asyncpg
 
+from .. import people
 from ..links import QUOTE_MESSAGE_SQL, message_link
 from ..quotes import pick_quotes
 
@@ -63,8 +64,9 @@ async def build(pool: asyncpg.Pool, out: Path, top: int = 30) -> Path:
                 for r in await pool.fetch(
                     f"""
                     select s.id, s.evidence_quote, s.chat_id, {QUOTE_MESSAGE_SQL} as mid,
-                           c.username
+                           c.username, s.author_label, a.name a_name, a.company a_company, a.role a_role
                       from signals s join chats c on c.id = s.chat_id
+                      left join authors a on a.author_label = s.author_label
                      where s.cluster_id = $1 order by s.intensity desc, s.id
                     """,
                     c["id"],
@@ -73,7 +75,9 @@ async def build(pool: asyncpg.Pool, out: Path, top: int = 30) -> Path:
             quote_lines = []
             for q in pick_quotes(card, signals):
                 link = message_link(q["chat_id"], q["username"], q["mid"])
-                tail = f" — [сообщение]({link})" if link else ""
+                who = people.display(q["a_name"], q["author_label"], q["a_company"],
+                                     q["a_role"])
+                tail = f" — {who}" + (f", [сообщение]({link})" if link else "")
                 quote_lines.append(f"> «{q['evidence_quote']}»{tail}")
             if card:
                 lines += [

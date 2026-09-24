@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from telethon.tl.types import Message, PeerChannel, PeerUser
+from telethon.tl.types import Message, PeerChannel, PeerUser, User
 
 TEST_DB = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB, reason="TEST_DATABASE_URL не задан")
@@ -20,8 +20,10 @@ T0 = datetime(2026, 3, 1, tzinfo=timezone.utc)
 
 
 def msg(i: int) -> Message:
-    return Message(id=i, peer_id=PeerChannel(1234567890), date=T0 + timedelta(minutes=i),
-                   message=f"сообщение номер {i}", from_id=PeerUser(1000 + i % 7))
+    m = Message(id=i, peer_id=PeerChannel(1234567890), date=T0 + timedelta(minutes=i),
+                message=f"сообщение номер {i}", from_id=PeerUser(1000 + i % 7))
+    m._sender = User(id=1000 + i % 7, first_name=f"Участник{i % 7}", username=f"user{i % 7}")
+    return m
 
 
 class FakeClient:
@@ -33,9 +35,12 @@ class FakeClient:
     async def get_entity(self, _):
         return object()
 
-    def iter_messages(self, entity, offset_id=0, limit=None, min_id=None, reverse=False):
+    def iter_messages(self, entity, offset_id=0, limit=None, min_id=None, reverse=False,
+                      offset_date=None):
         async def gen():
-            if reverse:
+            if reverse and offset_date is not None:
+                items = [m for m in self.messages if m.date > offset_date]
+            elif reverse:
                 items = [m for m in self.messages if m.id > (min_id or 0)]
             else:
                 items = [m for m in reversed(self.messages) if not offset_id or m.id < offset_id]
@@ -56,7 +61,7 @@ async def pool(monkeypatch):
     monkeypatch.setattr(db, "_pool", None)
     p = await db.get_pool()
     await p.execute("drop table if exists runs, clusters, signals, threads, cursors, "
-                    "messages, chats, llm_usage, chat_requests cascade")
+                    "messages, chats, llm_usage, chat_requests, bot_settings, authors cascade")
     await db.apply_schema()
     await p.execute("insert into chats (id, title) values ($1, 'Оптики')", CHAT)
     yield p
@@ -101,3 +106,30 @@ async def test_stopped_history_resumes_without_duplicates(pool):
     assert res["saved"] == 150
     assert await pool.fetchval("select count(*) from messages") == 250
     assert await pool.fetchval("select backfill_done from cursors where chat_id=$1", CHAT)
+
+
+
+async def test_recent_mode_takes_only_the_window(pool):
+    """Чат, историю которого не загружали: вечером берём только последние сутки."""
+    from chat_parser.ingest import collector
+
+    client = FakeClient(250)  # сообщения идут по минуте от T0
+    res = await collector.sync_chat(client, pool, CHAT, "recent",
+                                    since=T0 + timedelta(minutes=200))
+    assert res["saved"] == 50
+    cur = await pool.fetchrow("select * from cursors where chat_id = $1", CHAT)
+    assert (cur["oldest_id"], cur["newest_id"], cur["backfill_done"]) == (201, 250, False)
+    # ручная загрузка истории потом продолжит назад от 201 — без дыр и дублей
+    res = await collector.sync_chat_full(client, pool, CHAT)
+    assert await pool.fetchval("select count(*) from messages") == 250
+
+
+async def test_author_names_are_remembered(pool):
+    from chat_parser.ingest import collector
+
+    await collector.sync_chat_full(FakeClient(20), pool, CHAT)
+    names = {r["name"] for r in await pool.fetch("select name from authors")}
+    assert names == {f"Участник{i}" for i in range(7)}
+    assert await pool.fetchval(
+        "select count(*) from messages m join authors a on a.author_label = m.author_label"
+    ) == 20

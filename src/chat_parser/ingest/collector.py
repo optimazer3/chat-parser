@@ -22,6 +22,7 @@ from telethon.tl import functions, types
 from telethon.tl.types import Message
 
 from ..config import settings
+from ..people import upsert_authors
 from ..pii import author_hash, author_label, mask_text
 
 BATCH = 100
@@ -118,6 +119,18 @@ def _row(msg: Message, chat_id: int) -> tuple | None:
     )
 
 
+def sender_names(msg: Message) -> tuple[str | None, str | None]:
+    """(имя, username) автора — для карточки участника. Нет данных — None."""
+    sender = getattr(msg, "sender", None)
+    if sender is None:
+        return None, None
+    title = getattr(sender, "title", None)  # написал от имени канала/группы
+    name = title or " ".join(
+        x for x in (getattr(sender, "first_name", None), getattr(sender, "last_name", None)) if x
+    )
+    return (name or None), getattr(sender, "username", None)
+
+
 async def save_messages(conn: asyncpg.Connection, rows: list[tuple]) -> None:
     if not rows:
         return
@@ -170,8 +183,14 @@ async def sync_chat(
     mode: str,
     limit: int | None = None,
     on_progress: Callable[[int], Awaitable[None]] | None = None,
+    since: datetime | None = None,
 ) -> dict:
-    """Один проход по чату. Возвращает статистику."""
+    """Один проход по чату. Возвращает статистику.
+
+    mode: backfill — назад по истории; incremental — всё новее последнего
+    загруженного; recent — всё новее момента since (для чата, историю которого
+    не загружали, вечернему отчёту нужны только последние сутки с контекстом).
+    """
     # Курсор дальше обновляется через UPDATE: без строки он молча не писался бы,
     # и остановленная загрузка начиналась бы заново.
     await pool.execute(
@@ -192,10 +211,15 @@ async def sync_chat(
         if newest is None:
             return {"chat_id": chat_id, "skipped": "no_cursor_run_backfill_first"}
         it = client.iter_messages(entity, min_id=newest, reverse=True, limit=limit)
+    elif mode == "recent":
+        if since is None:
+            raise ValueError("recent: нужен since")
+        it = client.iter_messages(entity, offset_date=since, reverse=True, limit=limit)
     else:
         raise ValueError(f"unknown mode: {mode}")
 
     rows: list[tuple] = []
+    authors: dict[str, tuple] = {}
     saved = 0
     seen_min: int | None = None
     seen_max: int | None = None
@@ -207,6 +231,7 @@ async def sync_chat(
             return
         async with pool.acquire() as conn, conn.transaction():
             await save_messages(conn, rows)
+            await upsert_authors(conn, list(authors.values()))
             new_oldest = min(oldest, seen_min) if oldest else seen_min
             new_newest = max(newest, seen_max) if newest else seen_max
             await conn.execute(
@@ -222,6 +247,7 @@ async def sync_chat(
             oldest, newest = new_oldest, new_newest
         saved += len(rows)
         rows = []
+        authors.clear()
         if on_progress is not None:
             await on_progress(saved)
 
@@ -231,6 +257,8 @@ async def sync_chat(
             if row is None:
                 continue
             rows.append(row)
+            if row[3]:
+                authors[row[3]] = (row[3], row[4], *sender_names(msg))
             seen_min = msg.id if seen_min is None else min(seen_min, msg.id)
             seen_max = msg.id if seen_max is None else max(seen_max, msg.id)
             if len(rows) >= BATCH:

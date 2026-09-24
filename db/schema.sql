@@ -119,6 +119,8 @@ create table if not exists clusters (
     updated_at timestamptz not null default now()
 );
 create index if not exists clusters_score_idx on clusters (score desc);
+-- когда боль появилась в базе: «новая боль» в итогах дня
+alter table clusters add column if not exists created_at timestamptz not null default now();
 
 -- ------------------------------------------------------------ прогоны/лог
 create table if not exists runs (
@@ -147,6 +149,36 @@ create table if not exists llm_usage (
     cancelled         boolean not null default false
 );
 create index if not exists llm_usage_ts_idx on llm_usage (ts);
+-- manual — запущено человеком; live — автоматический разбор (под дневной бюджет)
+alter table llm_usage add column if not exists source text not null default 'manual';
+
+-- Переключатели бота, которые должны переживать перезапуск (пауза /live)
+create table if not exists bot_settings (
+    key        text primary key,
+    value      text not null,
+    updated_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------- участники чатов
+-- Кто есть кто: имя из Telegram и то, что внёс пользователь (компания, роль).
+-- В модель имена не уходят — она видит только псевдонимы u:xxxxxxxx.
+create table if not exists authors (
+    author_hash     text primary key,
+    author_label    text not null,
+    name            text,
+    username        text,
+    company         text,           -- вносит пользователь
+    role            text,
+    note            text,
+    -- подсказка нейросети по словам самого человека, до подтверждения
+    company_hint    text,
+    role_hint       text,
+    hint_quote      text,
+    hint_chat_id    bigint,
+    hint_message_id bigint,
+    updated_at      timestamptz not null default now()
+);
+create index if not exists authors_label_idx on authors (author_label);
 
 -- ------------------------------------------------------------ защита данных
 -- Supabase публикует схему public через REST API (Data API). Без RLS любой,
@@ -164,3 +196,5 @@ alter table clusters enable row level security;
 alter table runs     enable row level security;
 alter table llm_usage enable row level security;
 alter table chat_requests enable row level security;
+alter table bot_settings enable row level security;
+alter table authors enable row level security;

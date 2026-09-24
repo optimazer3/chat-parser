@@ -22,6 +22,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
+    ForceReply,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -30,9 +31,10 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from .. import db, usage
+from .. import clock, db, usage
 from ..config import settings
 from ..ingest import collector
+from .. import people
 from ..links import QUOTE_MESSAGE_SQL, BadChatRef, chat_link, message_link, normalize_chat_ref
 from ..llm import build_llm
 from ..quotes import pick_quotes
@@ -51,70 +53,59 @@ BTN_TOP = "🔝 Топ болей"
 BTN_REPORT = "📄 Отчёт"
 BTN_HELP = "❓ Помощь"
 BTN_ADD = "➕ Добавить чат"
+BTN_TOP_MONTH = "🔝 Топ болей за месяц"
+BTN_CHATS = "💬 Список чатов"
 
+# Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
+KEYBOARD_KEY = "keyboard_version"
+KEYBOARD_VERSION = "3"
+
+# Прежние кнопки (статус, разобрать, отчёт…) убраны с клавиатуры, но их
+# обработчики оставлены: у кого-то в Telegram ещё может висеть старая.
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_EXTRACT)],
-        [KeyboardButton(text=BTN_CLUSTER), KeyboardButton(text=BTN_TOP)],
-        [KeyboardButton(text=BTN_REPORT), KeyboardButton(text=BTN_ADD)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_TOP_MONTH)],
+        [KeyboardButton(text=BTN_CHATS), KeyboardButton(text=BTN_ADD)],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-HELP = """👋 <b>Я нахожу боли и потребности рынка оптики</b>
+def help_text() -> str:
+    budget = (f"не больше {settings.live_daily_budget:g} ₽ в день"
+              if settings.live_daily_budget > 0 else "без дневного лимита")
+    return f"""👋 <b>Я слежу за чатами рынка оптики</b>
 
-Читаю переписку в чатах владельцев оптик, продавцов, врачей и покупателей
-и выписываю, на что люди жалуются, что ищут и каких решений им не хватает.
-Потом собираю это в список «болей» — от самых частых и острых к редким.
+Читаю переписку владельцев оптик, продавцов, врачей и покупателей и нахожу,
+на что люди жалуются, что ищут и каких решений им не хватает.
 
 <b>Как это работает</b>
-1️⃣ Ты присылаешь мне историю чата — файлом.
-2️⃣ Я делю переписку на <b>обсуждения</b>: вопрос и ответы на него.
-3️⃣ Нейросеть читает каждое обсуждение и выписывает <b>сигналы</b> — жалобы,
-запросы, вопросы, обходные пути. Каждый сигнал подтверждён дословной
-цитатой: если цитаты в переписке нет, сигнал выбрасывается.
-4️⃣ Похожие сигналы я собираю в <b>боли</b> и сортирую: сколько разных людей об
-этом говорят, в скольких чатах, насколько остро.
+• Каждый вечер в <b>{settings.report_hour}:00</b> я забираю переписку подключённых
+  чатов за сутки (для контекста — и за сутки до них), разбираю её и присылаю
+  <b>итоги дня</b>: главное за день, что было в каждом чате, новые боли, самые
+  острые жалобы и всплески — с цитатами и ссылками на сообщения. Днём я не пишу.
+• Под каждой цитатой видно, кто её сказал. Кто из какой компании и кем
+  работает — можно внести в карточку человека, я и сам подскажу, если человек
+  рассказал о себе.
+• Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.
+• На автоматический разбор трачу {budget}.
 
-<b>С чего начать</b>
-1. В Telegram Desktop на компьютере открой нужный чат → ⋮ справа вверху →
-   «Экспорт истории чата».
-2. Формат — <b>JSON</b> (не HTML!). Фото и видео сними — нужен только текст.
-3. Пришли мне получившийся файл <code>result.json</code>.
-4. Я спрошу, сколько обсуждений разобрать. Для начала выбери <b>20</b> —
-   это быстро и покажет, как всё работает.
-5. Нажми 🧩 <b>Пересчитать боли</b>, затем 🔝 <b>Топ болей</b>.
-
-<b>Кнопки внизу</b>
-📊 <b>Статус</b> — что загружено, сколько ждёт разбора, что выполняется
-🧠 <b>Разобрать</b> — отдать обсуждения нейросети (спрошу, сколько)
-🧩 <b>Пересчитать боли</b> — собрать сигналы в боли и описать каждую
-🔝 <b>Топ болей</b> — главные боли по группам людей
-📄 <b>Отчёт</b> — всё одним файлом
-➕ <b>Добавить чат</b> — прислать ссылку на чат, чтобы я читал его сам
-❓ <b>Помощь</b> — это сообщение
+<b>Кнопки</b>
+🔝 <b>Топ болей за месяц</b> — главные боли за последние 30 дней. Рядом с каждой
+   ссылка /pain_… — нажми, пришлю подробности, цитаты и идеи решений.
+💬 <b>Список чатов</b> — за чем я слежу; там же участники каждого чата и удаление.
+➕ <b>Добавить чат</b> — пришли ссылку на чат, и я начну за ним следить.
 
 <b>Полезно знать</b>
-• Любую долгую операцию можно остановить кнопкой ⏹ — сделанное сохранится.
-• Меню можно закрыть кнопкой «Отмена» — ничего не запустится.
-• Сам я ничего не запускаю и токены не трачу — только по твоей команде.
-• В топе рядом с каждой болью есть ссылка /pain_… — нажми, пришлю
-  подробности: кто страдает, как выкручиваются, цитаты, идеи решений.
-
-<b>Ещё команды</b>
-/signals — последние найденные сигналы
-/retry — повторить обсуждения, которые не получилось разобрать
-/redo — разобрать всё заново (после изменения настроек разбора)
-/run — всё за один раз: разбор, боли и отчёт
-/chats — какие чаты загружены, со ссылками
-
-<b>Про «Добавить чат»</b>
-Чтобы я сам читал чаты, нужны ключи Telegram API в настройках. Пока их нет,
-я просто запомню ссылку и подключу чат сам, как только ключи появятся. Сейчас
-историю можно прислать файлом, как описано выше.
+• Топ пополняется вечером, вместе с итогами дня.
+• Историю чата можно прислать и файлом: Telegram Desktop → чат → ⋮ →
+  «Экспорт истории чата» → формат JSON → пришли мне <code>result.json</code>.
+• Сам я разбираю только переписку последних суток. Архив из файла — вручную: /extract.
+• Нажми /who_… под цитатой — откроется карточка человека: компания, роль, заметка.
+• Любую долгую операцию можно остановить кнопкой ⏹.
+• Остальные команды — в меню слева от поля ввода.
 """
+
 
 class LiveMessage:
     """Сообщение-прогресс, которое правится не чаще раза в interval секунд.
@@ -198,11 +189,35 @@ async def _drop_markup(call: CallbackQuery) -> None:
 # ------------------------------------------------------------- справка/статус
 
 
+EDIT_PROMPT_RE = r"^(✏️|📝) .*?(u:[0-9a-f]{8})"
+
+
+@router.message(F.reply_to_message.text.regexp(EDIT_PROMPT_RE))
+async def on_person_edit_reply(message: Message) -> None:
+    """Ответ на «✏️ Компания и роль для u:…» или «📝 Заметка для u:…»."""
+    m = re.match(EDIT_PROMPT_RE, message.reply_to_message.text or "")
+    text = (message.text or "").strip()
+    if not m or not text:
+        await message.answer("Не понял ответ — напиши текстом.")
+        return
+    kind, label = m.group(1), m.group(2)
+    pool = await db.get_pool()
+    if kind == "✏️":
+        company, role = people.split_company_role(text)
+        ok = await people.set_company_role(pool, label, company, role)
+    else:
+        ok = await people.set_note(pool, label, None if text in ("-", "—") else text)
+    if not ok:
+        await message.answer("Такого участника нет в базе.")
+        return
+    await _send_person(message, label, prefix="✅ Сохранил.\n\n")
+
+
 @router.message(CommandStart())
 @router.message(Command("help"))
 @router.message(F.text == BTN_HELP)
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP, reply_markup=MAIN_KB)
+    await message.answer(help_text(), reply_markup=MAIN_KB)
 
 
 @router.message(Command("status"))
@@ -436,6 +451,38 @@ async def cb_cluster(call: CallbackQuery) -> None:
         await _do_cluster(call.message)
 
 
+AUDIENCE_ORDER = ["owner", "staff", "optometrist", "supplier", "customer", "unknown"]
+MONTH_PER_AUDIENCE = 7
+
+
+@router.message(F.text == BTN_TOP_MONTH)
+async def btn_top_month(message: Message) -> None:
+    """Боли по сигналам за последние 30 дней: кто и сколько говорил за месяц."""
+    pool = await db.get_pool()
+    rows = [dict(r) for r in await pool.fetch(
+        """
+        select c.id, c.audience, c.label,
+               count(*) n_signals,
+               count(distinct s.author_label) n_authors,
+               count(distinct s.chat_id) n_chats
+          from clusters c join signals s on s.cluster_id = c.id
+         where s.ts >= now() - interval '30 days'
+         group by c.id, c.audience, c.label
+         order by n_authors desc, n_signals desc, c.id
+        """
+    )]
+    if not rows:
+        await message.answer(
+            "За последние 30 дней болей пока нет. Топ пополняется вечером, вместе с "
+            "итогами дня. Боли за всё время — /top"
+        )
+        return
+    picked = []
+    for aud in AUDIENCE_ORDER + sorted({r["audience"] for r in rows} - set(AUDIENCE_ORDER)):
+        picked += [r for r in rows if r["audience"] == aud][:MONTH_PER_AUDIENCE]
+    await _reply_long(message, fmt.fmt_top(picked, title="🔝 <b>Топ болей за месяц</b>"))
+
+
 @router.message(Command("top"))
 @router.message(F.text == BTN_TOP)
 async def cmd_top(message: Message, command: CommandObject | None = None) -> None:
@@ -487,8 +534,9 @@ async def _signals_with_links(tail: str, *args) -> list[dict]:
     rows = await pool.fetch(
         f"""
         select s.id, s.type, s.audience, s.summary, s.evidence_quote, s.intensity,
-               s.chat_id, {QUOTE_MESSAGE_SQL} as mid, c.username
+               s.chat_id, {QUOTE_MESSAGE_SQL} as mid, c.username, s.author_label, a.name a_name, a.company a_company, a.role a_role
           from signals s join chats c on c.id = s.chat_id
+          left join authors a on a.author_label = s.author_label
         {tail}
         """,
         *args,
@@ -572,6 +620,7 @@ async def cb_run(call: CallbackQuery) -> None:
 # ------------------------------------------------------------------ чаты
 
 
+@router.message(F.text == BTN_CHATS)
 @router.message(Command("chats"))
 async def cmd_chats(message: Message) -> None:
     pool = await db.get_pool()
@@ -613,7 +662,11 @@ async def cmd_chats(message: Message) -> None:
         if not r["is_active"]:
             lines.append(f"   ⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
         lines.append("")
-    markup = None
+    rows_kb: list[list[tuple[str, str]]] = [
+        [(f"👥 {_short(r['title'] or 'без названия', 22)}", f"ppl:{r['id']}"),
+         ("🗑 Удалить", f"del:{r['id']}")]
+        for r in rows
+    ]
     if waiting:
         why = ("нужны ключи Telegram API в настройках" if not settings.telegram_ready
                else "подключу по кнопке ниже")
@@ -622,12 +675,77 @@ async def cmd_chats(message: Message) -> None:
             note = {"join_pending": " — ждёт одобрения админа чата",
                     "failed": f" — не получилось: {fmt.esc(w['note'] or '')}"}.get(w["status"], "")
             lines.append(f"• {fmt.esc(w['link'])}{note}")
+        rows_kb += [[(f"🗑 Убрать: {_short(w['link'].removeprefix('https://'))}",
+                      f"delreq:{w['id']}")] for w in waiting]
         if settings.telegram_ready:
-            markup = _kb([("🔌 Подключить сейчас", "connect:saved")])
-    if markup is not None:
-        await _reply_long(message, "\n".join(lines).rstrip(), reply_markup=markup)
+            rows_kb.append([("🔌 Подключить сейчас", "connect:saved")])
+    text = "\n".join(lines).rstrip()
+    if rows_kb:
+        await _reply_long(message, text, reply_markup=_kb(*rows_kb))
     else:
-        await _reply_long(message, "\n".join(lines).rstrip())
+        await _reply_long(message, text)
+
+
+def _short(text: str, limit: int = 28) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def cb_delete_ask(call: CallbackQuery) -> None:
+    await call.answer()
+    if call.message is None:
+        return
+    chat_id = int(call.data.split(":", 1)[1])
+    pool = await db.get_pool()
+    info = await pool.fetchrow(
+        """
+        select title,
+               (select count(*) from messages where chat_id = $1) messages,
+               (select count(*) from signals where chat_id = $1) signals
+          from chats where id = $1
+        """,
+        chat_id,
+    )
+    if info is None:
+        await call.message.answer("Этого чата уже нет в списке.")
+        return
+    await call.message.answer(
+        f"Удалить чат <b>{fmt.esc(info['title'])}</b>?\n\n"
+        f"Я перестану за ним следить и удалю из базы его "
+        f"{fmt.messages_word(info['messages'])}, обсуждения и "
+        f"{fmt.signals_word(info['signals'])}. Боли пересчитаются без него.\n"
+        "Из самого чата в Telegram аккаунт не выйдет.",
+        reply_markup=_kb([("🗑 Да, удалить", f"delok:{chat_id}"), ("Отмена", "cancel")]),
+    )
+
+
+@router.callback_query(F.data.startswith("delok:"))
+async def cb_delete(call: CallbackQuery) -> None:
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is None:
+        return
+    try:
+        res = await jobs.delete_chat(int(call.data.split(":", 1)[1]))
+    except jobs.Busy as e:
+        await call.message.answer(_busy(e))
+        return
+    if res is None:
+        await call.message.answer("Этого чата уже нет в списке.")
+        return
+    text = (f"✅ Чат <b>{fmt.esc(res['title'])}</b> удалён: "
+            f"{fmt.messages_word(res['messages'])}, {fmt.signals_word(res['signals'])}.")
+    if res["pains_removed"]:
+        text += f"\nБолей, в которых не осталось сигналов: {res['pains_removed']} — убрал."
+    await call.message.answer(text)
+
+
+@router.callback_query(F.data.startswith("delreq:"))
+async def cb_delete_request(call: CallbackQuery) -> None:
+    link = await jobs.delete_request(int(call.data.split(":", 1)[1]))
+    await call.answer("Убрал из ожидания" if link else "Уже убрано")
+    if call.message is not None and link:
+        await call.message.answer(f"Убрал из ожидания: {fmt.esc(link)}")
 
 
 # ----------------------------------------------------------- добавление чата
@@ -896,3 +1014,184 @@ async def cmd_usage(message: Message) -> None:
     await _reply_long(
         message, fmt.fmt_usage(report, settings.llm_price_in, settings.llm_price_out)
     )
+
+
+# ------------------------------------------ скрытая: отслеживание и отчёт
+
+
+@router.message(Command("live"))
+async def cmd_live(message: Message) -> None:
+    """Пауза отслеживания, расход за день и отчёт по запросу. Не в меню."""
+    from . import live
+
+    on = await live.is_enabled()
+    lines = [f"📡 Отслеживание: <b>{'включено' if on else 'на паузе'}</b>"]
+    if not settings.telegram_ready:
+        lines.append("Нужны ключи Telegram API — без них читать чаты я не могу.")
+    lines.append(
+        f"Каждый вечер в {settings.report_hour}:00 забираю переписку за сутки, разбираю "
+        "её и присылаю итоги дня."
+    )
+    spent = await live.spent_today()
+    if live.budget_enabled():
+        lines.append(f"Потрачено сегодня: {spent:.2f} из {settings.live_daily_budget:g} ₽")
+    hit = await live.budget_hit_today()
+    if hit:
+        lines.append(f"⚠️ Сегодня лимит исчерпан в {fmt.when(hit)}.")
+    raw = await db.get_setting(live.LAST_RUN_KEY)
+    if raw:
+        from datetime import datetime
+
+        lines.append(f"Последний разбор: {fmt.when(datetime.fromisoformat(raw))}")
+    sent = await db.get_setting(live.REPORT_DATE_KEY) == clock.now().date().isoformat()
+    lines.append(f"Итоги дня: в {settings.report_hour}:00"
+                 + (" (сегодня уже отправлены)" if sent else ""))
+    toggle = ("⏸ Поставить на паузу", "live:off") if on else ("▶️ Включить", "live:on")
+    await message.answer(
+        "\n".join(lines), reply_markup=_kb([toggle], [("📤 Итоги дня сейчас", "live:report")])
+    )
+
+
+@router.callback_query(F.data.in_({"live:on", "live:off"}))
+async def cb_live_toggle(call: CallbackQuery) -> None:
+    from . import live
+
+    on = call.data == "live:on"
+    await live.set_enabled(on)
+    await call.answer("Включено" if on else "На паузе")
+    await _drop_markup(call)
+    if call.message is not None:
+        await call.message.answer(
+            "▶️ Отслеживание включено." if on else
+            "⏸ Вечерний разбор на паузе: переписку я продолжаю собирать, но нейросеть "
+            "не запускаю. Итоги дня придут без разбора. Включить — /live"
+        )
+
+
+@router.callback_query(F.data == "live:report")
+async def cb_live_report(call: CallbackQuery) -> None:
+    from . import live
+
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is None:
+        return
+    status = await call.message.answer("📤 Собираю итоги дня…")
+    try:
+        text = await jobs.run_job(live.build_report(mark_sent=False))
+    except jobs.Busy as e:
+        await status.edit_text(_busy(e))
+        return
+    except Exception as e:  # noqa: BLE001
+        await status.edit_text(f"❌ Не получилось собрать: {fmt.esc(e)}")
+        return
+    await status.delete()
+    await _reply_long(call.message, text)
+
+
+# ------------------------------------------------------ участники чатов
+
+
+async def _send_person(message: Message, label: str, prefix: str = "") -> None:
+    pool = await db.get_pool()
+    c = await people.card(pool, label)
+    if c is None:
+        await message.answer("Такого участника нет в базе.")
+        return
+    if c.get("hint_chat_id") and c.get("hint_message_id"):
+        username = await pool.fetchval("select username from chats where id = $1",
+                                       c["hint_chat_id"])
+        c["hint_link"] = message_link(c["hint_chat_id"], username, c["hint_message_id"])
+    code = label.removeprefix("u:")
+    rows = [[("✏️ Компания и роль", f"pe:{code}"), ("📝 Заметка", f"pn:{code}")]]
+    if c.get("company_hint") or c.get("role_hint"):
+        rows.insert(0, [("✅ Верно, сохранить подсказку", f"pa:{code}")])
+    await _reply_long(message, prefix + fmt.fmt_person(c), reply_markup=_kb(*rows))
+
+
+@router.message(Command(re.compile(r"who_([0-9a-f]{8})")))
+async def cmd_who(message: Message, command: CommandObject) -> None:
+    await _send_person(message, "u:" + command.regexp_match.group(1))
+
+
+@router.callback_query(F.data.startswith("pe:") | F.data.startswith("pn:"))
+async def cb_person_edit(call: CallbackQuery) -> None:
+    await call.answer()
+    if call.message is None:
+        return
+    kind, code = call.data.split(":", 1)
+    label = "u:" + code
+    pool = await db.get_pool()
+    name = await pool.fetchval("select name from authors where author_label = $1", label)
+    who = f" ({fmt.esc(name)})" if name else ""
+    if kind == "pe":
+        text = (f"✏️ Компания и роль для {label}{who}\n\nОтветь на это сообщение одной "
+                "строкой через запятую, например: <i>Оптика Люкс, владелец</i>\n"
+                "Только компания — без запятой. Стереть — «-».")
+        hint = "Оптика Люкс, владелец"
+    else:
+        text = (f"📝 Заметка для {label}{who}\n\nОтветь на это сообщение текстом заметки. "
+                "Стереть — «-».")
+        hint = "например: знакомы по выставке"
+    await call.message.answer(
+        text, reply_markup=ForceReply(input_field_placeholder=hint, selective=True)
+    )
+
+
+@router.callback_query(F.data.startswith("pa:"))
+async def cb_person_accept(call: CallbackQuery) -> None:
+    label = "u:" + call.data.split(":", 1)[1]
+    ok = await people.accept_hint(await db.get_pool(), label)
+    await call.answer("Сохранил" if ok else "Подсказки уже нет")
+    await _drop_markup(call)
+    if call.message is not None and ok:
+        await _send_person(call.message, label, prefix="✅ Сохранил.\n\n")
+
+
+@router.message(Command("people"))
+async def cmd_people(message: Message) -> None:
+    rows = await people.listing(await db.get_pool(), None)
+    await _reply_long(message, fmt.fmt_people(rows, "все чаты"))
+
+
+@router.callback_query(F.data.startswith("ppl:"))
+async def cb_people_in_chat(call: CallbackQuery) -> None:
+    await call.answer()
+    if call.message is None:
+        return
+    chat_id = int(call.data.split(":", 1)[1])
+    pool = await db.get_pool()
+    title = await pool.fetchval("select title from chats where id = $1", chat_id)
+    if title is None:
+        await call.message.answer("Этого чата уже нет в списке.")
+        return
+    rows = await people.listing(pool, chat_id)
+    kb = None
+    if settings.telegram_ready:
+        kb = _kb([("🔄 Подтянуть имена из Telegram", f"names:{chat_id}")])
+    text = fmt.fmt_people(rows, title)
+    if kb:
+        await _reply_long(call.message, text, reply_markup=kb)
+    else:
+        await _reply_long(call.message, text)
+
+
+@router.callback_query(F.data.startswith("names:"))
+async def cb_refresh_names(call: CallbackQuery) -> None:
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is None:
+        return
+    status = await call.message.answer("🔄 Подтягиваю имена участников из Telegram…")
+    try:
+        n = await jobs.run_job(jobs.refresh_names(int(call.data.split(":", 1)[1])))
+    except jobs.Busy as e:
+        await status.edit_text(_busy(e))
+        return
+    except Exception as e:  # noqa: BLE001 — например, админ скрыл список участников
+        await status.edit_text(
+            f"❌ Не получилось: {fmt.esc(e)}\nВ некоторых чатах админы скрывают список "
+            "участников — тогда имена появятся, когда люди будут писать."
+        )
+        return
+    await status.edit_text(f"✅ Обновил имена: {n}. Открой список участников ещё раз.")

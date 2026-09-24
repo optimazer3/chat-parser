@@ -281,10 +281,69 @@ async def pending_requests() -> list[dict[str, Any]]:
     return [
         dict(r)
         for r in await pool.fetch(
-            "select link, status, note from chat_requests "
+            "select id, link, status, note from chat_requests "
             "where status <> 'done' order by added_at"
         )
     ]
+
+
+async def refresh_names(chat_id: int) -> int:
+    """Подтянуть имена всех участников чата из Telegram. Нужно для тех, кто
+    писал до того, как бот начал запоминать имена."""
+    from ..people import upsert_authors
+    from ..pii import author_hash, author_label
+
+    async with exclusive("имена участников"):
+        pool = await db.get_pool()
+        client = await connect_client()
+        try:
+            entity = await client.get_entity(chat_id)
+            items = []
+            async for user in client.iter_participants(entity, limit=10000):
+                h = author_hash(user.id, settings.author_salt)
+                name = " ".join(x for x in (user.first_name, user.last_name) if x) or None
+                items.append((h, author_label(h), name, user.username))
+        finally:
+            await client.disconnect()
+        async with pool.acquire() as conn:
+            await upsert_authors(conn, items)
+        return len(items)
+
+
+async def delete_request(request_id: int) -> str | None:
+    pool = await db.get_pool()
+    return await pool.fetchval(
+        "delete from chat_requests where id = $1 returning link", request_id
+    )
+
+
+async def delete_chat(chat_id: int) -> dict[str, Any] | None:
+    """Перестать следить за чатом и удалить его данные. Боли, где после этого
+    не осталось сигналов, убираются, остальные пересчитываются."""
+    async with exclusive("удаление чата"):
+        pool = await db.get_pool()
+        info = await pool.fetchrow(
+            """
+            select title,
+                   (select count(*) from messages where chat_id = $1) messages,
+                   (select count(*) from signals where chat_id = $1) signals
+              from chats where id = $1
+            """,
+            chat_id,
+        )
+        if info is None:
+            return None
+        touched = [r["cluster_id"] for r in await pool.fetch(
+            "select distinct cluster_id from signals where chat_id = $1 and cluster_id is not null",
+            chat_id,
+        )]
+        async with pool.acquire() as conn, conn.transaction():
+            # чтобы бот не подключил его обратно при запуске
+            await conn.execute("delete from chat_requests where chat_id = $1", chat_id)
+            # сообщения, курсор, обсуждения и сигналы уходят каскадом
+            await conn.execute("delete from chats where id = $1", chat_id)
+        removed = await llm_cluster.refresh_stats(pool, touched) if touched else 0
+        return {**dict(info), "pains_removed": removed}
 
 
 async def _mark_request(pool, link: str, status: str, chat_id: int | None = None,

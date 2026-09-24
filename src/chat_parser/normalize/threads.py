@@ -89,7 +89,15 @@ def thread_hash(ids: list[int], texts: dict[int, str]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
-async def build_for_chat(pool: asyncpg.Pool, chat_id: int) -> dict:
+async def build_for_chat(
+    pool: asyncpg.Pool, chat_id: int, since: datetime | None = None
+) -> dict:
+    """since — собрать только обсуждения из сообщений не старше этого момента.
+
+    Нужно вечернему разбору: пересобирать всю историю чата каждый вечер
+    незачем. Обсуждение, начавшееся до окна, получит в окне новый корень, но
+    уже разобранная его часть не переразбирается — хэш старой записи тот же.
+    """
     rows = [
         dict(r)
         for r in await pool.fetch(
@@ -97,9 +105,11 @@ async def build_for_chat(pool: asyncpg.Pool, chat_id: int) -> dict:
             select message_id, ts, author_label, text, reply_to
               from messages
              where chat_id = $1 and not is_bot and text <> ''
+               and ($2::timestamptz is null or ts >= $2)
              order by message_id
             """,
             chat_id,
+            since,
         )
     ]
     if not rows:

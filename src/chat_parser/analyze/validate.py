@@ -14,6 +14,7 @@ from .schema import Extraction, Signal
 WS_RE = re.compile(r"\s+")
 # строка треда: [m:<id> | <автор> | <дата>…] текст  (см. normalize/chunker.py)
 LINE_RE = re.compile(r"^\[m:(\d+) \|[^\]]*\]\s?(.*)$")
+AUTHOR_LINE_RE = re.compile(r"^\[m:(\d+) \| (u:[0-9a-f]{8}) \|[^\]]*\]\s?(.*)$")
 MIN_QUOTE_CHARS = 8
 # Цитата из одного-двух слов («jacquemus») ничего не доказывает.
 MIN_QUOTE_WORDS = 3
@@ -59,3 +60,27 @@ def validate(
             s.message_ids = [where] + [i for i in s.message_ids if i != where]
         good.append(s)
     return good, dropped
+
+
+def validate_people(
+    extraction: Extraction, source: str
+) -> list[tuple[str, str | None, str | None, str, int]]:
+    """Подсказки «кто есть кто» -> (label, компания, роль, цитата, id сообщения).
+
+    Цитата должна дословно стоять в сообщении ЭТОГО же человека: так чужие
+    слова ему не припишутся.
+    """
+    lines = [m for m in map(AUTHOR_LINE_RE.match, source.splitlines()) if m]
+    out = []
+    for p in extraction.people:
+        company = p.company.strip() or None
+        role = p.role.strip() or None
+        quote = norm(p.evidence_quote)
+        if not (company or role) or len(quote.split()) < MIN_QUOTE_WORDS:
+            continue
+        own = next((m for m in lines if m.group(2) == p.author_label
+                    and quote in norm(m.group(3))), None)
+        if own is None:
+            continue
+        out.append((p.author_label, company, role, p.evidence_quote.strip(), int(own.group(1))))
+    return out

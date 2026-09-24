@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import timedelta, timezone
 from typing import Any
 
-from ..config import settings
+from .. import clock, people
 
 LIMIT = 3800
 
@@ -23,7 +22,7 @@ AUDIENCE_RU = {
 
 def when(ts: Any, with_year: bool = False) -> str:
     """Время в часовом поясе пользователя: «23.09 в 18:01». В базе всё в UTC."""
-    local = ts.astimezone(timezone(timedelta(hours=settings.display_utc_offset)))
+    local = ts.astimezone(clock.tz())
     return local.strftime("%d.%m.%Y в %H:%M" if with_year else "%d.%m в %H:%M")
 
 
@@ -85,7 +84,7 @@ def messages_word(n: int) -> str:
     return f"{fmt_num(n)} {plural(n, 'сообщение', 'сообщения', 'сообщений')}"
 
 
-def people(n: int) -> str:
+def people_word(n: int) -> str:
     return f"{n} {plural(n, 'человек', 'человека', 'человек')}"
 
 
@@ -97,13 +96,13 @@ def signals_word(n: int) -> str:
     return f"{n} {plural(n, 'сигнал', 'сигнала', 'сигналов')}"
 
 
-def fmt_top(clusters: list[Any]) -> str:
+def fmt_top(clusters: list[Any], title: str = "🔝 <b>Топ болей</b>") -> str:
     if not clusters:
         return (
             "Болей пока нет. Сначала разбери обсуждения — 🧠 Разобрать, "
             "потом собери их — 🧩 Пересчитать боли."
         )
-    lines = ["🔝 <b>Топ болей</b>"]
+    lines = [title]
     current = None
     for c in clusters:
         if c["audience"] != current:
@@ -111,7 +110,7 @@ def fmt_top(clusters: list[Any]) -> str:
             lines.append(f"\n<b>{AUDIENCE_RU.get(current, current).capitalize()}</b>")
         lines.append(
             f"• {esc(c['label'])}\n"
-            f"   говорят {people(c['n_authors'])} в {chats_word(c['n_chats'])}, "
+            f"   говорят {people_word(c['n_authors'])} в {chats_word(c['n_chats'])}, "
             f"{signals_word(c['n_signals'])} → /pain_{c['id']}"
         )
     lines.append("\nНажми на /pain_… рядом с болью — пришлю подробности и цитаты.")
@@ -131,11 +130,19 @@ TYPE_RU = {
 
 
 def fmt_quote(q: Any) -> str:
-    """Цитата и под ней ссылка на сообщение, если у чата бывают ссылки."""
+    """Цитата, под ней — кто сказал (с карточкой участника) и ссылка на сообщение."""
     text = f"<blockquote>{esc(q['evidence_quote'])}</blockquote>"
-    link = q.get("link") if isinstance(q, dict) else None
-    if link:
-        text += f'\n<a href="{html.escape(link, quote=True)}">↗ сообщение в чате</a>'
+    if not isinstance(q, dict):
+        return text
+    parts = []
+    label = q.get("author_label")
+    if label:
+        who = people.display(q.get("a_name"), label, q.get("a_company"), q.get("a_role"))
+        parts.append(f"— {esc(who)} {people.who_command(label)}")
+    if q.get("link"):
+        parts.append(f'<a href="{html.escape(q["link"], quote=True)}">↗ сообщение в чате</a>')
+    if parts:
+        text += "\n" + " · ".join(parts)
     return text
 
 
@@ -146,7 +153,7 @@ def fmt_card(cluster: Any, quotes: list[Any]) -> str:
         "",
         f"<blockquote>{esc(cluster['statement'])}</blockquote>",
         "",
-        f"Говорят {people(cluster['n_authors'])} в {chats_word(cluster['n_chats'])}, "
+        f"Говорят {people_word(cluster['n_authors'])} в {chats_word(cluster['n_chats'])}, "
         f"{signals_word(cluster['n_signals'])}.",
     ]
     card = cluster["card"]
@@ -202,7 +209,7 @@ def fmt_digest(stats: dict[str, Any], new_signals: int, new_msgs: int, top: list
         lines.append("\n<b>Топ болей сейчас</b>")
         for c in top:
             lines.append(
-                f"• {esc(c['label'])} — {people(c['n_authors'])} → /pain_{c['id']}"
+                f"• {esc(c['label'])} — {people_word(c['n_authors'])} → /pain_{c['id']}"
             )
         lines.append("\nПодробности — нажми /pain_… · весь отчёт: /report")
     return "\n".join(lines)
@@ -380,3 +387,52 @@ def fmt_connect_result(res: dict[str, list]) -> tuple[str, Any]:
             InlineKeyboardButton(text="📥 Загрузить историю", callback_data="hist:all")
         ]])
     return "\n".join(lines).strip(), markup
+
+
+def fmt_person(c: dict[str, Any]) -> str:
+    """Карточка участника."""
+    label = c["author_label"]
+    name = c["name"] or "участник " + label.removeprefix("u:")
+    head = f"👤 <b>{esc(name)}</b>" + (f" (@{esc(c['username'])})" if c.get("username") else "")
+    lines = [head, ""]
+    lines.append(f"Компания: {esc(c['company']) if c.get('company') else '— не указано'}")
+    lines.append(f"Роль: {esc(c['role']) if c.get('role') else '— не указано'}")
+    if c.get("note"):
+        lines.append(f"Заметка: {esc(c['note'])}")
+    if c.get("company_hint") or c.get("role_hint"):
+        hint = ", ".join(esc(x) for x in (c.get("role_hint"), c.get("company_hint")) if x)
+        lines += ["", f"💡 <b>Подсказка по словам самого участника:</b> {hint}"]
+        if c.get("hint_quote"):
+            lines.append(f"<blockquote>{esc(c['hint_quote'])}</blockquote>")
+        if c.get("hint_link"):
+            href = html.escape(c["hint_link"], quote=True)
+            lines.append(f'<a href="{href}">↗ сообщение в чате</a>')
+    if c.get("chats"):
+        lines += ["", "<b>Пишет в чатах:</b>"]
+        lines += [f"• {esc(ch['title'])} — {messages_word(ch['n'])}" for ch in c["chats"]]
+    lines.append(f"\nСигналов от участника: {c.get('signals', 0)}")
+    if c.get("pains"):
+        lines.append("<b>Боли участника:</b>")
+        lines += [f"• {esc(pn['label'])} → /pain_{pn['id']}" for pn in c["pains"]]
+    return "\n".join(lines)
+
+
+def fmt_people(rows: list[dict[str, Any]], title: str) -> str:
+    if not rows:
+        return "Участников пока нет — сначала загрузи переписку чата."
+    lines = [f"👥 <b>Участники</b> · {esc(title)}", ""]
+    unknown = 0
+    for r in rows:
+        who = people.display(r["name"], r["author_label"], r["company"], r["role"])
+        mark = " 💡" if r.get("has_hint") and not (r["company"] or r["role"]) else ""
+        if not (r["company"] or r["role"]):
+            unknown += 1
+        lines.append(f"• {esc(who)} — {messages_word(r['msgs'])}{mark} "
+                     f"{people.who_command(r['author_label'])}")
+    lines.append("")
+    if unknown:
+        lines.append(f"Компания и роль не указаны у {unknown} из {len(rows)}. "
+                     "Нажми /who_… рядом с человеком, чтобы внести.")
+    lines.append("💡 — нейросеть заметила, что человек сам сказал о себе; "
+                 "подтвердить можно в карточке участника.")
+    return "\n".join(lines)

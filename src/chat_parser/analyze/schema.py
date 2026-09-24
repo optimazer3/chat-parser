@@ -38,9 +38,21 @@ class Signal(BaseModel):
     context: str = Field(description="Обстоятельства, в которых возникает проблема")
 
 
+class PersonHint(BaseModel):
+    author_label: str
+    company: str = Field(description="Компания или салон, если человек сам назвал; иначе пусто")
+    role: str = Field(
+        description="Кем работает: владелец, продавец, оптометрист, поставщик…; иначе пусто"
+    )
+    evidence_quote: str = Field(description="Дословная цитата, где человек говорит о себе")
+
+
 class Extraction(BaseModel):
     has_signals: bool
     signals: list[Signal]
+    # Кто есть кто — по словам самих людей. Становится подсказкой в карточке
+    # участника, пока пользователь не подтвердит или не впишет своё.
+    people: list[PersonHint] = Field(default_factory=list)
 
 
 class ClusterDraft(BaseModel):
@@ -76,3 +88,16 @@ class Card(BaseModel):
     )
     product_hypotheses: list[str]
     open_questions: list[str]
+
+
+class AssignItem(BaseModel):
+    signal_id: int
+    pain_id: int = Field(description="id подходящей боли или 0, если ни одна не подходит")
+
+
+class Assignment(BaseModel):
+    items: list[AssignItem]
+
+
+class DayDigest(BaseModel):
+    highlights: list[str] = Field(description="3-5 главных выводов дня, по одному предложению")

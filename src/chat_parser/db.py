@@ -10,7 +10,7 @@ from .config import settings
 
 EXPECTED_TABLES = [
     "chats", "messages", "cursors", "threads", "signals", "clusters", "runs", "llm_usage",
-    "chat_requests",
+    "chat_requests", "bot_settings", "authors",
 ]
 
 _pool: asyncpg.Pool | None = None
@@ -84,3 +84,20 @@ def safe_dsn() -> str:
     import re
 
     return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", settings.database_url)
+
+
+async def get_setting(key: str, default: str | None = None) -> str | None:
+    pool = await get_pool()
+    value = await pool.fetchval("select value from bot_settings where key = $1", key)
+    return default if value is None else value
+
+
+async def set_setting(key: str, value: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        """
+        insert into bot_settings (key, value) values ($1, $2)
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+        """,
+        key, value,
+    )

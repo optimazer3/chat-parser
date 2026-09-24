@@ -17,13 +17,14 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.types import BotCommand, User
 
-from .. import db
+from .. import clock, db
 from ..config import settings
 from ..net import aiogram_proxy, network_hint
 from . import format as fmt
 from . import jobs
 from .auth import AdminOnly
-from .handlers import router
+from . import live
+from .handlers import KEYBOARD_KEY, KEYBOARD_VERSION, MAIN_KB, router
 
 log = logging.getLogger("chat_parser.bot")
 
@@ -39,6 +40,7 @@ COMMANDS = [
     BotCommand(command="retry", description="повторить неудачные обсуждения"),
     BotCommand(command="run", description="полный цикл одной кнопкой"),
     BotCommand(command="chats", description="список чатов"),
+    BotCommand(command="people", description="участники: кто из какой компании"),
     BotCommand(command="help", description="справка"),
 ]
 
@@ -50,6 +52,51 @@ async def _broadcast(bot: Bot, text: str) -> None:
                 await bot.send_message(admin, part)
         except Exception as e:  # noqa: BLE001 — один недоступный админ не валит рассылку
             log.warning("не доставлено %s: %s", admin, e)
+
+
+async def send_report(bot: Bot, mark_sent: bool = True) -> str:
+    text = await jobs.run_job(live.build_report(mark_sent))
+    await _broadcast(bot, text)
+    return text
+
+
+async def report_loop(bot: Bot) -> None:
+    """Отчёт в REPORT_HOUR по местному времени. Если в это время бот был
+    выключен — досылается сразу после запуска."""
+    while True:
+        try:
+            if await live.report_due():
+                await send_report(bot)
+        except jobs.Busy:
+            await asyncio.sleep(60)  # идёт другая операция — отчёт чуть позже
+            continue
+        except jobs.Cancelled:
+            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("дневной отчёт не собрался: %s: %s", type(e).__name__, e)
+            await asyncio.sleep(300)
+            continue
+        wait = (clock.next_at(settings.report_hour) - clock.now()).total_seconds()
+        await asyncio.sleep(max(wait, 1) + 1)
+
+
+async def announce_keyboard(bot: Bot) -> None:
+    """Прислать новую клавиатуру один раз после обновления: у пользователя в
+    Telegram остаётся старая, пока бот не пришлёт другую."""
+    if await db.get_setting(KEYBOARD_KEY) == KEYBOARD_VERSION:
+        return
+    for admin in settings.admin_ids:
+        try:
+            await bot.send_message(
+                admin,
+                "Обновил кнопки внизу. Теперь каждый вечер в "
+                f"{settings.report_hour}:00 я сам разбираю переписку за день и присылаю "
+                "итоги. Подробности — /help",
+                reply_markup=MAIN_KB,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("не доставлено %s: %s", admin, e)
+    await db.set_setting(KEYBOARD_KEY, KEYBOARD_VERSION)
 
 
 async def connect_saved(bot: Bot) -> None:
@@ -105,7 +152,7 @@ async def run_bot() -> None:
         bot = build_bot()
     except ValueError as e:  # неправильный TG_PROXY
         raise SystemExit(str(e)) from None
-    task: asyncio.Task | None = None
+    background: list[asyncio.Task] = []
     try:
         # Связь проверяем до сборки диспетчера: router — модульный синглтон,
         # и его можно подключить только к одному диспетчеру за процесс.
@@ -121,12 +168,14 @@ async def run_bot() -> None:
         await bot.set_my_commands(COMMANDS)
         via = f", через прокси {settings.tg_proxy}" if settings.tg_proxy else ""
         log.info("бот @%s запущен%s, админов: %d", me.username, via, len(settings.admin_ids))
-        # Расписания нет: всё, что тратит токены, запускается только вручную.
-        if settings.telegram_ready and await jobs.pending_requests():
-            task = asyncio.create_task(connect_saved(bot))
+        background = [asyncio.create_task(announce_keyboard(bot))]
+        if settings.telegram_ready:
+            if await jobs.pending_requests():
+                background.append(asyncio.create_task(connect_saved(bot)))
+            background.append(asyncio.create_task(report_loop(bot)))
         await dp.start_polling(bot)
     finally:
-        if task is not None:
-            task.cancel()
+        for t in background:
+            t.cancel()
         await db.close_pool()
         await bot.session.close()

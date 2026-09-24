@@ -55,7 +55,8 @@ async def harness(monkeypatch, tmp_path):
 
     from chat_parser import db
     from chat_parser.analyze.schema import (
-        Card, ClusterDraft, Clustering, Extraction, Merging, Signal,
+        AssignItem, Assignment, Card, ClusterDraft, Clustering, DayDigest, Extraction,
+        Merging, PersonHint, Signal,
     )
     from chat_parser.bot import jobs
     from chat_parser.bot.auth import AdminOnly
@@ -70,26 +71,47 @@ async def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "tg_api_id", None)
     monkeypatch.setattr(settings, "tg_api_hash", "")
     monkeypatch.setattr(db, "_pool", None)
+    monkeypatch.setattr(settings, "tg_admin_ids", str(ADMIN))
+    state = {"cluster_label": "Нехватка оборудования"}
 
     async def fake_structured(self, system, user, schema, max_tokens=8000):
+        state.setdefault("prompts", []).append(user)
         self.usage["calls"] += 1
         self.usage["prompt"] += 900
         self.usage["completion"] += 600
         if schema is Extraction:
+            lines = [m for m in map(LINE.match, user.splitlines()) if m]
             sigs = [
                 Signal(type="pain", audience="owner", summary=m.group(3)[:100],
                        evidence_quote=" ".join(m.group(3).split()[:5]),
                        message_ids=[int(m.group(1))], author_label=m.group(2),
-                       intensity=3, confidence=0.9, entities=[], context="тест")
-                for m in map(LINE.match, user.splitlines())
-                if m and len(m.group(3).split()) >= 5
+                       intensity=5 if "срочно" in m.group(3) else 3,
+                       confidence=0.9, entities=[], context="тест")
+                for m in lines if len(m.group(3).split()) >= 5
             ]
-            return Extraction(has_signals=bool(sigs), signals=sigs)
+            # человек сам рассказал о себе — и ещё кто-то рассказал о нём (не считается)
+            hints = [
+                PersonHint(author_label=m.group(2), company="Оптика Люкс", role="владелец",
+                           evidence_quote="у меня два салона Оптика Люкс")
+                for m in lines if "два салона Оптика Люкс" in m.group(3)
+            ]
+            return Extraction(has_signals=bool(sigs), signals=sigs, people=hints)
         if schema is Clustering:
             ids = [int(x) for x in re.findall(r"^(\d+)\t", user, re.M)]
             return Clustering(clusters=[ClusterDraft(
-                label="Нехватка оборудования", statement="мне не хватает приборов",
+                label=state["cluster_label"], statement="мне не хватает приборов",
                 signal_ids=ids)])
+        if schema is Assignment:
+            known = user.split("Известные боли", 1)[1].split("Новые сигналы", 1)
+            first_pain = int(re.search(r"^(\d+)\t", known[0].split("\n", 1)[1], re.M)[1])
+            return Assignment(items=[
+                AssignItem(signal_id=int(sid),
+                           pain_id=first_pain if re.search("прибор|пупиллометр", text) else 0)
+                for sid, text in re.findall(r"^(\d+)\t\w+\t(.*)$", known[1], re.M)
+            ])
+        if schema is DayDigest:
+            return DayDigest(highlights=["Поставщики срывают сроки, владельцы теряют клиентов",
+                                         "Не хватает диагностических приборов"])
         if schema is Merging:
             return Merging(groups=[])
         if schema is Card:
@@ -142,6 +164,8 @@ async def harness(monkeypatch, tmp_path):
                     self.mid += 1
                     return self._msg(bot, self.mid, method.text)
                 return self._msg(bot, method.message_id, method.text)
+            if name == "DeleteMessage":
+                return True
             if name == "EditMessageReplyMarkup":
                 return self._msg(bot, method.message_id, None)
             if name == "SendDocument":
@@ -162,7 +186,7 @@ async def harness(monkeypatch, tmp_path):
     pool = await db.get_pool()
     await pool.execute(
         "drop table if exists runs, clusters, signals, threads, cursors, messages, chats, "
-        "llm_usage, chat_requests cascade"
+        "llm_usage, chat_requests, bot_settings, authors cascade"
     )
     await db.apply_schema()
 
@@ -170,7 +194,7 @@ async def harness(monkeypatch, tmp_path):
         pass
 
     h = H()
-    h.session, h.pool, h.jobs = session, pool, jobs
+    h.session, h.pool, h.jobs, h.bot, h.state = session, pool, jobs, bot, state
     h.counter = 0
 
     async def feed(update_kwargs):
@@ -186,8 +210,13 @@ async def harness(monkeypatch, tmp_path):
             message_id=h.counter + 1, date=datetime.now(timezone.utc),
             chat=Chat(id=ADMIN, type="private"), from_user=user, text=text, **kw)}
 
-    async def say(text, frm=ADMIN):
-        return await feed(msg(text, frm))
+    async def say(text, frm=ADMIN, reply_to=None):
+        kw = {}
+        if reply_to is not None:
+            kw["reply_to_message"] = Message(
+                message_id=1, date=datetime.now(timezone.utc),
+                chat=Chat(id=ADMIN, type="private"), text=reply_to)
+        return await feed(msg(text, frm, **kw))
 
     async def press(data):
         from aiogram.types import CallbackQuery
@@ -483,3 +512,289 @@ async def test_connect_saved_chats_by_button(harness, telegram_api):
     out = await h.press("hist:all")
     assert "Загружено: <b>3 сообщения</b>" in out and "[ex:all]" in out
     assert "Ждут подключения" not in await h.say("/chats")
+
+
+# ------------------------------------------------------------ вечерний отчёт
+
+PRO = -1009000000001  # «Оптики Про»: подключён, история не загружалась
+AUTHORS = {
+    "a": ("a" * 16, "u:aaaaaaaa", "Иван Петров", "ivan_optika"),
+    "b": ("b" * 16, "u:bbbbbbbb", "Мария", None),
+    "c": ("c" * 16, "u:cccccccc", "Ольга Смирнова", "olga"),
+}
+TODAY = [  # (автор, текст, ответ на)
+    ("a", "у меня два салона Оптика Люкс в Казани, поставщик оправ опять сорвал сроки", None),
+    ("b", "у нас тоже поставщик линз задерживает поставки уже третью неделю", 1),
+    ("c", "срочно нужен второй пупиллометр, один прибор на два салона не спасает", None),
+    ("b", "авторефрактометр сломался, приборов не хватает, клиентов некуда посадить", None),
+    ("a", "ещё прибор для проверки линз нужен, старый еле работает совсем", None),
+]
+
+
+@pytest.fixture
+async def evening(harness, telegram_api, monkeypatch):
+    """Аккаунт-сборщик «читает» чаты: сегодня в «Оптиках Про» пять сообщений."""
+    from chat_parser.bot import live
+    from chat_parser.config import settings
+    from chat_parser.ingest import collector
+    from chat_parser.people import upsert_authors
+
+    h = harness
+    monkeypatch.setattr(settings, "live_quiet_minutes", 0)
+    monkeypatch.setattr(live, "connect_client", telegram_api_client)
+    await h.pool.execute("insert into chats (id, title, username) values ($1, $2, $3)",
+                         PRO, "Оптики Про", "optika_pro")
+    await h.pool.execute("insert into cursors (chat_id) values ($1)", PRO)
+
+    h.calls, h.inbox = [], {PRO: list(TODAY)}
+
+    async def sync_chat(client, pool, chat_id, mode, limit=None, on_progress=None, since=None):
+        h.calls.append((chat_id, mode, since))
+        todo, h.inbox[chat_id] = h.inbox.get(chat_id, []), []
+        if not todo:
+            return {"chat_id": chat_id, "saved": 0}
+        first = await pool.fetchval(
+            "select coalesce(max(message_id), 0) + 1 from messages where chat_id = $1", chat_id)
+        t0 = datetime.now(timezone.utc) - timedelta(minutes=len(todo) + 2)
+        async with pool.acquire() as conn:
+            for i, (who, text, reply) in enumerate(todo):
+                ah, label, name, username = AUTHORS[who]
+                await conn.execute(
+                    "insert into messages (chat_id, message_id, ts, author_hash, author_label, "
+                    "text, reply_to) values ($1,$2,$3,$4,$5,$6,$7)",
+                    chat_id, first + i, t0 + timedelta(minutes=i), ah, label, text, reply)
+            await upsert_authors(conn, [AUTHORS[w] for w, _, _ in todo])
+        await pool.execute("update cursors set newest_id = $2, last_run = now() "
+                           "where chat_id = $1", chat_id, first + len(todo) - 1)
+        return {"chat_id": chat_id, "saved": len(todo)}
+
+    monkeypatch.setattr(collector, "sync_chat", sync_chat)
+    return h
+
+
+async def telegram_api_client():
+    class FakeClient:
+        async def disconnect(self):
+            pass
+
+    return FakeClient()
+
+
+async def _old_pain(h) -> int:
+    """Архив из файла разобран вручную: есть известная боль «Нехватка оборудования»."""
+    await h.send_export()
+    await h.press("ex:all")
+    await h.press("cl")
+    h.state["cluster_label"] = "Срыв сроков поставки"
+    return await h.pool.fetchval("select id from clusters")
+
+
+async def test_evening_report(evening, monkeypatch):
+    from chat_parser import clock
+    from chat_parser.bot import live, main
+
+    h = evening
+    cid = await _old_pain(h)
+    old_n = await h.pool.fetchval("select n_signals from clusters where id = $1", cid)
+    assert "За последние 30 дней болей пока нет" in await h.say("🔝 Топ болей за месяц")
+
+    late, early = clock.now().replace(hour=23, minute=0), clock.now().replace(hour=21)
+    assert await live.report_due(late) and not await live.report_due(early)
+
+    h.session.sent.clear()
+    text = await main.send_report(h.bot)
+    assert h.session.sent == [text]  # отчёт пришёл админу одним сообщением
+
+    # переписка: чат без загруженной истории — сутки и сутки контекста, архивный — с курсора
+    modes = {chat_id: (mode, since) for chat_id, mode, since in h.calls}
+    assert modes[PRO][0] == "recent"
+    assert timedelta(hours=47) < datetime.now(timezone.utc) - modes[PRO][1] < timedelta(hours=49)
+    assert {m for m, _ in modes.values()} == {"recent", "incremental"}
+
+    assert "📊 <b>Итоги дня ·" in text
+    assert '<a href="https://t.me/optika_pro">Оптики Про</a>: 5 сообщений' in text
+    assert "Оптики — обмен опытом</a>: сегодня тишина" in text
+    assert "🧭 <b>Главное за день</b>" in text and "Поставщики срывают сроки" in text
+
+    new_id = await h.pool.fetchval(
+        "select id from clusters where label = 'Срыв сроков поставки'")
+    new_part = text.split("🆕 <b>Новые боли</b>")[1].split("🔥")[0]
+    assert f"<b>Срыв сроков поставки</b> — 2 человека, 2 сигнала → /pain_{new_id}" in new_part
+    assert "Нехватка оборудования" not in new_part  # известная боль — не новая
+    assert "↗ сообщение в чате" in new_part
+
+    sharp = text.split("🔥 <b>Острые сигналы</b>")[1].split("📈")[0]
+    assert "острота 5 из 5" in sharp and f"→ /pain_{cid}" in sharp
+    assert "— Ольга Смирнова /who_cccccccc" in sharp
+    assert '<a href="https://t.me/optika_pro/3">' in sharp
+    assert sharp.count("острота") == 1  # остальное молча копится в базе
+
+    assert "📈 <b>Всплески</b>" in text
+    assert f"Нехватка оборудования — сегодня 3, раньше почти не упоминалась → /pain_{cid}" in text
+    assert "Всего за день: 5 сигналов" in text
+    assert "токен" not in text and "лимит" not in text and "пауз" not in text
+
+    # известная боль сохранила номер и пополнилась, у новой есть описание
+    assert await h.pool.fetchval("select n_signals from clusters where id = $1", cid) == old_n + 3
+    assert "возят прибор" in await h.say(f"/pain_{new_id}")
+    top = await h.say("🔝 Топ болей за месяц")
+    assert "Нехватка оборудования" in top and "Срыв сроков поставки" in top
+
+    # расход автоматического разбора отделён от ручного
+    live_stages = {r["stage"] for r in await h.pool.fetch(
+        "select distinct stage from llm_usage where source = 'live'")}
+    assert live_stages == {"extract", "assign", "cards", "digest"}
+    assert await h.pool.fetchval(
+        "select count(*) from llm_usage where source = 'manual' and stage = 'assign'") == 0
+
+    # отправлен — сегодня больше не придёт; архив из файла автоматически не трогается
+    assert not await live.report_due(late)
+    assert await h.pool.fetchval(
+        "select count(*) from threads where chat_id <> $1 and status = 'pending'", PRO) == 0
+
+    # «Итоги дня сейчас» из /live: считает с прошлого отчёта и не сбивает вечерний
+    out = await h.say("/live")
+    assert "включено" in out and "сегодня уже отправлены" in out and "[live:report]" in out
+    await h.press("live:report")
+    again = "\n".join(h.session.log[-1:])
+    assert "Оптики Про</a>: сегодня тишина" in again and "Новых сигналов нет" in again
+    assert [m for c, m, _ in h.calls if c == PRO] == ["recent", "incremental"]
+
+
+async def test_evening_paused_and_budget(evening, monkeypatch):
+    from chat_parser.bot import live
+    from chat_parser.config import settings
+
+    h = evening
+    await h.send_export()  # архив не разбирали — вечером он не разбирается сам
+
+    out = await h.press("live:off")
+    assert "на паузе" in out
+    text = await live.build_report()
+    assert "⏸ Разбор на паузе" in text and "Оптики Про</a>: 5 сообщений" in text
+    assert await h.pool.fetchval("select count(*) from signals") == 0
+    assert await h.pool.fetchval("select count(*) from llm_usage where source = 'live'") == 0
+    assert "В архиве ждут ручного разбора: 3 обсуждения" in text
+
+    await h.press("live:on")
+    monkeypatch.setattr(settings, "llm_price_in", 10.0)
+    monkeypatch.setattr(settings, "llm_price_out", 10.0)
+    await h.pool.execute("insert into llm_usage (stage, prompt_tokens, source) "
+                         "values ('extract', 5000000, 'manual')")
+    assert await live.budget_left() == pytest.approx(30.0)  # ручной разбор не в счёт
+    await h.pool.execute("insert into llm_usage (stage, prompt_tokens, source) "
+                         "values ('extract', 3100000, 'live')")
+    h.inbox[PRO] = [("c", "срочно ищем мастера по ремонту оправ, никто не берётся", None)]
+    text = await live.build_report()
+    assert "⚠️ Дневной лимит на автоматический разбор исчерпан в" in text
+    assert await h.pool.fetchval("select count(*) from signals") == 0
+    assert await h.pool.fetchval(
+        "select count(*) from threads where chat_id = $1 and status = 'pending'", PRO) >= 1
+    out = await h.say("/live")
+    assert "Потрачено сегодня: 31.00 из 30 ₽" in out and "лимит исчерпан" in out
+
+
+async def test_discussion_going_at_report_time_is_not_lost(evening, monkeypatch):
+    """Обсуждение шло в момент отчёта — его разберут следующим вечером, хотя
+    закончилось оно раньше начала следующего периода."""
+    from chat_parser.bot import live
+    from chat_parser.config import settings
+
+    h = evening
+    monkeypatch.setattr(settings, "live_quiet_minutes", 60)  # люди ещё пишут
+    await live.build_report()
+    assert await h.pool.fetchval("select count(*) from signals") == 0
+
+    monkeypatch.setattr(settings, "live_quiet_minutes", 0)
+    text = await live.build_report()
+    assert await h.pool.fetchval("select count(*) from signals") == 5
+    assert "Всего за день: 5 сигналов" in text
+
+
+async def test_people_and_companies(evening):
+    from chat_parser.bot import live
+
+    h = evening
+    await _old_pain(h)
+    await live.build_report(mark_sent=False)  # «Итоги дня сейчас» — вечерний всё равно придёт
+
+    card = await h.say("/who_aaaaaaaa")
+    assert "👤 <b>Иван Петров</b> (@ivan_optika)" in card
+    assert "Компания: — не указано" in card
+    assert "по словам самого участника:</b> владелец, Оптика Люкс" in card
+    assert "у меня два салона Оптика Люкс" in card and "https://t.me/optika_pro/1" in card
+    assert "Оптики Про — 2 сообщения" in card and "Срыв сроков поставки" in card
+    assert "[pa:aaaaaaaa]" in card and "[pe:aaaaaaaa]" in card
+
+    out = await h.press("pa:aaaaaaaa")
+    assert "✅ Сохранил." in out and "Компания: Оптика Люкс" in out and "Роль: владелец" in out
+    assert "[pa:" not in out
+
+    # Марии нейросеть ничего не подсказала — вносим руками ответом на сообщение
+    assert "[pa:" not in await h.say("/who_bbbbbbbb")
+    prompt = await h.press("pe:bbbbbbbb")
+    assert "✏️ Компания и роль для u:bbbbbbbb (Мария)" in prompt
+    out = await h.say("Линзы Плюс, продавец", reply_to=prompt)
+    assert "Компания: Линзы Плюс" in out and "Роль: продавец" in out
+    prompt = await h.press("pn:bbbbbbbb")
+    assert "Заметка: знакомы по выставке" in await h.say("знакомы по выставке", reply_to=prompt)
+    assert "Заметка:" not in await h.say("-", reply_to=prompt)
+    prompt = await h.press("pe:bbbbbbbb")
+    out = await h.say("-", reply_to=prompt)
+    assert "Компания: — не указано" in out and "Роль: — не указано" in out
+    assert "нет в базе" in await h.say("/who_deadbeef")
+
+    ppl = await h.say("/people")
+    assert "Иван Петров · Оптика Люкс, владелец — 2 сообщения /who_aaaaaaaa" in ppl
+    assert "не указаны у 2 из 3" in ppl
+    out = await h.press(f"ppl:{PRO}")
+    assert "Участники</b> · Оптики Про" in out and f"[names:{PRO}]" in out
+
+    # подпись под цитатой — везде, где есть цитаты
+    assert "— Иван Петров · Оптика Люкс, владелец /who_aaaaaaaa" in await h.say("/signals 30")
+    report = await live.build_report(mark_sent=False)
+    assert "Ольга Смирнова /who_cccccccc" in report
+
+    # имена и ники в нейросеть не уходят
+    prompts = "\n".join(h.state["prompts"])
+    assert "Иван" not in prompts and "ivan_optika" not in prompts and "Ольга" not in prompts
+
+
+async def test_delete_chat_from_list(evening):
+    from chat_parser.bot import live
+
+    h = evening
+    cid = await _old_pain(h)
+    await live.build_report()
+    await h.pool.execute("insert into chat_requests (link) values ('https://t.me/optika_new')")
+
+    chats = await h.say("💬 Список чатов")
+    assert f"[ppl:{PRO}] [del:{PRO}]" in chats and "[delreq:" in chats
+
+    out = await h.press(f"del:{PRO}")
+    assert "Удалить чат <b>Оптики Про</b>?" in out and f"[delok:{PRO}]" in out
+    assert await h.pool.fetchval("select count(*) from chats where id = $1", PRO) == 1
+
+    out = await h.press(f"delok:{PRO}")
+    assert "✅ Чат <b>Оптики Про</b> удалён: 5 сообщений, 5 сигналов." in out
+    assert "Болей, в которых не осталось сигналов: 1 — убрал." in out
+    for table in ("chats", "cursors", "messages", "threads", "signals"):
+        col = "id" if table == "chats" else "chat_id"
+        assert await h.pool.fetchval(f"select count(*) from {table} where {col} = $1", PRO) == 0
+    assert [r["id"] for r in await h.pool.fetch("select id from clusters")] == [cid]
+    assert "уже нет в списке" in await h.press(f"delok:{PRO}")
+
+    req = await h.pool.fetchval("select id from chat_requests")
+    assert "Убрал из ожидания: https://t.me/optika_new" in await h.press(f"delreq:{req}")
+    chats = await h.say("💬 Список чатов")
+    assert "Оптики Про" not in chats and "Ждут подключения" not in chats
+
+
+async def test_new_keyboard_is_sent_once(harness):
+    from chat_parser.bot import main
+
+    h = harness
+    h.session.sent.clear()
+    await main.announce_keyboard(h.bot)
+    await main.announce_keyboard(h.bot)
+    assert len(h.session.sent) == 1
