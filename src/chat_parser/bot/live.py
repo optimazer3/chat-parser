@@ -282,7 +282,7 @@ async def day_highlights(since: datetime, until: datetime, fresh: datetime) -> l
 # ------------------------------------------------------------ дневной отчёт
 
 
-async def build_report(mark_sent: bool = True, catch_up: bool = False) -> str:
+async def build_report(mark_sent: bool = True, catch_up: bool = False) -> daily.DailyReport:
     """Проход и отчёт.
 
     mark_sent=True — отчёт по расписанию: следующий будет в следующее время.
@@ -321,7 +321,7 @@ async def build_report(mark_sent: bool = True, catch_up: bool = False) -> str:
                 log.warning("выводы дня не получились: %s", e)
 
         data = await daily.collect(pool, since, until, fresh)
-        data["highlights"] = highlights
+        data.update(highlights=highlights, since=since, until=until)
         backlog = await pool.fetchval(
             "select count(*) from threads where status = 'pending' and ended_at < $1", fresh
         )
@@ -340,4 +340,4 @@ async def build_report(mark_sent: bool = True, catch_up: bool = False) -> str:
                 await _advance(pending)
             await db.set_setting(REPORT_DATE_KEY, day.date().isoformat())
             await db.set_setting(REPORT_AT_KEY, until.isoformat())
-        return daily.render(data, notes)
+        return daily.DailyReport(data, notes)

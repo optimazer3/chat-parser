@@ -86,9 +86,9 @@ def help_text(at: str = "22:00") -> str:
 <b>Как это работает</b>
 • Каждый день в <b>{at}</b> ({clock.tz_label()}) я забираю переписку подключённых
   чатов за сутки (для контекста — и за сутки до них), разбираю её и присылаю
-  <b>итоги дня</b>: главное за день, что было в каждом чате, новые боли, самые
-  острые жалобы и всплески — с цитатами и ссылками на сообщения. В остальное
-  время я не пишу.
+  <b>итоги дня файлом PDF</b>: главное за день, что было в каждом чате, новые
+  боли, самые острые жалобы и всплески — с цитатами и ссылками на сообщения.
+  Копия приходит на почту, если она настроена. В остальное время я не пишу.
 • Под каждой цитатой видно, кто её сказал. Кто из какой компании и кем
   работает — можно записать, я и сам подскажу, если человек рассказал о себе.
 • Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.
@@ -302,6 +302,18 @@ async def _time_answer(message: Message, text: str) -> None:
 @router.message(F.reply_to_message.text.startswith(PERSON_PROMPT))
 async def on_person_info_reply(message: Message) -> None:
     await _person_info(message, message.text or "")
+
+
+@router.message(CommandStart(deep_link=True))
+async def cmd_start_link(message: Message, command: CommandObject) -> None:
+    """Ссылки из PDF итогов дня: t.me/<бот>?start=pain_12 или start=who_1a2b3c4d."""
+    arg = (command.args or "").strip()
+    if m := re.fullmatch(r"pain_(\d+)", arg):
+        await _send_pain(message, m.group(1))
+    elif m := re.fullmatch(r"who_([0-9a-f]{8})", arg):
+        await _send_person(message, "u:" + m.group(1))
+    else:
+        await cmd_help(message)
 
 
 @router.message(CommandStart())
@@ -596,6 +608,10 @@ async def cmd_pain(message: Message, command: CommandObject) -> None:
         arg = command.regexp_match.group(1)
     else:
         arg = (command.args or "").strip().lstrip("#")
+    await _send_pain(message, arg)
+
+
+async def _send_pain(message: Message, arg: str) -> None:
     if not arg.isdigit():
         await message.answer("Открой 🔝 Топ болей и нажми на /pain_… рядом с нужной болью.")
         return
@@ -1142,10 +1158,38 @@ async def cmd_live(message: Message) -> None:
     sent = await db.get_setting(live.REPORT_DATE_KEY) == clock.now().date().isoformat()
     lines.append(f"Следующие итоги: {fmt.when_next(await live.next_report_at())}"
                  + (" (сегодняшние уже отправлены)" if sent else ""))
+    if settings.email_ready:
+        lines.append("Итоги дня в PDF дублирую на почту: "
+                     + fmt.esc(", ".join(settings.email_recipients)))
+    else:
+        lines.append("На почту не отправляю: в .env не заданы REPORT_EMAIL_TO, SMTP_USER и "
+                     "SMTP_PASSWORD.")
     toggle = ("⏸ Поставить на паузу", "live:off") if on else ("▶️ Включить", "live:on")
-    await message.answer(
-        "\n".join(lines), reply_markup=_kb([toggle], [("📤 Итоги дня сейчас", "live:report")])
-    )
+    rows = [[toggle], [("📤 Итоги дня сейчас", "live:report")]]
+    if settings.email_ready:
+        rows.append([("✉️ Проверить почту", "live:mail")])
+    await message.answer("\n".join(lines), reply_markup=_kb(*rows))
+
+
+@router.callback_query(F.data == "live:mail")
+async def cb_live_mail(call: CallbackQuery) -> None:
+    from .. import mailer
+
+    await call.answer()
+    if call.message is None:
+        return
+    status = await call.message.answer("✉️ Отправляю тестовое письмо…")
+    try:
+        await mailer.send(
+            "Проверка почты — мониторинг чатов оптики",
+            "Почта настроена правильно: итоги дня в PDF будут приходить сюда.\n\n"
+            "— chat-parser, мониторинг чатов рынка оптики",
+        )
+    except Exception as e:  # noqa: BLE001
+        await status.edit_text(f"❌ {fmt.esc(e)}")
+        return
+    await status.edit_text("✅ Письмо ушло: " + fmt.esc(", ".join(settings.email_recipients))
+                           + ". Если его нет во «Входящих» — загляни в «Спам».")
 
 
 @router.callback_query(F.data.in_({"live:on", "live:off"}))
@@ -1165,10 +1209,10 @@ async def cb_live_toggle(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.in_({"live:report", "live:catchup"}))
-async def cb_live_report(call: CallbackQuery) -> None:
+async def cb_live_report(call: CallbackQuery, bot: Bot) -> None:
     """live:report — показать сейчас (по расписанию всё равно придут);
-    live:catchup — сегодняшние, пропавшие из-за смены времени."""
-    from . import live
+    live:catchup — сегодняшние, пропавшие из-за смены времени: их и на почту."""
+    from . import delivery, live
 
     await call.answer()
     await _drop_markup(call)
@@ -1177,7 +1221,7 @@ async def cb_live_report(call: CallbackQuery) -> None:
     catch_up = call.data == "live:catchup"
     status = await call.message.answer("📤 Собираю итоги дня…")
     try:
-        text = await jobs.run_job(live.build_report(mark_sent=catch_up, catch_up=catch_up))
+        report = await jobs.run_job(live.build_report(mark_sent=catch_up, catch_up=catch_up))
     except jobs.Busy as e:
         await status.edit_text(_busy(e))
         return
@@ -1185,7 +1229,7 @@ async def cb_live_report(call: CallbackQuery) -> None:
         await status.edit_text(f"❌ Не получилось собрать: {fmt.esc(e)}")
         return
     await status.delete()
-    await _reply_long(call.message, text)
+    await delivery.deliver(bot, [call.message.chat.id], report, email=catch_up)
 
 
 # ------------------------------------------------------ участники чатов

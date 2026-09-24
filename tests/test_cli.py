@@ -11,6 +11,7 @@ from chat_parser.cli import app
 EXPECTED = {
     "doctor", "init-db", "models", "llm-test", "import-json", "add-chat",
     "ingest", "threads", "extract", "cluster", "report", "status", "bot", "pipeline",
+    "mail-test",
 }
 
 

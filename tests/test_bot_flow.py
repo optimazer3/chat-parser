@@ -131,6 +131,7 @@ async def harness(monkeypatch, tmp_path):
             self.sent: list[str] = []
             self.log: list[str] = []
             self.labels: list[str] = []  # подписи кнопок последнего ответа
+            self.files: list[tuple] = []  # (имя, байты, подпись) отправленных файлов
             self.documents = 0
 
         async def close(self):
@@ -175,6 +176,11 @@ async def harness(monkeypatch, tmp_path):
             if name == "SendDocument":
                 self.documents += 1
                 self.mid += 1
+                doc = method.document
+                data = getattr(doc, "data", None)
+                self.files.append((getattr(doc, "filename", None), data, method.caption))
+                self.sent.append(method.caption or "")
+                self.log.append(method.caption or "")
                 return self._msg(bot, self.mid, None)
             raise AssertionError(f"неожиданный метод {name}")
 
@@ -594,6 +600,23 @@ async def evening(harness, telegram_api, monkeypatch):
     return h
 
 
+def pdf_text(pdf: bytes) -> str:
+    import io
+
+    from pypdf import PdfReader
+
+    return "\n".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf)).pages)
+
+
+def pdf_links(pdf: bytes) -> list[str]:
+    import io
+
+    from pypdf import PdfReader
+
+    return [a.get_object().get("/A", {}).get("/URI")
+            for p in PdfReader(io.BytesIO(pdf)).pages for a in p.get("/Annots", [])]
+
+
 async def telegram_api_client():
     class FakeClient:
         async def disconnect(self):
@@ -624,8 +647,12 @@ async def test_evening_report(evening, monkeypatch):
     assert await live.report_due(late) and not await live.report_due(early)
 
     h.session.sent.clear()
-    text = await main.send_report(h.bot)
-    assert h.session.sent == [text]  # отчёт пришёл админу одним сообщением
+    report = await main.send_report(h.bot)
+    text = report.text
+    # админу пришёл один PDF с короткой подписью
+    assert h.session.sent == [report.caption]
+    (name, pdf, _), = h.session.files
+    assert name == report.filename and pdf.startswith(b"%PDF")
 
     # переписка: чат без загруженной истории — сутки и сутки контекста, архивный — с курсора
     modes = {chat_id: (mode, since) for chat_id, mode, since in h.calls}
@@ -679,8 +706,8 @@ async def test_evening_report(evening, monkeypatch):
     assert "включено" in out and "сегодняшние уже отправлены" in out and "[live:report]" in out
     assert "Следующие итоги: завтра в 22:00" in out
     await h.press("live:report")
-    again = "\n".join(h.session.log[-1:])
-    assert "Оптики Про</a>: сегодня тишина" in again and "Новых сигналов нет" in again
+    again = pdf_text(h.session.files[-1][1])
+    assert "Оптики Про · тишина" in again and "Новых сигналов нет" in again
     assert [m for c, m, _ in h.calls if c == PRO] == ["recent", "incremental"]
 
 
@@ -693,7 +720,7 @@ async def test_evening_paused_and_budget(evening, monkeypatch):
 
     out = await h.press("live:off")
     assert "на паузе" in out
-    text = await live.build_report()
+    text = (await live.build_report()).text
     assert "⏸ Разбор на паузе" in text and "Оптики Про</a>: 5 сообщений" in text
     assert await h.pool.fetchval("select count(*) from signals") == 0
     assert await h.pool.fetchval("select count(*) from llm_usage where source = 'live'") == 0
@@ -708,7 +735,7 @@ async def test_evening_paused_and_budget(evening, monkeypatch):
     await h.pool.execute("insert into llm_usage (stage, prompt_tokens, source) "
                          "values ('extract', 3100000, 'live')")
     h.inbox[PRO] = [("c", "срочно ищем мастера по ремонту оправ, никто не берётся", None)]
-    text = await live.build_report()
+    text = (await live.build_report()).text
     assert "⚠️ Дневной лимит на автоматический разбор исчерпан в" in text
     assert await h.pool.fetchval("select count(*) from signals") == 0
     assert await h.pool.fetchval(
@@ -729,7 +756,7 @@ async def test_discussion_going_at_report_time_is_not_lost(evening, monkeypatch)
     assert await h.pool.fetchval("select count(*) from signals") == 0
 
     monkeypatch.setattr(settings, "live_quiet_minutes", 0)
-    text = await live.build_report()
+    text = (await live.build_report()).text
     assert await h.pool.fetchval("select count(*) from signals") == 5
     assert "Всего за день: 5 сигналов" in text
 
@@ -776,7 +803,7 @@ async def test_people_and_companies(evening):
 
     # подпись под цитатой — везде, где есть цитаты
     assert "— Иван Петров · Оптика Люкс, владелец /who_aaaaaaaa" in await h.say("/signals 30")
-    report = await live.build_report(mark_sent=False)
+    report = (await live.build_report(mark_sent=False)).text
     assert "Ольга Смирнова /who_cccccccc" in report
 
     # имена и ники в нейросеть не уходят
@@ -1020,3 +1047,86 @@ async def test_prompts_keep_keyboard_and_can_be_left(harness, monkeypatch):
     await h.press("rt:custom")
     assert "<b>21:30</b>" in await h.say("21:30")
     assert await live.report_time() == (21, 30)
+
+
+# ------------------------------------------------------- PDF и почта
+
+
+async def test_report_pdf_and_email(evening, monkeypatch):
+    import smtplib
+
+    from chat_parser import mailer
+    from chat_parser.bot import main
+    from chat_parser.config import settings
+
+    h = evening
+    monkeypatch.setattr(settings, "report_email_to", "owner@example.com")
+    monkeypatch.setattr(settings, "smtp_user", "bot@gmail.com")
+    monkeypatch.setattr(settings, "smtp_password", "app-password")
+    letters = []
+    monkeypatch.setattr(mailer, "_send_sync", letters.append)
+
+    cid = await _old_pain(h)
+    h.session.files.clear()
+    report = await main.send_report(h.bot)
+    new_id = await h.pool.fetchval(
+        "select id from clusters where label = 'Срыв сроков поставки'")
+
+    (name, pdf, caption), = h.session.files
+    assert caption.startswith("📊 <b>Итоги дня") and f"/pain_{new_id}" in caption
+    assert "5 сообщений · 1 обсуждение · 5 сигналов" in caption
+    text = pdf_text(pdf)
+    for part in ("Итоги дня", "Оптики Про", "Поставщики срывают сроки", "Срыв сроков поставки",
+                 "острота 5 из 5", "Ольга Смирнова", "Нехватка оборудования"):
+        assert part in text, part
+    links = pdf_links(pdf)
+    assert "https://t.me/optika_pro/3" in links  # цитата — ссылка на сообщение
+    assert f"https://t.me/test_bot?start=pain_{new_id}" in links  # боль — карточка в боте
+    assert f"https://t.me/test_bot?start=pain_{cid}" in links
+
+    (letter,) = letters  # и то же самое — на почту
+    assert letter["To"] == "owner@example.com" and "Итоги дня" in letter["Subject"]
+    (att,) = list(letter.iter_attachments())
+    assert att.get_filename() == name == report.filename and att.get_content() == pdf
+    assert "Срыв сроков поставки" in letter.get_body(("plain",)).get_content()
+
+    # ссылки из PDF открывают карточки в боте
+    assert "возят прибор" in await h.say(f"/start pain_{new_id}")
+    assert "👤 <b>Иван Петров</b>" in await h.say("/start who_aaaaaaaa")
+    assert "Я слежу за чатами" in await h.say("/start")
+
+    # «Итоги дня сейчас» — только в Telegram, на почту не дублируем
+    await h.press("live:report")
+    assert len(letters) == 1 and h.session.files[-1][1].startswith(b"%PDF")
+
+    # почта не сработала — отчёт в Telegram всё равно пришёл, а об ошибке сказано
+    def broken(msg):
+        raise smtplib.SMTPAuthenticationError(535, b"Username and Password not accepted")
+
+    monkeypatch.setattr(mailer, "_send_sync", broken)
+    h.session.sent.clear()
+    await main.send_report(h.bot)
+    assert h.session.sent[0].startswith("📊 <b>Итоги дня")
+    assert "⚠️ Итоги дня не ушли на почту: почтовый сервер не принял логин" in h.session.sent[1]
+
+    # /live: куда уходит почта и проверка одной кнопкой
+    monkeypatch.setattr(mailer, "_send_sync", letters.append)
+    out = await h.say("/live")
+    assert "дублирую на почту: owner@example.com" in out and "[live:mail]" in out
+    assert "✅ Письмо ушло: owner@example.com" in await h.press("live:mail")
+    assert letters[-1]["Subject"].startswith("Проверка почты")
+
+
+async def test_report_without_email_and_pdf_fallback(evening, monkeypatch):
+    from chat_parser.bot import main
+    from chat_parser.report import daily
+
+    h = evening
+    out = await h.say("/live")
+    assert "На почту не отправляю" in out and "[live:mail]" not in out
+
+    # PDF не собрался — отчёт всё равно доходит, текстом
+    monkeypatch.setattr(daily.DailyReport, "pdf", lambda self, bot_username=None: None)
+    h.session.sent.clear()
+    report = await main.send_report(h.bot)
+    assert h.session.files == [] and h.session.sent == [report.text]

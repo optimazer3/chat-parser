@@ -94,6 +94,15 @@ class Settings(BaseSettings):
     join_per_run: int = 5
     join_pause: float = 20.0
 
+    # --- Итоги дня на почту (PDF во вложении) ---
+    report_email_to: str = ""        # кому, через запятую; пусто — не отправлять
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587             # 587 — STARTTLS, 465 — сразу TLS
+    smtp_user: str = ""              # логин; для Gmail — адрес почты
+    smtp_password: str = ""          # для Gmail — пароль приложения, не обычный пароль
+    smtp_from: str = ""              # от кого; пусто — SMTP_USER
+    smtp_proxy: str = ""             # socks5://… если SMTP-сервер напрямую недоступен
+
     # --- Пороги нормализации ---
     thread_gap_minutes: int = 10
     thread_max_messages: int = 80
@@ -133,6 +142,16 @@ class Settings(BaseSettings):
         if not isinstance(value, dict):
             raise SystemExit("LLM_EXTRA_BODY должен быть JSON-объектом: {...}")
         return value
+
+    @property
+    def email_recipients(self) -> list[str]:
+        return [x.strip() for x in self.report_email_to.replace(";", ",").split(",")
+                if x.strip()]
+
+    @property
+    def email_ready(self) -> bool:
+        return bool(self.email_recipients and self.smtp_host and self.smtp_user
+                    and self.smtp_password)
 
     @property
     def admin_ids(self) -> set[int]:

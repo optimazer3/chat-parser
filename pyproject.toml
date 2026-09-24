@@ -15,10 +15,12 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.7",
     "python-dotenv>=1.0",
+    # PDF итогов дня; чистый Python — ставится и на Windows без сборки
+    "reportlab>=4.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5", "pypdf>=4"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

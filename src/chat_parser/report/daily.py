@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import logging
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -19,6 +22,51 @@ from ..links import QUOTE_MESSAGE_SQL, chat_link, message_link
 from ..quotes import pick_quotes
 
 TOP_N = 5
+CAPTION_LIMIT = 1024  # подпись к файлу в Telegram
+
+log = logging.getLogger("chat_parser.report")
+
+
+@dataclass
+class DailyReport:
+    """Готовые итоги дня: данные и все их представления."""
+
+    data: dict[str, Any]
+    notes: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def day(self) -> datetime:
+        return self.data["day"]
+
+    @property
+    def text(self) -> str:
+        """Полный текст для Telegram — если PDF не собрался."""
+        return render(self.data, self.notes)
+
+    @property
+    def caption(self) -> str:
+        return caption(self.data, self.notes)
+
+    @property
+    def filename(self) -> str:
+        return f"itogi-dnya-{self.day:%Y-%m-%d}.pdf"
+
+    @property
+    def subject(self) -> str:
+        return f"Итоги дня · {self.day:%d.%m.%Y} — мониторинг чатов оптики"
+
+    def pdf(self, bot_username: str | None = None) -> bytes | None:
+        """PDF или None, если собрать не получилось (отчёт уйдёт текстом)."""
+        from . import pdf
+
+        try:
+            return pdf.render(self.data, self.notes, bot_username)
+        except Exception:  # noqa: BLE001 — без PDF отчёт всё равно должен дойти
+            log.exception("PDF итогов дня не собрался")
+            return None
+
+    def plain(self) -> str:
+        return plain(self.data, self.notes)
 
 
 async def collect(
@@ -63,9 +111,11 @@ async def collect(
         f"""
         select s.id, s.type, s.audience, s.summary, s.evidence_quote, s.intensity,
                s.cluster_id, s.chat_id, {QUOTE_MESSAGE_SQL} as mid, ch.username,
-               s.author_label, a.name a_name, a.company a_company, a.role a_role
+               s.author_label, a.name a_name, a.company a_company, a.role a_role,
+               cl.label pain_label
           from signals s join chats ch on ch.id = s.chat_id
           left join authors a on a.author_label = s.author_label
+          left join clusters cl on cl.id = s.cluster_id
          where s.created_at >= $1 and s.created_at < $2 and s.ts >= $3
            and s.intensity >= 4 and s.confidence >= 0.5
          order by s.intensity desc, s.id
@@ -130,7 +180,7 @@ async def _best_quote(pool: asyncpg.Pool, cluster_id: int) -> dict[str, Any] | N
     return q
 
 
-def _usually(per_day: float) -> str:
+def usually(per_day: float) -> str:
     if per_day >= 1:
         return f"обычно ~{per_day:.0f} в день"
     per_week = per_day * 7
@@ -191,7 +241,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
     if data["spikes"]:
         lines += ["", "📈 <b>Всплески</b>"]
         lines += [
-            f"• {esc(x['label'])} — сегодня {x['today']}, {_usually(x['per_day'])} "
+            f"• {esc(x['label'])} — сегодня {x['today']}, {usually(x['per_day'])} "
             f"→ /pain_{x['id']}"
             for x in data["spikes"]
         ]
@@ -222,3 +272,75 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
         )
     return "\n".join(lines)
 
+
+
+def _totals(data: dict[str, Any]) -> tuple[int, int, int]:
+    return (sum(c["msgs"] for c in data["chats"]), sum(c["threads"] for c in data["chats"]),
+            sum(data["types"].values()))
+
+
+def caption(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
+    """Коротко — подпись к PDF в Telegram: цифры, главное, новые боли с
+    нажимаемыми /pain_…. Не длиннее лимита Telegram."""
+    notes = notes or {}
+    esc = fmt.esc
+    msgs, threads, total = _totals(data)
+    lines = [
+        f"📊 <b>Итоги дня · {data['day']:%d.%m}</b>",
+        f"{fmt.messages_word(msgs)} · {fmt.discussions(threads)} · "
+        f"{fmt.signals_word(total)}",
+    ]
+    optional = []
+    if data.get("highlights"):
+        optional.append("")
+        optional += [f"🧭 {esc(h)}" for h in data["highlights"][:3]]
+    if data["new_pains"]:
+        optional.append("")
+        optional += [f"🆕 {esc(p['label'])} → /pain_{p['id']}" for p in data["new_pains"]]
+    extra = []
+    if data["sharp"]:
+        extra.append(f"🔥 острых сигналов: {len(data['sharp'])}")
+    if data["spikes"]:
+        extra.append(f"📈 всплесков: {len(data['spikes'])}")
+    if extra:
+        optional += ["", " · ".join(extra)]
+    if notes.get("paused"):
+        optional.append("⏸ разбор на паузе — /live")
+    if notes.get("budget_hit_at"):
+        optional.append(f"⚠️ лимит исчерпан в {notes['budget_hit_at']:%H:%M} — /extract")
+    if notes.get("errors"):
+        optional.append(f"⚠️ не прочитано чатов: {len(notes['errors'])} — подробности в файле")
+    tail = "\nПодробности — в файле."
+    for line in optional:  # что не влезает в подпись — остаётся только в файле
+        if _visible(lines + [line]) + len(tail) > CAPTION_LIMIT - 24:
+            break
+        lines.append(line)
+    return "\n".join(lines) + tail
+
+
+def _visible(lines: list[str]) -> int:
+    return len(re.sub(r"<[^>]+>", "", "\n".join(lines)))
+
+
+def plain(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
+    """Текст письма: коротко, остальное — во вложенном PDF."""
+    notes = notes or {}
+    msgs, threads, total = _totals(data)
+    lines = [
+        f"Итоги дня · {data['day']:%d.%m.%Y}",
+        "",
+        f"{fmt.messages_word(msgs)}, {fmt.discussions(threads)}, "
+        f"{fmt.signals_word(total)}, новых болей: {len(data['new_pains'])}.",
+    ]
+    if data.get("highlights"):
+        lines += ["", "Главное за день:"] + [f"• {h}" for h in data["highlights"]]
+    if data["new_pains"]:
+        lines += ["", "Новые боли:"] + [f"• {p['label']}" for p in data["new_pains"]]
+    if notes.get("paused"):
+        lines += ["", "Разбор был на паузе — нейросеть не запускалась."]
+    if notes.get("budget_hit_at"):
+        lines += ["", f"Дневной лимит исчерпан в {notes['budget_hit_at']:%H:%M} — "
+                      "разобрано не всё."]
+    lines += ["", "Полный отчёт — во вложении (PDF).", "",
+              "— chat-parser, мониторинг чатов рынка оптики"]
+    return "\n".join(lines)

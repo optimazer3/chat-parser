@@ -23,7 +23,8 @@ from ..net import aiogram_proxy, network_hint
 from . import format as fmt
 from . import jobs
 from .auth import AdminOnly
-from . import live
+from . import delivery, live
+from ..report.daily import DailyReport
 from .handlers import KEYBOARD_KEY, KEYBOARD_VERSION, MAIN_KB, router
 
 log = logging.getLogger("chat_parser.bot")
@@ -54,10 +55,11 @@ async def _broadcast(bot: Bot, text: str) -> None:
             log.warning("не доставлено %s: %s", admin, e)
 
 
-async def send_report(bot: Bot, mark_sent: bool = True) -> str:
-    text = await jobs.run_job(live.build_report(mark_sent))
-    await _broadcast(bot, text)
-    return text
+async def send_report(bot: Bot, mark_sent: bool = True) -> DailyReport:
+    """Итоги дня всем админам: PDF в Telegram и, если настроено, на почту."""
+    report = await jobs.run_job(live.build_report(mark_sent))
+    await delivery.deliver(bot, settings.admin_ids, report, email=mark_sent)
+    return report
 
 
 async def report_loop(bot: Bot) -> None:

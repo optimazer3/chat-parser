@@ -345,12 +345,59 @@ def doctor() -> None:
                 if settings.llm_json_mode == "auto":
                     print(f"  [dim]можно зафиксировать: LLM_JSON_MODE={mode}[/dim]")
 
+        print("\n[bold]6. Почта (итоги дня в PDF)[/bold]")
+        if not settings.email_ready:
+            print("  [dim]не настроена — итоги дня придут только в Telegram. Нужны[/dim]")
+            print("  [dim]REPORT_EMAIL_TO, SMTP_USER и SMTP_PASSWORD (см. .env.example)[/dim]")
+        else:
+            from . import mailer
+
+            try:
+                where = await asyncio.wait_for(asyncio.to_thread(mailer.check), 40)
+                print(f"  [green]OK[/green]   вход на почтовый сервер: {where}")
+                print("  [dim]тестовое письмо: chat-parser mail-test[/dim]")
+            except Exception as e:  # noqa: BLE001
+                msg = str(e) or type(e).__name__
+                if "535" in msg or "Username and Password" in msg:
+                    msg = ("логин или пароль не подошли. Для Gmail нужен пароль приложения "
+                           "(16 букв), а не обычный пароль от почты")
+                print(f"  [red]FAIL[/red] {msg}")
+                problems.append("почта")
+
         print()
         if problems:
             print(f"[red bold]Не готово: {', '.join(problems)}.[/red bold] См. выше.")
             raise typer.Exit(1)
         print("[green bold]Всё готово.[/green bold] "
               "Дальше: chat-parser add-chat <ссылка> --join")
+
+    _run(go())
+
+
+@app.command("mail-test")
+def mail_test() -> None:
+    """Отправить тестовое письмо с PDF итогов дня на REPORT_EMAIL_TO."""
+
+    async def go():
+        from datetime import datetime, timezone
+
+        from . import clock, mailer
+        from .report.daily import DailyReport
+
+        now = datetime.now(timezone.utc)
+        sample = DailyReport({
+            "day": clock.day_start(), "since": now, "until": now, "chats": [],
+            "new_pains": [], "sharp": [], "spikes": [], "topics": [], "types": {},
+            "highlights": ["Это тестовое письмо: так будут приходить итоги дня."],
+        })
+        try:
+            await mailer.send("Проверка почты — мониторинг чатов оптики", sample.plain(),
+                              sample.pdf(), sample.filename)
+        except Exception as e:  # noqa: BLE001
+            print(f"[red]FAIL[/red] {e}")
+            raise typer.Exit(1) from None
+        print(f"[green]OK[/green] письмо с PDF ушло: {', '.join(settings.email_recipients)}")
+        print("[dim]нет во «Входящих» — загляни в «Спам»[/dim]")
 
     _run(go())
 
