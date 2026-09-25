@@ -380,7 +380,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
         from .daily import usually
 
         story.append(Paragraph("Всплески", st["h2"]))
-        story.append(Paragraph("Известные боли, о которых сегодня говорят заметно чаще "
+        story.append(Paragraph("Известные боли, о которых за эти сутки говорили заметно чаще "
                                "обычного.", st["lead"]))
         body = [[Paragraph(_a(_t(x["label"]), bot_link(f"pain_{x['id']}"), color="#0b0b0b"),
                            st["cell"]),
@@ -388,7 +388,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
                  Paragraph(_t(usually(x["per_day"]).removeprefix("обычно ")), ParagraphStyle(
                      "u", st["cell"], alignment=2, textColor=INK2))]
                 for x in data["spikes"]]
-        story.append(_table(["Боль", "Сегодня", "Обычно"], body,
+        story.append(_table(["Боль", "За сутки", "Обычно"], body,
                             [width * 0.55, width * 0.15, width * 0.30], st))
 
     # итог и заметки

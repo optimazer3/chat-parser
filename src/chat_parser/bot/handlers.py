@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import re
@@ -57,10 +58,11 @@ BTN_TOP_MONTH = "🔝 Топ болей за месяц"
 BTN_CHATS = "💬 Список чатов"
 BTN_PERSON = "👤 Инфо о человеке"
 BTN_TIME = "⏰ Время отчёта"
+BTN_SEND_NOW = "📤 Отправить отчёт сейчас"  # временная, для проверки
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "5"
+KEYBOARD_VERSION = "6"
 
 # Прежние кнопки (статус, разобрать, отчёт…) убраны с клавиатуры, но их
 # обработчики оставлены: у кого-то в Telegram ещё может висеть старая.
@@ -69,6 +71,7 @@ MAIN_KB = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_TOP_MONTH)],
         [KeyboardButton(text=BTN_CHATS), KeyboardButton(text=BTN_ADD)],
         [KeyboardButton(text=BTN_PERSON), KeyboardButton(text=BTN_TIME)],
+        [KeyboardButton(text=BTN_SEND_NOW)],  # временная — убрать после проверки
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -102,6 +105,8 @@ def help_text(at: str = "22:00") -> str:
 👤 <b>Инфо о человеке</b> — пришли @username и через запятую компанию, роль,
    заметку: <i>@ivan_optika Оптика Люкс, владелец</i>.
 ⏰ <b>Время отчёта</b> — во сколько присылать итоги дня.
+📤 <b>Отправить отчёт сейчас</b> — временно, для проверки: итоги за последние
+   сутки сразу (PDF и копия на почту). Отчёт по расписанию придёт как обычно.
 
 <b>Полезно знать</b>
 • Топ пополняется вместе с итогами дня.
@@ -205,7 +210,7 @@ async def _drop_markup(call: CallbackQuery) -> None:
 AWAIT_SECONDS = 15 * 60
 _awaiting: dict[int, tuple[str, float]] = {}  # кто -> (чего ждём, до какого момента)
 KEYBOARD_TEXTS = {BTN_STATUS, BTN_EXTRACT, BTN_CLUSTER, BTN_TOP, BTN_REPORT, BTN_HELP,
-                  BTN_ADD, BTN_TOP_MONTH, BTN_CHATS, BTN_PERSON, BTN_TIME}
+                  BTN_ADD, BTN_TOP_MONTH, BTN_CHATS, BTN_PERSON, BTN_TIME, BTN_SEND_NOW}
 CANCEL_KB = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel")]]
 )
@@ -1169,6 +1174,48 @@ async def cmd_live(message: Message) -> None:
     if settings.email_ready:
         rows.append([("✉️ Проверить почту", "live:mail")])
     await message.answer("\n".join(lines), reply_markup=_kb(*rows))
+
+
+@router.message(F.text == BTN_SEND_NOW)
+async def btn_send_now(message: Message, bot: Bot) -> None:
+    """Временная кнопка для проверки: итоги за последние сутки прямо сейчас —
+    в Telegram и на почту. Расписание не трогает."""
+    from . import delivery, live
+
+    head = "📤 Собираю итоги за последние сутки…"
+    job_id, progress = await _start_live(message, head)
+    task = asyncio.ensure_future(
+        jobs.run_job(live.build_report(mark_sent=False, job_id=job_id))
+    )
+    try:
+        shown = ""
+        while not task.done():  # показываем, на каком шаге сбор
+            await asyncio.wait({task}, timeout=3)
+            job = jobs.current()
+            if job and job["id"] == job_id and job.get("progress") not in ("", shown):
+                shown = job["progress"]
+                await progress.set(f"{head}\n{fmt.esc(shown)}")
+        report = task.result()
+    except jobs.Cancelled:
+        await progress.set(fmt.fmt_stopped("сбор итогов"), final=True)
+        return
+    except jobs.Busy as e:
+        await progress.set(_busy(e), final=True)
+        return
+    except Exception as e:  # noqa: BLE001
+        await progress.set(f"❌ Не получилось собрать: {fmt.esc(e)}", final=True)
+        return
+    finally:
+        if not task.done():
+            task.cancel()
+    emailed = await delivery.deliver(bot, [message.chat.id], report, email=True)
+    note = "✅ Готово — итоги за последние сутки ниже."
+    if emailed:
+        note += " Копия ушла на почту: " + fmt.esc(", ".join(settings.email_recipients)) + "."
+    elif not settings.email_ready:
+        note += " На почту не отправлял: она не настроена."
+    note += " Отчёт по расписанию придёт как обычно."
+    await progress.set(note, final=True)
 
 
 @router.callback_query(F.data == "live:mail")

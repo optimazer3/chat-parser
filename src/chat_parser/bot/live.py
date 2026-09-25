@@ -3,7 +3,7 @@
 Раз в день, в выбранное время (кнопка ⏰ в боте; по умолчанию REPORT_HOUR
 по местному времени), аккаунт-сборщик забирает
 переписку за последние сутки (для контекста — ещё сутки до них), собирает
-обсуждения, разбирает те, что шли сегодня, раскладывает сигналы по болям и
+обсуждения, разбирает свежие, раскладывает сигналы по болям и
 присылает один отчёт. Автоматический разбор идёт в дневной бюджет
 LIVE_DAILY_BUDGET. Архив, залитый из файлов, не трогает — он разбирается вручную.
 """
@@ -39,7 +39,6 @@ BUDGET_HIT_KEY = "live_budget_hit"
 LAST_RUN_KEY = "live_last_run"
 ERRORS_KEY = "live_errors"
 REPORT_DATE_KEY = "daily_report_date"   # за какой день отчёт уже отправлен
-REPORT_AT_KEY = "daily_report_at"       # когда закрыт период прошлого отчёта
 REPORT_TIME_KEY = "report_time"         # «21:30», выбранное в боте
 NEXT_REPORT_KEY = "report_next_at"      # когда присылать следующий
 DAY = timedelta(hours=24)
@@ -75,14 +74,6 @@ async def budget_hit_today() -> datetime | None:
         return None
     at = datetime.fromisoformat(raw)
     return at if at >= clock.day_start() else None
-
-
-async def _period_start(now: datetime) -> datetime:
-    """С прошлого отчёта (после смены времени между отчётами бывает больше
-    суток), но не дальше двух суток назад. Первый отчёт — за сутки."""
-    raw = await db.get_setting(REPORT_AT_KEY)
-    last = datetime.fromisoformat(raw) if raw else None
-    return max(last, now - CONTEXT) if last else now - DAY
 
 
 # ------------------------------------------------------------ расписание
@@ -282,20 +273,21 @@ async def day_highlights(since: datetime, until: datetime, fresh: datetime) -> l
 # ------------------------------------------------------------ дневной отчёт
 
 
-async def build_report(mark_sent: bool = True, catch_up: bool = False) -> daily.DailyReport:
-    """Проход и отчёт.
+async def build_report(mark_sent: bool = True, catch_up: bool = False,
+                       job_id: str | None = None) -> daily.DailyReport:
+    """Проход и отчёт — всегда за последние 24 часа, когда бы он ни собирался.
 
     mark_sent=True — отчёт по расписанию: следующий будет в следующее время.
     catch_up=True — сегодняшние итоги, которые пропали из-за смены времени:
     считаются отправленными, расписание не трогают.
     mark_sent=False — «показать сейчас», отчёт по расписанию всё равно придёт.
     """
-    async with jobs.exclusive("итоги дня") as job:
+    async with jobs.exclusive("итоги дня", job_id) as job:
         pool = await db.get_pool()
         # какой отчёт по расписанию закрываем — до того, как время успеют поменять
         pending = await next_report_at() if mark_sent and not catch_up else None
         now = datetime.now(timezone.utc)
-        since = await _period_start(now)
+        since = now - DAY  # отчёт в 00:01 — за весь вчерашний день, а не с прошлого отчёта
         fresh = now - CONTEXT
 
         run = await collect_day(job, now)
@@ -339,5 +331,4 @@ async def build_report(mark_sent: bool = True, catch_up: bool = False) -> daily.
                 day = min(day, pending.astimezone(clock.tz()))
                 await _advance(pending)
             await db.set_setting(REPORT_DATE_KEY, day.date().isoformat())
-            await db.set_setting(REPORT_AT_KEY, until.isoformat())
         return daily.DailyReport(data, notes)

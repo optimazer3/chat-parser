@@ -112,3 +112,13 @@ def test_plain_text_for_email():
 def test_clean_drops_missing_glyphs():
     assert clean("жду → 6 недель 😡✅") == "жду › 6 недель"
     assert clean(None) == ""
+
+
+def test_report_day_is_the_day_it_covers():
+    tz = clock.tz()
+    evening = datetime(2026, 9, 24, 22, 0, tzinfo=tz)
+    assert daily.report_day(evening - timedelta(days=1), evening).day == 24
+    after_midnight = datetime(2026, 9, 25, 0, 1, tzinfo=tz)  # отчёт в 00:01 — за 24.09
+    assert daily.report_day(after_midnight - timedelta(days=1), after_midnight).day == 24
+    morning = datetime(2026, 9, 25, 9, 0, tzinfo=tz)
+    assert daily.report_day(morning - timedelta(days=1), morning).day == 24

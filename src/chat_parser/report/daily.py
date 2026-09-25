@@ -69,13 +69,19 @@ class DailyReport:
         return plain(self.data, self.notes)
 
 
+def report_day(since: datetime, until: datetime) -> datetime:
+    """К какому дню относится отчёт за сутки: в 22:00 — к сегодняшнему, в 00:01 —
+    ко вчерашнему. Берём день, на который приходится середина периода."""
+    return clock.day_start(since + (until - since) / 2)
+
+
 async def collect(
     pool: asyncpg.Pool, since: datetime, until: datetime, fresh: datetime
 ) -> dict[str, Any]:
-    """since/until — период отчёта (с прошлого отчёта); сутки для всплесков —
-    с местной полуночи. fresh — сигналы из разговоров не старше этого момента:
-    архив, разобранный вручную в тот же день, в итоги дня не попадает."""
-    day = clock.day_start(until)
+    """since/until — период отчёта, последние 24 часа; по нему же считаются
+    всплески. fresh — сигналы из разговоров не старше этого момента: архив,
+    разобранный вручную в тот же день, в итоги дня не попадает."""
+    day = report_day(since, until)
     chats = [dict(r) for r in await pool.fetch(
         """
         select c.id, c.title, c.username, c.link,
@@ -130,13 +136,13 @@ async def collect(
     for r in await pool.fetch(
         """
         select c.id, c.label,
-               count(*) filter (where s.ts >= $1) today,
+               count(*) filter (where s.ts >= $1) today,  -- за сутки отчёта
                count(*) filter (where s.ts >= $1 - interval '30 days' and s.ts < $1) prev
           from clusters c join signals s on s.cluster_id = c.id
          group by c.id
         having count(*) filter (where s.ts >= $1) >= $2
         """,
-        day, settings.spike_min,
+        since, settings.spike_min,
     ):
         per_day = r["prev"] / 30
         if r["id"] not in new_ids and r["today"] >= settings.spike_factor * per_day:
@@ -202,7 +208,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
         title = esc(c["title"] or "без названия")
         name = f'<a href="{fmt.html.escape(link, quote=True)}">{title}</a>' if link else title
         if not c["msgs"]:
-            lines.append(f"• {name}: сегодня тишина")
+            lines.append(f"• {name}: тишина")
         else:
             lines.append(
                 f"• {name}: {fmt.messages_word(c['msgs'])}, "
@@ -241,7 +247,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
     if data["spikes"]:
         lines += ["", "📈 <b>Всплески</b>"]
         lines += [
-            f"• {esc(x['label'])} — сегодня {x['today']}, {usually(x['per_day'])} "
+            f"• {esc(x['label'])} — за сутки {x['today']}, {usually(x['per_day'])} "
             f"→ /pain_{x['id']}"
             for x in data["spikes"]
         ]

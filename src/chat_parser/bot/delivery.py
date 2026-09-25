@@ -61,11 +61,12 @@ async def to_email(report: DailyReport, pdf: bytes | None) -> str | None:
 
 
 async def deliver(bot: Bot, chat_ids: Iterable[int], report: DailyReport,
-                  email: bool = True) -> None:
+                  email: bool = True) -> bool:
+    """Возвращает True, если письмо ушло."""
     chat_ids = list(chat_ids)
     pdf = await to_telegram(bot, chat_ids, report)
-    if not email:
-        return
+    if not email or not settings.email_ready:
+        return False
     error = await to_email(report, pdf)
     if error:
         for chat_id in chat_ids:
@@ -75,3 +76,4 @@ async def deliver(bot: Bot, chat_ids: Iterable[int], report: DailyReport,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("не доставлено %s: %s", chat_id, e)
+    return error is None

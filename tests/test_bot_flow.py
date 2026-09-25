@@ -662,7 +662,7 @@ async def test_evening_report(evening, monkeypatch):
 
     assert "📊 <b>Итоги дня ·" in text
     assert '<a href="https://t.me/optika_pro">Оптики Про</a>: 5 сообщений' in text
-    assert "Оптики — обмен опытом</a>: сегодня тишина" in text
+    assert "Оптики — обмен опытом</a>: тишина" in text
     assert "🧭 <b>Главное за день</b>" in text and "Поставщики срывают сроки" in text
 
     new_id = await h.pool.fetchval(
@@ -679,7 +679,7 @@ async def test_evening_report(evening, monkeypatch):
     assert sharp.count("острота") == 1  # остальное молча копится в базе
 
     assert "📈 <b>Всплески</b>" in text
-    assert f"Нехватка оборудования — сегодня 3, раньше почти не упоминалась → /pain_{cid}" in text
+    assert f"Нехватка оборудования — за сутки 3, раньше почти не упоминалась → /pain_{cid}" in text
     assert "Всего за день: 5 сигналов" in text
     assert "токен" not in text and "лимит" not in text and "пауз" not in text
 
@@ -701,13 +701,15 @@ async def test_evening_report(evening, monkeypatch):
     assert await h.pool.fetchval(
         "select count(*) from threads where chat_id <> $1 and status = 'pending'", PRO) == 0
 
-    # «Итоги дня сейчас» из /live: считает с прошлого отчёта и не сбивает вечерний
+    # «Итоги дня сейчас» из /live: снова за полные сутки (не с прошлого отчёта)
+    # и не сбивает вечерний
     out = await h.say("/live")
     assert "включено" in out and "сегодняшние уже отправлены" in out and "[live:report]" in out
     assert "Следующие итоги: завтра в 22:00" in out
     await h.press("live:report")
     again = pdf_text(h.session.files[-1][1])
-    assert "Оптики Про · тишина" in again and "Новых сигналов нет" in again
+    assert "тишина" not in again.split("Оптики Про")[1][:20]
+    assert "Срыв сроков поставки" in again and "Новых сигналов нет" not in again
     assert [m for c, m, _ in h.calls if c == PRO] == ["recent", "incremental"]
 
 
@@ -1130,3 +1132,37 @@ async def test_report_without_email_and_pdf_fallback(evening, monkeypatch):
     h.session.sent.clear()
     report = await main.send_report(h.bot)
     assert h.session.files == [] and h.session.sent == [report.text]
+
+
+async def test_send_report_now_button(evening, monkeypatch):
+    """Временная кнопка: итоги за сутки сразу — PDF, копия на почту, расписание не трогаем."""
+    from chat_parser import db, mailer
+    from chat_parser.bot import live
+    from chat_parser.config import settings
+
+    h = evening
+    monkeypatch.setattr(settings, "report_email_to", "owner@example.com")
+    monkeypatch.setattr(settings, "smtp_user", "bot@gmail.com")
+    monkeypatch.setattr(settings, "smtp_password", "app-password")
+    letters = []
+    monkeypatch.setattr(mailer, "_send_sync", letters.append)
+    await _old_pain(h)
+    before = await live.next_report_at()
+
+    out = await h.say("📤 Отправить отчёт сейчас")
+    assert "Собираю итоги за последние сутки" in out and "[stop:" in out  # можно остановить
+    assert "✅ Готово — итоги за последние сутки ниже. Копия ушла на почту: owner@example.com." in out
+    (name, pdf, caption), = h.session.files
+    assert pdf.startswith(b"%PDF") and "5 сообщений" in caption
+    assert len(letters) == 1 and list(letters[0].iter_attachments())[0].get_content() == pdf
+    assert await live.next_report_at() == before  # по расписанию придёт как обычно
+    assert await db.get_setting(live.REPORT_DATE_KEY) is None
+
+    # и ещё раз — снова за полные сутки, а не «с прошлого отчёта»
+    h.session.files.clear()
+    out = await h.say("📤 Отправить отчёт сейчас")
+    assert "5 сообщений" in h.session.files[0][2]
+
+    # без почты — так и говорит
+    monkeypatch.setattr(settings, "smtp_password", "")
+    assert "На почту не отправлял: она не настроена." in await h.say("📤 Отправить отчёт сейчас")
