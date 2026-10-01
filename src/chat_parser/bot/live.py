@@ -124,14 +124,14 @@ async def report_due(at: datetime | None = None) -> bool:
 
 
 async def _advance(pending: datetime) -> None:
-    """Отчёт за pending отправлен (или отменён) — следующий по расписанию,
-    не раньше следующего дня: даже если время успели поменять на более позднее."""
+    """Отчёт за pending отправлен (или отменён) — следующий по расписанию.
+    Если время успели поменять, пока отчёт собирался, выбор пользователя
+    остаётся: он уже записал, когда ждать следующий."""
+    if await next_report_at() != pending:
+        return
     hour, minute = await report_time()
-    pending = pending.astimezone(clock.tz())
-    nxt = clock.next_at(hour, minute, max(clock.now(), pending))
-    if nxt.date() <= pending.date():
-        nxt += DAY
-    await db.set_setting(NEXT_REPORT_KEY, nxt.isoformat())
+    after = max(clock.now(), pending.astimezone(clock.tz()))
+    await db.set_setting(NEXT_REPORT_KEY, clock.next_at(hour, minute, after).isoformat())
 
 
 async def skip_pending() -> None:
@@ -141,11 +141,14 @@ async def skip_pending() -> None:
 
 async def set_report_time(hour: int, minute: int) -> tuple[datetime, bool]:
     """Новое время. Возвращает (когда следующий отчёт, пропадает ли сегодняшний).
-    Сегодняшний пропадает, если его ещё не было, а новое время уже прошло."""
+
+    Выбранное время срабатывает всегда: ещё впереди сегодня — отчёт придёт
+    сегодня, даже если сегодня он уже был (так можно проверять несколько раз
+    за день). Сегодняшний пропадает, если его ещё не было, а время уже прошло."""
     sent = await _sent_today()
     today = clock.at_time(hour, minute)
     passed = today <= clock.now()
-    nxt = today + DAY if passed or sent else today
+    nxt = today + DAY if passed else today
     await db.set_setting(REPORT_TIME_KEY, f"{hour:02d}:{minute:02d}")
     await db.set_setting(NEXT_REPORT_KEY, nxt.isoformat())
     schedule_changed.set()

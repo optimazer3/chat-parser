@@ -15,6 +15,7 @@ import re
 import tempfile
 import time
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import asyncpg
@@ -63,14 +64,15 @@ BTN_SEND_NOW = "📤 Отправить отчёт сейчас"
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "7"
+KEYBOARD_VERSION = "8"
 
-# Отчёты уходят на почту, в боте остаются две кнопки. Прежние кнопки убраны
+# Отчёты уходят на почту, в боте остаются три кнопки. Прежние кнопки убраны
 # с клавиатуры, но их обработчики оставлены: у кого-то ещё может висеть старая.
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ADD)],
         [KeyboardButton(text=BTN_PERSON)],
+        [KeyboardButton(text=BTN_TIME)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -100,11 +102,12 @@ def help_text(at: str = "22:00") -> str:
         "Чтобы добавить новый — пришли ссылку на него.",
         "👤 <b>Добавить инфо о человеке</b> — пришли @username, потом напиши, кто это. В отчётах "
         "будет видно, кто что сказал, а при разборе я учту компанию и роль.",
+        "⏰ <b>Время отчёта</b> — во сколько присылать отчёт на почту.",
         "",
         "<b>Полезно знать</b>",
         "• Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.",
         f"• На автоматический разбор трачу {budget}.",
-        "• Время отчёта — /time, остальные команды — в меню слева.",
+        "• Остальные команды — в меню слева.",
     ])
 
 
@@ -1280,11 +1283,13 @@ async def cmd_time(message: Message) -> None:
     buttons = [(("✓ " if t == current else "") + clock.hhmm(int(t[:2]), int(t[3:])),
                 "rt:" + t.replace(":", "")) for t in TIME_PRESETS]
     await message.answer(
-        f"⏰ Итоги дня приходят в <b>{clock.hhmm(hour, minute)}</b> ({clock.tz_label()}), "
-        f"следующие — {fmt.when_next(nxt)}.\n\nВо сколько присылать? Выбери или нажми "
-        "«✍️ Другое время» и напиши своё, например 21:30.",
+        f"⏰ Отчёт приходит на почту в <b>{clock.hhmm(hour, minute)}</b> ({clock.tz_label()}), "
+        f"следующий — {fmt.when_next(nxt)}.\n\nВо сколько присылать? Выбери или нажми "
+        "«✍️ Другое время» и напиши своё, например 21:30. Время можно менять сколько "
+        "угодно раз за день — отчёт придёт в каждое новое время.",
         reply_markup=_kb(buttons[:4], buttons[4:],
-                         [("✍️ Другое время", "rt:custom"), ("Отмена", "cancel")]),
+                         [("⏱ Через 5 минут", "rt:soon"), ("✍️ Другое время", "rt:custom")],
+                         [("Отмена", "cancel")]),
     )
 
 
@@ -1297,6 +1302,10 @@ async def cb_time(call: CallbackQuery) -> None:
     if call.message is None:
         return
     value = call.data.split(":", 1)[1]
+    if value == "soon":  # для проверки: отчёт на почту через несколько минут
+        soon = clock.now() + timedelta(minutes=5)
+        await _apply_time(call.message, soon.hour, soon.minute)
+        return
     if value == "custom":
         await call.message.answer(
             f"{TIME_PROMPT}\n\nНапиши время по {clock.tz_label()}, например <b>21:30</b> "
@@ -1315,13 +1324,13 @@ async def _apply_time(message: Message, hour: int, minute: int) -> None:
 
     nxt, skipped = await live.set_report_time(hour, minute)
     at = clock.hhmm(hour, minute)
-    text = (f"✅ Итоги дня теперь приходят в <b>{at}</b> ({clock.tz_label()}). "
-            f"Следующие — {fmt.when_next(nxt)}.")
+    text = (f"✅ Отчёт теперь приходит на почту в <b>{at}</b> ({clock.tz_label()}). "
+            f"Следующий — {fmt.when_next(nxt)}.")
     if skipped:
         await message.answer(
-            text + f"\n\nВремя {at} сегодня уже прошло, поэтому сегодняшних итогов по "
-            "расписанию не будет. Прислать их сейчас?",
-            reply_markup=_kb([("📤 Прислать итоги за сегодня", "live:catchup")]),
+            text + f"\n\nВремя {at} сегодня уже прошло, поэтому сегодняшнего отчёта по "
+            "расписанию не будет. Отправить его на почту сейчас?",
+            reply_markup=_kb([("📤 Отправить отчёт сейчас", "live:catchup")]),
         )
     else:
         await message.answer(text)

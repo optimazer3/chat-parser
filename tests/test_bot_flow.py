@@ -889,15 +889,17 @@ async def test_report_time(harness, monkeypatch):
 
     h = harness
     fixed = clock.now().replace(hour=15, minute=0, second=0, microsecond=0)
-    monkeypatch.setattr(clock, "now", lambda: fixed)
+    t = {"now": fixed}
+    monkeypatch.setattr(clock, "now", lambda: t["now"])
     live.schedule_changed.clear()
 
     out = await h.say("⏰ Время отчёта")
-    assert "приходят в <b>22:00</b> (МСК), следующие — сегодня в 22:00" in out
-    assert "[rt:2100]" in out and "[rt:custom]" in out and "[cancel]" in out
+    assert "Отчёт приходит на почту в <b>22:00</b> (МСК), следующий — сегодня в 22:00" in out
+    assert "[rt:2100]" in out and "[rt:custom]" in out and "[rt:soon]" in out
+    assert "[cancel]" in out
 
     out = await h.press("rt:2100")
-    assert "теперь приходят в <b>21:00</b> (МСК). Следующие — сегодня в 21:00." in out
+    assert "Отчёт теперь приходит на почту в <b>21:00</b> (МСК). Следующий — сегодня в 21:00." in out
     assert live.schedule_changed.is_set()  # цикл отчёта проснётся и пересчитает ожидание
     assert await live.report_time() == (21, 0)
     assert not await live.report_due(fixed)
@@ -912,20 +914,32 @@ async def test_report_time(harness, monkeypatch):
     out = await h.say("21:45")  # после ошибки бот ждёт ответ снова
     assert "<b>21:45</b>" in out and "сегодня в 21:45" in out
 
-    # время уже прошло, а сегодняшних итогов не было — предлагаем прислать сейчас
+    # время уже прошло, а сегодняшнего отчёта не было — предлагаем отправить сейчас
     out = await h.say("9", reply_to=prompt)
-    assert "Следующие — завтра в 9:00" in out and "9:00 сегодня уже прошло" in out
+    assert "Следующий — завтра в 9:00" in out and "9:00 сегодня уже прошло" in out
     assert "[live:catchup]" in out
     out = await h.press("live:catchup")
-    assert "📊 <b>Итоги дня" in out
+    assert "Почта не настроена" in out and h.session.files  # без почты — сюда, PDF
     assert await db.get_setting(live.REPORT_DATE_KEY) == fixed.date().isoformat()
     tomorrow_9 = fixed.replace(hour=9) + timedelta(days=1)
     assert await live.next_report_at() == tomorrow_9  # расписание не сдвинулось
 
-    # сегодняшние уже пришли — более позднее время сегодня второго отчёта не даст
+    # сегодня отчёт уже был, но выбранное время впереди — придёт ещё раз сегодня
     out = await h.press("rt:2300")
-    assert "Следующие — завтра в 23:00" in out and "уже прошло" not in out
+    assert "Следующий — сегодня в 23:00" in out and "уже прошло" not in out
     assert "Каждый день в <b>23:00</b> (МСК)" in await h.say("/help")
+
+    # для проверки: «через 5 минут», и так несколько раз за день
+    out = await h.press("rt:soon")
+    assert "<b>15:05</b>" in out and "Следующий — сегодня в 15:05" in out
+    t["now"] = fixed.replace(minute=6)  # отчёт по расписанию пришёл в 15:05
+    assert await live.report_due()
+    await live.build_report()
+    assert not await live.report_due()
+    out = await h.press("rt:soon")
+    assert "Следующий — сегодня в 15:11" in out
+    t["now"] = fixed.replace(minute=12)
+    assert await live.report_due()
 
 
 async def test_schedule_edge_cases(harness, monkeypatch):
@@ -953,7 +967,7 @@ async def test_schedule_edge_cases(harness, monkeypatch):
     await live.skip_pending()
     assert await live.next_report_at() == slot + timedelta(days=2)
 
-    # время поменяли на более позднее, пока шёл отчёт, — второго в тот же день нет
+    # время поменяли, пока шёл отчёт, — выбор пользователя остаётся в силе
     t["now"] = slot + timedelta(days=2, minutes=1)
     real = live.collect_day
 
@@ -963,7 +977,7 @@ async def test_schedule_edge_cases(harness, monkeypatch):
 
     monkeypatch.setattr(live, "collect_day", collect_and_change)
     await live.build_report()
-    assert await live.next_report_at() == day1.replace(hour=23, minute=59) + timedelta(days=3)
+    assert await live.next_report_at() == day1.replace(hour=23, minute=59) + timedelta(days=2)
 
 
 async def test_report_loop_wakes_on_new_time(harness, monkeypatch):
