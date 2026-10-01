@@ -1,7 +1,8 @@
-"""Доставка итогов дня: PDF в Telegram с короткой подписью и на почту.
+"""Доставка итогов дня — на почту: обзор в письме, подробный PDF во вложении.
 
-PDF рендерится один раз и уходит и в Telegram, и в письмо. Не собрался PDF —
-отчёт всё равно доходит: в Telegram текстом, на почту — письмом без вложения.
+В Telegram отчёт не отправляется. Исключение — запасной путь, чтобы отчёт не
+потерялся: почта не настроена или письмо не ушло. Тогда в Telegram приходят
+предупреждение и PDF.
 """
 
 from __future__ import annotations
@@ -28,10 +29,26 @@ async def _bot_username(bot: Bot) -> str | None:
         return None
 
 
-async def to_telegram(bot: Bot, chat_ids: Iterable[int], report: DailyReport) -> bytes | None:
-    pdf = await asyncio.to_thread(report.pdf, await _bot_username(bot))
+async def to_email(report: DailyReport, pdf: bytes | None) -> str | None:
+    """None — письмо ушло; иначе — что пошло не так."""
+    text = report.plain()
+    if pdf is None:
+        text = text.replace("Полный отчёт — во вложении (PDF).",
+                            "PDF собрать не получилось — в письме только обзор.")
+    try:
+        await mailer.send(report.subject, text, pdf, report.filename, html=report.html())
+    except Exception as e:  # noqa: BLE001
+        log.warning("итоги дня не ушли на почту: %s", e)
+        return str(e)
+    return None
+
+
+async def _fallback(bot: Bot, chat_ids: list[int], report: DailyReport, pdf: bytes | None,
+                    problem: str) -> None:
+    """Почта не сработала — отчёт приходит сюда, чтобы не потерялся."""
     for chat_id in chat_ids:
         try:
+            await bot.send_message(chat_id, problem)
             if pdf:
                 await bot.send_document(
                     chat_id, BufferedInputFile(pdf, report.filename), caption=report.caption
@@ -41,39 +58,21 @@ async def to_telegram(bot: Bot, chat_ids: Iterable[int], report: DailyReport) ->
                     await bot.send_message(chat_id, part)
         except Exception as e:  # noqa: BLE001 — один получатель не мешает остальным
             log.warning("итоги дня не доставлены %s: %s", chat_id, e)
-    return pdf
 
 
-async def to_email(report: DailyReport, pdf: bytes | None) -> str | None:
-    """None — письмо ушло (или почта не настроена); иначе — что пошло не так."""
-    if not settings.email_ready:
-        return None
-    text = report.plain()
-    if pdf is None:
-        text = text.replace("Полный отчёт — во вложении (PDF).",
-                            "PDF собрать не получилось — полный отчёт в Telegram.")
-    try:
-        await mailer.send(report.subject, text, pdf, report.filename)
-    except Exception as e:  # noqa: BLE001
-        log.warning("итоги дня не ушли на почту: %s", e)
-        return str(e)
-    return None
-
-
-async def deliver(bot: Bot, chat_ids: Iterable[int], report: DailyReport,
-                  email: bool = True) -> bool:
-    """Возвращает True, если письмо ушло."""
+async def deliver(bot: Bot, chat_ids: Iterable[int], report: DailyReport) -> bool:
+    """Отправить итоги на почту. True — письмо ушло."""
     chat_ids = list(chat_ids)
-    pdf = await to_telegram(bot, chat_ids, report)
-    if not email or not settings.email_ready:
+    pdf = await asyncio.to_thread(report.pdf, await _bot_username(bot))
+    if not settings.email_ready:
+        await _fallback(bot, chat_ids, report, pdf,
+                        "⚠️ Почта не настроена, поэтому итоги дня присылаю сюда. Чтобы они "
+                        "приходили на почту, заполни в .env REPORT_EMAIL_TO, SMTP_USER и "
+                        "SMTP_PASSWORD и перезапусти бота.")
         return False
     error = await to_email(report, pdf)
-    if error:
-        for chat_id in chat_ids:
-            try:
-                await bot.send_message(
-                    chat_id, f"⚠️ Итоги дня не ушли на почту: {fmt.esc(error)}"
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("не доставлено %s: %s", chat_id, e)
-    return error is None
+    if error is None:
+        return True
+    await _fallback(bot, chat_ids, report, pdf,
+                    f"⚠️ Итоги дня не ушли на почту: {fmt.esc(error)}\nПрисылаю их сюда.")
+    return False

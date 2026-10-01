@@ -105,13 +105,17 @@ async def find_by_username(pool: asyncpg.Pool, username: str) -> str | None:
 
 async def update_info(pool: asyncpg.Pool, label: str, company: str | None,
                       role: str | None, note: str | None) -> bool:
-    """Записать то, что прислали; не присланное не трогать. Внесли компанию
-    или роль — подсказка нейросети больше не нужна."""
+    """Записать то, что прислали; не присланное не трогать. Заметка дописывается
+    к прежней («добавить инфо»), а не заменяет её. Внесли компанию или роль —
+    подсказка нейросети больше не нужна."""
     res = await pool.execute(
         """
         update authors
            set company = coalesce($2, company), role = coalesce($3, role),
-               note = coalesce($4, note),
+               note = case when $4::text is null then note
+                           when coalesce(note, '') = '' then $4
+                           when position($4 in note) > 0 then note
+                           else note || E'\n' || $4 end,
                company_hint = case when $2::text is null and $3::text is null
                                    then company_hint end,
                role_hint = case when $2::text is null and $3::text is null then role_hint end,

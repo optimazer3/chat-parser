@@ -153,7 +153,6 @@ def test_only_evening_run_no_polling():
     assert not hasattr(settings, "live_poll_minutes")
     assert "21:30" in help_text("21:30") and "(МСК)" in help_text("21:30")
     assert [b.text for row in MAIN_KB.keyboard for b in row] == [
-        "🔝 Топ болей за месяц", "💬 Список чатов", "➕ Добавить чат",
-        "👤 Инфо о человеке", "⏰ Время отчёта", "📤 Отправить отчёт сейчас",
+        "➕ Добавить чат", "👤 Добавить инфо о человеке",
     ]
     assert live.DAY.total_seconds() == 24 * 3600 and live.CONTEXT.total_seconds() == 48 * 3600

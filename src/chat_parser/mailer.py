@@ -43,7 +43,7 @@ class _ProxySMTPSSL(smtplib.SMTP_SSL):
 
 
 def build_message(subject: str, text: str, attachment: bytes | None = None,
-                  filename: str = "report.pdf") -> EmailMessage:
+                  filename: str = "report.pdf", html: str | None = None) -> EmailMessage:
     sender = settings.smtp_from or settings.smtp_user
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -51,6 +51,8 @@ def build_message(subject: str, text: str, attachment: bytes | None = None,
     msg["To"] = ", ".join(settings.email_recipients)
     msg["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[-1] or None)
     msg.set_content(text)
+    if html:
+        msg.add_alternative(html, subtype="html")
     if attachment:
         msg.add_attachment(attachment, maintype="application", subtype="pdf",
                            filename=filename)
@@ -83,13 +85,13 @@ def _send_sync(msg: EmailMessage) -> None:
 
 
 async def send(subject: str, text: str, attachment: bytes | None = None,
-               filename: str = "report.pdf") -> None:
+               filename: str = "report.pdf", html: str | None = None) -> None:
     """Отправить письмо всем из REPORT_EMAIL_TO. Ошибка — исключение с понятным текстом."""
     if not settings.email_ready:
         raise MailNotConfigured(
             "почта не настроена: нужны REPORT_EMAIL_TO, SMTP_USER и SMTP_PASSWORD в .env"
         )
-    msg = build_message(subject, text, attachment, filename)
+    msg = build_message(subject, text, attachment, filename, html)
     try:
         await asyncio.to_thread(_send_sync, msg)
     except smtplib.SMTPAuthenticationError as e:

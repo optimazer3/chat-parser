@@ -62,7 +62,7 @@ def test_pdf_contents_and_links():
     assert pdf.startswith(b"%PDF")
     r, text, links = read(pdf)
     assert r.metadata.title == "Итоги дня · 24.09.2026"
-    for part in ("Итоги дня", "Четверг, 24 сентября 2026", "Главное за день", "Чаты",
+    for part in ("Итоги дня", "Четверг, 24 сентября 2026", "Главное за сутки", "Чаты",
                  "О чём говорили", "Новые боли", "Острые сигналы", "острота 5 из 5",
                  "Всплески", "~3 в неделю", "Иван Петров · Оптика Люкс, владелец",
                  "поставщик опять сорвал сроки", "FloodWait", "12 обсуждений"):
@@ -122,3 +122,56 @@ def test_report_day_is_the_day_it_covers():
     assert daily.report_day(after_midnight - timedelta(days=1), after_midnight).day == 24
     morning = datetime(2026, 9, 25, 9, 0, tzinfo=tz)
     assert daily.report_day(morning - timedelta(days=1), morning).day == 24
+
+
+def detailed():
+    sig = {"type": "pain", "audience": "owner", "intensity": 3, "summary": "жду оправы 6 недель",
+           "chat_title": "Оптики Про",
+           **quote("поставщик опять сорвал сроки", "Иван Петров", "u:aaaaaaaa",
+                   "https://t.me/optika_pro/4988", "Оптика Люкс", "владелец")}
+    return sample(
+        summary="Сутки прошли под знаком поставок <и> нехватки приборов.",
+        opportunities=["Региональный склад оправ"],
+        signals=[{**sig, "cluster_id": 12, "pain_label": "Срыв сроков поставки оправ"},
+                 {**sig, "cluster_id": None, "pain_label": None, "type": "question",
+                  "summary": "где проверить зрение ребёнку"}],
+        people=[{"author_label": "u:aaaaaaaa", "a_name": "Иван Петров", "username": "ivan",
+                 "a_company": "Оптика Люкс", "a_role": "владелец", "note": "3 салона",
+                 "msgs": 42, "chats": 1, "signals": 2},
+                {"author_label": "u:dddddddd", "a_name": None, "username": None,
+                 "a_company": None, "a_role": None, "note": None, "msgs": 3, "chats": 1,
+                 "signals": 0}],
+        people_total=5,
+    )
+
+
+def test_detailed_sections():
+    data = detailed()
+    data["new_pains"][0]["card"] = {"statement": "Оправы идут по 6 недель",
+                                    "current_workarounds": ["заказывают у двух сразу"],
+                                    "product_hypotheses": ["региональный склад"],
+                                    "open_questions": ["сколько клиентов уходит"]}
+    _, text, _ = read(daily.DailyReport(data).pdf())
+    for part in ("5\nучастников", "Сутки прошли под знаком поставок <и> нехватки приборов.",
+                 "Возможности для бизнеса", "Региональный склад оправ",
+                 "Оправы идут по 6 недель", "Как сейчас выкручиваются", "заказывают у двух сразу",
+                 "Что можно предложить", "Что стоит выяснить",
+                 "Все сигналы за сутки", "Срыв сроков поставки оправ · 1 сигнал",
+                 "Пока не привязаны к боли · 1 сигнал", "где проверить зрение ребёнку",
+                 "Кто писал за сутки", "@ivan", "владелец, Оптика Люкс", "3 салона",
+                 "участник dddddddd", "нет сведений", "И ещё 3 человека"):
+        assert part in text, part
+
+
+def test_letter_html():
+    report = daily.DailyReport(detailed(), {"budget_hit_at": clock.now().replace(hour=19)})
+    body = report.html()
+    assert body.startswith("<!doctype html>") and "max-width:640px" in body
+    for part in ("Итоги дня · 24.09.2026", "Главное за сутки",
+                 "Сутки прошли под знаком поставок &lt;и&gt; нехватки приборов.",  # экранировано
+                 "Возможности для бизнеса", "Новые боли", "Срыв сроков поставки оправ",
+                 "Острые сигналы", "острота 5 из 5", "https://t.me/optika_pro/5001",
+                 "Всплески", "лимит", "во вложении (PDF)"):
+        assert part in body, part
+    assert "Сутки прошли под знаком поставок" in report.plain()
+    assert "Возможности для бизнеса:" in report.plain()

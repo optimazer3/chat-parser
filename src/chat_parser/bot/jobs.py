@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -308,6 +310,36 @@ async def refresh_names(chat_id: int) -> int:
         async with pool.acquire() as conn:
             await upsert_authors(conn, items)
         return len(items)
+
+
+async def describe_person(text: str) -> tuple[str | None, str | None, str | None, bool]:
+    """Описание человека своими словами -> (компания, роль, остальное, разобрала ли
+    нейросеть). Не ответила — всё описание идёт в заметку, ничего не теряется."""
+    from ..analyze.prompts import SYSTEM_PERSON
+    from ..analyze.schema import PersonAbout
+    from ..llm import TokenBudgetExhausted, build_llm
+
+    text = text.strip()[:1500]
+    pool = await db.get_pool()
+    llm = build_llm(settings.synth_model)
+    started, finished = time.monotonic(), False
+    try:
+        try:
+            res = await llm.structured(SYSTEM_PERSON, text, PersonAbout, max_tokens=4000)
+        except TokenBudgetExhausted:
+            res = await llm.structured(SYSTEM_PERSON, text, PersonAbout, max_tokens=12000)
+        finished = True
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("chat_parser.people").warning("описание не разобрано: %s", e)
+        return None, None, text or None, False
+    finally:
+        await usage.record(pool, "person", llm, seconds=time.monotonic() - started,
+                           cancelled=not finished)
+
+    def clean(value: str) -> str | None:
+        return (value or "").strip() or None
+
+    return clean(res.company), clean(res.role), clean(res.details), True
 
 
 class NotAPerson(ValueError):

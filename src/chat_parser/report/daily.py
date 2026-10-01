@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -21,7 +22,9 @@ from ..config import settings
 from ..links import QUOTE_MESSAGE_SQL, chat_link, message_link
 from ..quotes import pick_quotes
 
-TOP_N = 5
+TOP_N = 5  # в коротком тексте (Telegram) — по пять пунктов
+# в подробном отчёте (PDF, письмо) — всё, но с разумным потолком
+NEW_LIMIT, SHARP_LIMIT, TOPICS_LIMIT, SIGNALS_LIMIT, PEOPLE_LIMIT = 15, 25, 12, 300, 80
 CAPTION_LIMIT = 1024  # подпись к файлу в Telegram
 
 log = logging.getLogger("chat_parser.report")
@@ -68,6 +71,11 @@ class DailyReport:
     def plain(self) -> str:
         return plain(self.data, self.notes)
 
+    def html(self) -> str:
+        from .letter import html
+
+        return html(self.data, self.notes)
+
 
 def report_day(since: datetime, until: datetime) -> datetime:
     """К какому дню относится отчёт за сутки: в 22:00 — к сегодняшнему, в 00:01 —
@@ -92,6 +100,8 @@ async def collect(
                (select count(*) from signals s
                  where s.chat_id = c.id and s.created_at >= $1 and s.created_at < $2
                    and s.ts >= $3) signals,
+               (select count(distinct m.author_label) from messages m
+                 where m.chat_id = c.id and m.ts >= $1 and m.ts < $2) people,
                (select max(message_id) from messages m where m.chat_id = c.id) last_msg
           from chats c where c.is_active
          order by msgs desc, c.id
@@ -101,16 +111,19 @@ async def collect(
 
     new_pains = [dict(r) for r in await pool.fetch(
         """
-        select c.id, c.label, c.audience, c.n_authors, c.n_signals
+        select c.id, c.label, c.audience, c.n_authors, c.n_signals, c.statement, c.card
           from clusters c
          where c.created_at >= $1 and c.first_seen >= $2
          order by c.n_authors desc, c.n_signals desc, c.id
          limit $3
         """,
-        since, fresh, TOP_N,
+        since, fresh, NEW_LIMIT,
     )]
     for p in new_pains:
-        p["quote"] = await _best_quote(pool, p["id"])
+        card = p.pop("card")
+        p["card"] = json.loads(card) if isinstance(card, str) else (card or {})
+        p["quotes"] = await _quotes(pool, p["id"], p["card"], 3)
+        p["quote"] = p["quotes"][0] if p["quotes"] else None
     new_ids = {p["id"] for p in new_pains}
 
     sharp = [dict(r) for r in await pool.fetch(
@@ -127,7 +140,7 @@ async def collect(
          order by s.intensity desc, s.id
          limit $4
         """,
-        since, until, fresh, TOP_N,
+        since, until, fresh, SHARP_LIMIT,
     )]
     for s in sharp:
         s["link"] = message_link(s["chat_id"], s["username"], s["mid"])
@@ -156,18 +169,58 @@ async def collect(
          where s.created_at >= $1 and s.created_at < $2 and s.ts >= $3
          group by c.id, c.label order by n desc, c.id limit $4
         """,
-        since, until, fresh, TOP_N,
+        since, until, fresh, TOPICS_LIMIT,
     )]
     types = {r["type"]: r["n"] for r in await pool.fetch(
         "select type, count(*) n from signals where created_at >= $1 and created_at < $2 "
         "and ts >= $3 group by type order by n desc",
         since, until, fresh,
     )}
+    # все сигналы суток — для раздела «по болям»
+    signals = [dict(r) for r in await pool.fetch(
+        f"""
+        select s.id, s.type, s.audience, s.summary, s.evidence_quote, s.intensity,
+               s.cluster_id, cl.label pain_label, s.chat_id, ch.title chat_title,
+               ch.username, {QUOTE_MESSAGE_SQL} as mid,
+               s.author_label, a.name a_name, a.company a_company, a.role a_role
+          from signals s join chats ch on ch.id = s.chat_id
+          left join authors a on a.author_label = s.author_label
+          left join clusters cl on cl.id = s.cluster_id
+         where s.created_at >= $1 and s.created_at < $2 and s.ts >= $3
+           and s.confidence >= 0.5
+         order by cl.n_authors desc nulls last, s.cluster_id nulls last,
+                  s.intensity desc, s.id
+         limit $4
+        """,
+        since, until, fresh, SIGNALS_LIMIT,
+    )]
+    for x in signals:
+        x["link"] = message_link(x["chat_id"], x["username"], x["mid"])
+
+    # кто писал за сутки и что о нём известно
+    people_rows = [dict(r) for r in await pool.fetch(
+        """
+        select m.author_label, max(a.name) a_name, max(a.username) username,
+               max(a.company) a_company, max(a.role) a_role, max(a.note) note,
+               count(*) msgs, count(distinct m.chat_id) chats,
+               (select count(*) from signals s
+                 where s.author_label = m.author_label and s.created_at >= $1
+                   and s.created_at < $2 and s.ts >= $3) signals
+          from messages m left join authors a on a.author_hash = m.author_hash
+         where m.ts >= $1 and m.ts < $2 and not m.is_bot and m.author_label is not null
+         group by m.author_label
+         order by msgs desc, m.author_label
+        """,
+        since, until, fresh,
+    )]
     return {"day": day, "chats": chats, "new_pains": new_pains, "sharp": sharp,
-            "spikes": spikes[:TOP_N], "topics": topics, "types": types}
+            "spikes": spikes, "topics": topics, "types": types, "signals": signals,
+            "people": people_rows[:PEOPLE_LIMIT], "people_total": len(people_rows)}
 
 
-async def _best_quote(pool: asyncpg.Pool, cluster_id: int) -> dict[str, Any] | None:
+async def _quotes(pool: asyncpg.Pool, cluster_id: int, card: dict[str, Any] | None,
+                  limit: int) -> list[dict[str, Any]]:
+    """Лучшие цитаты боли со ссылками: сначала те, что выбрала карточка."""
     rows = [dict(r) for r in await pool.fetch(
         f"""
         select s.id, s.evidence_quote, s.chat_id, {QUOTE_MESSAGE_SQL} as mid, ch.username,
@@ -178,12 +231,10 @@ async def _best_quote(pool: asyncpg.Pool, cluster_id: int) -> dict[str, Any] | N
         """,
         cluster_id,
     )]
-    picked = pick_quotes(None, rows, limit=1)
-    if not picked:
-        return None
-    q = picked[0]
-    q["link"] = message_link(q["chat_id"], q["username"], q["mid"])
-    return q
+    picked = pick_quotes(card, rows, limit=limit)
+    for q in picked:
+        q["link"] = message_link(q["chat_id"], q["username"], q["mid"])
+    return picked
 
 
 def usually(per_day: float) -> str:
@@ -222,11 +273,11 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
     if data["topics"]:
         lines += ["", "<b>О чём говорили</b>"]
         lines += [f"• {esc(t['label'])} — {fmt.signals_word(t['n'])} → /pain_{t['id']}"
-                  for t in data["topics"]]
+                  for t in data["topics"][:TOP_N]]
 
     if data["new_pains"]:
         lines += ["", "🆕 <b>Новые боли</b>"]
-        for p in data["new_pains"]:
+        for p in data["new_pains"][:TOP_N]:
             lines.append(
                 f"• <b>{esc(p['label'])}</b> — {fmt.people_word(p['n_authors'])}, "
                 f"{fmt.signals_word(p['n_signals'])} → /pain_{p['id']}"
@@ -236,7 +287,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
 
     if data["sharp"]:
         lines += ["", "🔥 <b>Острые сигналы</b>"]
-        for s in data["sharp"]:
+        for s in data["sharp"][:TOP_N]:
             kind = fmt.TYPE_RU.get(s["type"], s["type"])
             who = fmt.AUDIENCE_RU.get(s["audience"], s["audience"])
             pain = f" → /pain_{s['cluster_id']}" if s["cluster_id"] else ""
@@ -249,7 +300,7 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
         lines += [
             f"• {esc(x['label'])} — за сутки {x['today']}, {usually(x['per_day'])} "
             f"→ /pain_{x['id']}"
-            for x in data["spikes"]
+            for x in data["spikes"][:TOP_N]
         ]
 
     lines.append("")
@@ -338,8 +389,12 @@ def plain(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
         f"{fmt.messages_word(msgs)}, {fmt.discussions(threads)}, "
         f"{fmt.signals_word(total)}, новых болей: {len(data['new_pains'])}.",
     ]
+    if data.get("summary"):
+        lines += ["", data["summary"]]
     if data.get("highlights"):
-        lines += ["", "Главное за день:"] + [f"• {h}" for h in data["highlights"]]
+        lines += ["", "Главное за сутки:"] + [f"• {h}" for h in data["highlights"]]
+    if data.get("opportunities"):
+        lines += ["", "Возможности для бизнеса:"] + [f"• {h}" for h in data["opportunities"]]
     if data["new_pains"]:
         lines += ["", "Новые боли:"] + [f"• {p['label']}" for p in data["new_pains"]]
     if notes.get("paused"):

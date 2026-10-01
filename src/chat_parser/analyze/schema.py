@@ -100,4 +100,17 @@ class Assignment(BaseModel):
 
 
 class DayDigest(BaseModel):
-    highlights: list[str] = Field(description="3-5 главных выводов дня, по одному предложению")
+    summary: str = Field(default="", description="Обзор суток связным текстом, 3-5 предложений")
+    highlights: list[str] = Field(description="5-7 главных выводов, по одному предложению")
+    opportunities: list[str] = Field(
+        default_factory=list,
+        description="2-4 возможности для бизнеса, прямо вытекающие из сигналов; пусто, если нет",
+    )
+
+
+class PersonAbout(BaseModel):
+    """Описание участника, которое прислал пользователь, — по полям."""
+
+    company: str = Field(description="Компания, салон или сеть; пусто, если не названа")
+    role: str = Field(description="Кем работает или кто это; пусто, если не сказано")
+    details: str = Field(description="Остальные факты из описания, кратко; пусто, если нет")

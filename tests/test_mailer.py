@@ -92,3 +92,11 @@ def test_proxy_is_used_when_set(monkeypatch):
     with pytest.raises(OSError):
         mailer._ProxySMTP("smtp.gmail.com", 587, timeout=5)
     assert calls == ["socks5://127.0.0.1:1080", ("smtp.gmail.com", 587)]
+
+
+async def test_html_body_and_text_alternative(mail):
+    await mailer.send("s", "простой текст", b"%PDF", "a.pdf", html="<p>письмо</p>")
+    msg = mail[3][1]
+    assert msg.get_body(("html",)).get_content().strip() == "<p>письмо</p>"
+    assert msg.get_body(("plain",)).get_content().strip() == "простой текст"
+    assert len(list(msg.iter_attachments())) == 1

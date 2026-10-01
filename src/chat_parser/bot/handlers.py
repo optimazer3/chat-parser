@@ -56,67 +56,56 @@ BTN_HELP = "❓ Помощь"
 BTN_ADD = "➕ Добавить чат"
 BTN_TOP_MONTH = "🔝 Топ болей за месяц"
 BTN_CHATS = "💬 Список чатов"
-BTN_PERSON = "👤 Инфо о человеке"
+BTN_PERSON = "👤 Добавить инфо о человеке"
+BTN_PERSON_OLD = "👤 Инфо о человеке"
 BTN_TIME = "⏰ Время отчёта"
-BTN_SEND_NOW = "📤 Отправить отчёт сейчас"  # временная, для проверки
+BTN_SEND_NOW = "📤 Отправить отчёт сейчас"
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "6"
+KEYBOARD_VERSION = "7"
 
-# Прежние кнопки (статус, разобрать, отчёт…) убраны с клавиатуры, но их
-# обработчики оставлены: у кого-то в Telegram ещё может висеть старая.
+# Отчёты уходят на почту, в боте остаются две кнопки. Прежние кнопки убраны
+# с клавиатуры, но их обработчики оставлены: у кого-то ещё может висеть старая.
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_TOP_MONTH)],
-        [KeyboardButton(text=BTN_CHATS), KeyboardButton(text=BTN_ADD)],
-        [KeyboardButton(text=BTN_PERSON), KeyboardButton(text=BTN_TIME)],
-        [KeyboardButton(text=BTN_SEND_NOW)],  # временная — убрать после проверки
+        [KeyboardButton(text=BTN_ADD)],
+        [KeyboardButton(text=BTN_PERSON)],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
 def help_text(at: str = "22:00") -> str:
-    """at — во сколько приходят итоги дня, «21:30»."""
+    """at — во сколько приходят итоги дня, «21:30». Абзацы — одной строкой:
+    Telegram сам переносит текст по ширине экрана."""
     budget = (f"не больше {settings.live_daily_budget:g} ₽ в день"
               if settings.live_daily_budget > 0 else "без дневного лимита")
-    return f"""👋 <b>Я слежу за чатами рынка оптики</b>
-
-Читаю переписку владельцев оптик, продавцов, врачей и покупателей и нахожу,
-на что люди жалуются, что ищут и каких решений им не хватает.
-
-<b>Как это работает</b>
-• Каждый день в <b>{at}</b> ({clock.tz_label()}) я забираю переписку подключённых
-  чатов за сутки (для контекста — и за сутки до них), разбираю её и присылаю
-  <b>итоги дня файлом PDF</b>: главное за день, что было в каждом чате, новые
-  боли, самые острые жалобы и всплески — с цитатами и ссылками на сообщения.
-  Копия приходит на почту, если она настроена. В остальное время я не пишу.
-• Под каждой цитатой видно, кто её сказал. Кто из какой компании и кем
-  работает — можно записать, я и сам подскажу, если человек рассказал о себе.
-• Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.
-• На автоматический разбор трачу {budget}.
-
-<b>Кнопки</b>
-🔝 <b>Топ болей за месяц</b> — главные боли за последние 30 дней. Рядом с каждой
-   ссылка /pain_… — нажми, пришлю подробности, цитаты и идеи решений.
-💬 <b>Список чатов</b> — за чем я слежу; там же участники каждого чата и удаление.
-➕ <b>Добавить чат</b> — пришли ссылку на чат, и я начну за ним следить.
-👤 <b>Инфо о человеке</b> — пришли @username и через запятую компанию, роль,
-   заметку: <i>@ivan_optika Оптика Люкс, владелец</i>.
-⏰ <b>Время отчёта</b> — во сколько присылать итоги дня.
-📤 <b>Отправить отчёт сейчас</b> — временно, для проверки: итоги за последние
-   сутки сразу (PDF и копия на почту). Отчёт по расписанию придёт как обычно.
-
-<b>Полезно знать</b>
-• Топ пополняется вместе с итогами дня.
-• Историю чата можно прислать и файлом: Telegram Desktop → чат → ⋮ →
-  «Экспорт истории чата» → формат JSON → пришли мне <code>result.json</code>.
-• Сам я разбираю только переписку последних суток. Архив из файла — вручную: /extract.
-• Нажми /who_… под цитатой — откроется карточка человека: компания, роль, заметка.
-• Любую долгую операцию можно остановить кнопкой ⏹.
-• Остальные команды — в меню слева от поля ввода.
-"""
+    mail = (", ".join(settings.email_recipients) if settings.email_ready
+            else "почта пока не настроена — до тех пор присылаю отчёт сюда")
+    return "\n".join([
+        "👋 <b>Я слежу за чатами рынка оптики</b>",
+        "",
+        "Читаю переписку владельцев оптик, продавцов, врачей и покупателей и нахожу, на что "
+        "люди жалуются, что ищут и каких решений им не хватает.",
+        "",
+        "<b>Отчёт — на почту</b>",
+        f"Каждый день в <b>{at}</b> ({clock.tz_label()}) я читаю переписку подключённых чатов "
+        f"за последние сутки, разбираю её и отправляю подробный отчёт на почту "
+        f"({fmt.esc(mail)}). В письме — обзор суток, во вложении — PDF со всеми сигналами, "
+        "цитатами, новыми болями, всплесками и тем, кто что писал. Сюда отчёты не приходят.",
+        "",
+        "<b>Кнопки</b>",
+        "➕ <b>Добавить чат</b> — список чатов, за которыми я слежу; там же можно удалить чат. "
+        "Чтобы добавить новый — пришли ссылку на него.",
+        "👤 <b>Добавить инфо о человеке</b> — пришли @username, потом напиши, кто это. В отчётах "
+        "будет видно, кто что сказал, а при разборе я учту компанию и роль.",
+        "",
+        "<b>Полезно знать</b>",
+        "• Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.",
+        f"• На автоматический разбор трачу {budget}.",
+        "• Время отчёта — /time, остальные команды — в меню слева.",
+    ])
 
 
 class LiveMessage:
@@ -210,7 +199,8 @@ async def _drop_markup(call: CallbackQuery) -> None:
 AWAIT_SECONDS = 15 * 60
 _awaiting: dict[int, tuple[str, float]] = {}  # кто -> (чего ждём, до какого момента)
 KEYBOARD_TEXTS = {BTN_STATUS, BTN_EXTRACT, BTN_CLUSTER, BTN_TOP, BTN_REPORT, BTN_HELP,
-                  BTN_ADD, BTN_TOP_MONTH, BTN_CHATS, BTN_PERSON, BTN_TIME, BTN_SEND_NOW}
+                  BTN_ADD, BTN_TOP_MONTH, BTN_CHATS, BTN_PERSON, BTN_PERSON_OLD, BTN_TIME,
+                  BTN_SEND_NOW}
 CANCEL_KB = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel")]]
 )
@@ -243,6 +233,8 @@ async def on_awaited_answer(message: Message, awaiting: str) -> None:
         await _time_answer(message, text)
     elif awaiting == "person":
         await _person_info(message, text)
+    elif awaiting.startswith("about:"):
+        await _save_person(message, awaiting.removeprefix("about:"), text)
     elif awaiting.startswith(("edit:", "note:")):
         kind, label = awaiting.split(":", 1)
         await _person_edit(message, "✏️" if kind == "edit" else "📝", label, text)
@@ -277,11 +269,6 @@ async def _person_edit(message: Message, kind: str, label: str, text: str) -> No
 
 TIME_PROMPT = "⏰ Во сколько присылать итоги дня?"
 PERSON_PROMPT = "👤 Информация о человеке"
-PERSON_EXAMPLES = (
-    "<i>@ivan_optika Оптика Люкс, владелец, знакомы по выставке</i>\n"
-    "<i>@maria_opt Линзы Плюс</i>\n"
-    "<i>@olga_lens роль: оптометрист</i>"
-)
 
 
 @router.message(F.reply_to_message.text.startswith(TIME_PROMPT))
@@ -736,51 +723,45 @@ async def cb_run(call: CallbackQuery) -> None:
 # ------------------------------------------------------------------ чаты
 
 
+@router.message(F.text == BTN_ADD)
 @router.message(F.text == BTN_CHATS)
 @router.message(Command("chats"))
 async def cmd_chats(message: Message) -> None:
+    """Чаты, за которыми слежу, с удалением, и как добавить новый."""
     pool = await db.get_pool()
     rows = await pool.fetch(
         """
         select c.id, c.title, c.username, c.link, c.is_active, cu.last_run, cu.note,
                (select count(*) from messages m where m.chat_id = c.id) msgs,
+               (select count(*) from messages m
+                 where m.chat_id = c.id and m.ts >= now() - interval '24 hours') day_msgs,
+               (select count(distinct m.author_label) from messages m
+                 where m.chat_id = c.id) people,
                (select max(message_id) from messages m where m.chat_id = c.id) last_msg,
-               (select count(*) from threads t where t.chat_id = c.id) threads,
-               (select count(*) from threads t
-                 where t.chat_id = c.id and t.status = 'extracted') done,
                (select count(*) from signals s where s.chat_id = c.id) signals
           from chats c left join cursors cu on cu.chat_id = c.id
          order by c.id
         """
     )
     waiting = await jobs.pending_requests()
-    if not rows and not waiting:
-        await message.answer(
-            "Чатов пока нет. Пришли файл <code>result.json</code> с историей чата "
-            "или нажми ➕ Добавить чат."
-        )
-        return
-    lines = ["💬 <b>Чаты</b>", ""]
-    for r in rows:
+    lines = [f"💬 <b>Чаты, за которыми я слежу</b> · {len(rows)}", ""]
+    if not rows:
+        lines += ["Пока ни одного.", ""]
+    for i, r in enumerate(rows, 1):
         link = chat_link(r["id"], r["username"], r["last_msg"], r["link"])
         title = fmt.esc(r["title"] or "без названия")
-        name = f'<a href="{html.escape(link, quote=True)}">{title}</a>' if link else (
-            f"<b>{title}</b>"
-        )
-        updated = (f"обновлён {fmt.when(r['last_run'], with_year=True)}" if r["last_run"]
-                   else "история ещё не загружена")
-        lines.append(f"• {name}")
-        lines.append(f"   {fmt.messages_word(r['msgs'])} · {updated}")
-        lines.append(
-            f"   обсуждений: {fmt.fmt_num(r['threads'])}, разобрано: {fmt.fmt_num(r['done'])}, "
-            f"найдено сигналов: {fmt.fmt_num(r['signals'])}"
-        )
+        name = f'<a href="{html.escape(link, quote=True)}">{title}</a>' if link else title
+        lines.append(f"<b>{i}. {name}</b>")
+        lines.append(f"{fmt.messages_word(r['msgs'])}, за сутки {fmt.fmt_num(r['day_msgs'])} · "
+                     f"{fmt.people_word(r['people'])} · {fmt.signals_word(r['signals'])}")
         if not r["is_active"]:
-            lines.append(f"   ⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
+            lines.append(f"⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
+        else:
+            lines.append(f"обновлён {fmt.when(r['last_run'], with_year=True)}" if r["last_run"]
+                         else "история ещё не загружена")
         lines.append("")
-    rows_kb: list[list[tuple[str, str]]] = [
-        [(f"👥 {_short(r['title'] or 'без названия', 22)}", f"ppl:{r['id']}"),
-         ("🗑 Удалить", f"del:{r['id']}")]
+    buttons: list[list[tuple[str, str]]] = [
+        [(f"🗑 Удалить: {_short(r['title'] or 'без названия', 30)}", f"del:{r['id']}")]
         for r in rows
     ]
     if waiting:
@@ -791,13 +772,15 @@ async def cmd_chats(message: Message) -> None:
             note = {"join_pending": " — ждёт одобрения админа чата",
                     "failed": f" — не получилось: {fmt.esc(w['note'] or '')}"}.get(w["status"], "")
             lines.append(f"• {fmt.esc(w['link'])}{note}")
-        rows_kb += [[(f"🗑 Убрать: {_short(w['link'].removeprefix('https://'))}",
+        lines.append("")
+        buttons += [[(f"🗑 Убрать: {_short(w['link'].removeprefix('https://'))}",
                       f"delreq:{w['id']}")] for w in waiting]
         if settings.telegram_ready:
-            rows_kb.append([("🔌 Подключить сейчас", "connect:saved")])
+            buttons.append([("🔌 Подключить сейчас", "connect:saved")])
+    lines.append("➕ <b>Добавить чат</b> — " + ADD_HINT[0].lower() + ADD_HINT[1:])
     text = "\n".join(lines).rstrip()
-    if rows_kb:
-        await _reply_long(message, text, reply_markup=_kb(*rows_kb))
+    if buttons:
+        await _reply_long(message, text, reply_markup=_kb(*buttons))
     else:
         await _reply_long(message, text)
 
@@ -877,11 +860,6 @@ LINK_FILTER = F.text.regexp(
 
 # Токен -> ссылка: callback_data ограничен 64 байтами, ссылку туда не засунуть.
 _pending_joins: dict[str, str] = {}
-
-
-@router.message(F.text == BTN_ADD)
-async def btn_add(message: Message) -> None:
-    await message.answer("➕ " + ADD_HINT)
 
 
 @router.message(Command("addchat"))
@@ -1164,11 +1142,11 @@ async def cmd_live(message: Message) -> None:
     lines.append(f"Следующие итоги: {fmt.when_next(await live.next_report_at())}"
                  + (" (сегодняшние уже отправлены)" if sent else ""))
     if settings.email_ready:
-        lines.append("Итоги дня в PDF дублирую на почту: "
+        lines.append("Итоги дня отправляю на почту: "
                      + fmt.esc(", ".join(settings.email_recipients)))
     else:
-        lines.append("На почту не отправляю: в .env не заданы REPORT_EMAIL_TO, SMTP_USER и "
-                     "SMTP_PASSWORD.")
+        lines.append("Почта не настроена — итоги дня приходят сюда. Нужны REPORT_EMAIL_TO, "
+                     "SMTP_USER и SMTP_PASSWORD в .env.")
     toggle = ("⏸ Поставить на паузу", "live:off") if on else ("▶️ Включить", "live:on")
     rows = [[toggle], [("📤 Итоги дня сейчас", "live:report")]]
     if settings.email_ready:
@@ -1178,15 +1156,20 @@ async def cmd_live(message: Message) -> None:
 
 @router.message(F.text == BTN_SEND_NOW)
 async def btn_send_now(message: Message, bot: Bot) -> None:
-    """Временная кнопка для проверки: итоги за последние сутки прямо сейчас —
-    в Telegram и на почту. Расписание не трогает."""
+    """Кнопка из прошлой версии — у кого-то ещё может висеть старая клавиатура."""
+    await _report_now(message, bot)
+
+
+async def _report_now(message: Message, bot: Bot, catch_up: bool = False) -> None:
+    """Итоги за последние сутки прямо сейчас — на почту. catch_up — сегодняшние,
+    пропавшие из-за смены времени: считаются отправленными. Расписание не трогает."""
     from . import delivery, live
 
     head = "📤 Собираю итоги за последние сутки…"
     job_id, progress = await _start_live(message, head)
-    task = asyncio.ensure_future(
-        jobs.run_job(live.build_report(mark_sent=False, job_id=job_id))
-    )
+    task = asyncio.ensure_future(jobs.run_job(
+        live.build_report(mark_sent=catch_up, catch_up=catch_up, job_id=job_id)
+    ))
     try:
         shown = ""
         while not task.done():  # показываем, на каком шаге сбор
@@ -1208,14 +1191,12 @@ async def btn_send_now(message: Message, bot: Bot) -> None:
     finally:
         if not task.done():
             task.cancel()
-    emailed = await delivery.deliver(bot, [message.chat.id], report, email=True)
-    note = "✅ Готово — итоги за последние сутки ниже."
-    if emailed:
-        note += " Копия ушла на почту: " + fmt.esc(", ".join(settings.email_recipients)) + "."
-    elif not settings.email_ready:
-        note += " На почту не отправлял: она не настроена."
-    note += " Отчёт по расписанию придёт как обычно."
-    await progress.set(note, final=True)
+    if await delivery.deliver(bot, [message.chat.id], report):
+        await progress.set("✅ Итоги за последние сутки ушли на почту: "
+                           + fmt.esc(", ".join(settings.email_recipients))
+                           + ". Отчёт по расписанию придёт как обычно.", final=True)
+    else:
+        await progress.set("Итоги за последние сутки — ниже.", final=True)
 
 
 @router.callback_query(F.data == "live:mail")
@@ -1257,26 +1238,12 @@ async def cb_live_toggle(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.in_({"live:report", "live:catchup"}))
 async def cb_live_report(call: CallbackQuery, bot: Bot) -> None:
-    """live:report — показать сейчас (по расписанию всё равно придут);
-    live:catchup — сегодняшние, пропавшие из-за смены времени: их и на почту."""
-    from . import delivery, live
-
+    """live:report — итоги сейчас (по расписанию всё равно придут);
+    live:catchup — сегодняшние, пропавшие из-за смены времени."""
     await call.answer()
     await _drop_markup(call)
-    if call.message is None:
-        return
-    catch_up = call.data == "live:catchup"
-    status = await call.message.answer("📤 Собираю итоги дня…")
-    try:
-        report = await jobs.run_job(live.build_report(mark_sent=catch_up, catch_up=catch_up))
-    except jobs.Busy as e:
-        await status.edit_text(_busy(e))
-        return
-    except Exception as e:  # noqa: BLE001
-        await status.edit_text(f"❌ Не получилось собрать: {fmt.esc(e)}")
-        return
-    await status.delete()
-    await delivery.deliver(bot, [call.message.chat.id], report, email=catch_up)
+    if call.message is not None:
+        await _report_now(call.message, bot, catch_up=call.data == "live:catchup")
 
 
 # ------------------------------------------------------ участники чатов
@@ -1369,14 +1336,12 @@ async def cmd_who(message: Message, command: CommandObject) -> None:
         await _send_person(message, label)
 
 
-@router.message(F.text == BTN_PERSON)
+@router.message(F.text.in_({BTN_PERSON, BTN_PERSON_OLD}))
 async def btn_person(message: Message) -> None:
     await message.answer(
-        f"{PERSON_PROMPT}\n\nПришли одним сообщением @username, а дальше через запятую — "
-        f"компания, роль и заметка, что знаешь:\n{PERSON_EXAMPLES}\n\n"
-        "Можно по строкам: первая — @username, потом компания, роль, заметка. "
-        "Вместо @username подойдёт /who_… из подписи под цитатой. "
-        "Не присланное не меняется.",
+        f"{PERSON_PROMPT}\n\nПришли @username человека — например <i>@ivan_optika</i> "
+        "или ссылку t.me/ivan_optika. Потом я спрошу, кто это.\n\n"
+        "Ника нет — подойдёт /who_… из подписи под цитатой в отчёте.",
         reply_markup=CANCEL_KB,
     )
     _await_answer(message.from_user, "person")
@@ -1393,9 +1358,8 @@ async def _person_info(message: Message, text: str) -> None:
     parsed = people.parse_person_info(text)
     if parsed is None:
         await message.answer(
-            f"{PERSON_PROMPT}\n\nНе вижу @username в начале. Напиши так:\n"
-            f"{PERSON_EXAMPLES}\n\nЕсли ника нет — открой карточку человека через /who_… "
-            "под его цитатой или в 👥 списке участников чата.",
+            f"{PERSON_PROMPT}\n\nНе вижу @username. Пришли ник человека, например "
+            "<i>@ivan_optika</i>. Ника нет — подойдёт /who_… из подписи под цитатой.",
             reply_markup=CANCEL_KB,
         )
         _await_answer(message.from_user, "person")
@@ -1416,20 +1380,55 @@ async def _person_info(message: Message, text: str) -> None:
         if label is None:
             where = ("ни среди участников чатов, ни в Telegram" if settings.telegram_ready
                      else "среди участников подключённых чатов")
-            await message.answer(f"🤔 Не нашёл @{fmt.esc(username)} {where}. Проверь ник.")
+            await message.answer(f"🤔 Не нашёл @{fmt.esc(username)} {where}. Проверь ник и "
+                                 "пришли ещё раз.", reply_markup=CANCEL_KB)
+            _await_answer(message.from_user, "person")
             return
-    await _save_person(message, label, rest)
-
-
-async def _save_person(message: Message, label: str, rest: str) -> None:
-    company, role, note = people.parse_fields(rest)
-    if not (company or role or note):
-        await _send_person(message, label)
+    if rest:  # «@ivan_optika владелец Оптики Люкс» — сразу одним сообщением
+        await _save_person(message, label, rest)
         return
-    if not await people.update_info(await db.get_pool(), label, company, role, note):
+    pool = await db.get_pool()
+    who = await pool.fetchrow("select * from authors where author_label = $1", label)
+    if who is None:
         await message.answer("Такого участника нет в базе.")
         return
-    await _send_person(message, label, prefix="✅ Сохранил.\n\n")
+    name = fmt.esc(who["name"] or "участник " + label.removeprefix("u:"))
+    if who["username"]:
+        name += f" (@{fmt.esc(who['username'])})"
+    known = ", ".join(x for x in (who["role"], who["company"]) if x)
+    now = f"Сейчас записано: {fmt.esc(known)}" if known else "Пока ничего не записано"
+    if who["note"]:
+        now += f"\nЗаметка: {fmt.esc(who['note'])}"
+    await message.answer(
+        f"👤 <b>{name}</b>\n{now}\n\nТеперь напиши, кто это и что о человеке известно — "
+        "своими словами. Например: <i>владелец сети «Оптика Люкс» в Казани, 3 салона, "
+        "закупает оправы у Essilor</i>",
+        reply_markup=CANCEL_KB,
+    )
+    _await_answer(message.from_user, "about:" + label)
+
+
+async def _save_person(message: Message, label: str, text: str) -> None:
+    """Описание своими словами: нейросеть выделяет компанию и роль, остальное —
+    в заметку. В отчётах подпись «Имя · компания, роль», при разборе модель
+    знает, кто есть кто."""
+    pool = await db.get_pool()
+    if not await pool.fetchval("select 1 from authors where author_label = $1", label):
+        await message.answer("Такого участника нет в базе.")
+        return
+    status = await message.answer("⏳ Записываю…")
+    company, role, details, understood = await jobs.describe_person(text)
+    await people.update_info(pool, label, company, role, details)
+    try:
+        await status.delete()
+    except TelegramAPIError:
+        pass
+    if understood:
+        prefix = "✅ Записал.\n\n"
+    else:
+        prefix = ("✅ Записал всё описание в заметку: нейросеть сейчас не ответила. "
+                  "Компанию и роль можно указать кнопкой ✏️.\n\n")
+    await _send_person(message, label, prefix=prefix)
 
 
 @router.callback_query(F.data.startswith("pe:") | F.data.startswith("pn:"))

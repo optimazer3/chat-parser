@@ -114,6 +114,12 @@ def _styles() -> dict[str, ParagraphStyle]:
         "card_title": ParagraphStyle("card_title", base, fontName=BOLD, fontSize=11.5,
                                      leading=15),
         "meta": ParagraphStyle("meta", base, fontSize=8.8, leading=12, textColor=INK2),
+        "meta_b": ParagraphStyle("meta_b", base, fontName=BOLD, fontSize=8.8, leading=12,
+                                 textColor=INK2),
+        "bullet_s": ParagraphStyle("bullet_s", base, fontSize=9.2, leading=12.5,
+                                   leftIndent=11, bulletIndent=0, spaceAfter=1),
+        "h3": ParagraphStyle("h3", base, fontName=BOLD, fontSize=11, leading=14,
+                             spaceBefore=12, spaceAfter=2, keepWithNext=1),
         "quote": ParagraphStyle("quote", base, fontName=ITALIC, fontSize=10, leading=14),
         "cell": ParagraphStyle("cell", base, fontSize=9.5, leading=12.5),
         "cell_head": ParagraphStyle("cell_head", base, fontSize=8, leading=10,
@@ -255,6 +261,50 @@ def _cards_flow(head: list[Any], i: int, card: Table) -> list[Any]:
     return [Spacer(1, 8), KeepTogether(card)]
 
 
+def _listing(title: str, items: list[str] | None, st: dict[str, ParagraphStyle]) -> list[Any]:
+    """«Заголовок:» и пункты — для полей карточки боли."""
+    items = [x for x in (items or []) if str(x).strip()]
+    if not items:
+        return []
+    return ([Spacer(1, 5), Paragraph(_t(title) + ":", st["meta_b"])]
+            + [Paragraph(_t(x), st["bullet_s"], bulletText="•") for x in items])
+
+
+def _by_pain(signals: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]], int | None]]:
+    """Сигналы по болям в порядке выдачи; без боли — в конце."""
+    groups: dict[int | None, list[dict[str, Any]]] = {}
+    for x in signals:
+        groups.setdefault(x.get("cluster_id"), []).append(x)
+    out = [(items[0].get("pain_label") or "Без названия", items, cid)
+           for cid, items in groups.items() if cid is not None]
+    if None in groups:
+        out.append(("Пока не привязаны к боли", groups[None], None))
+    return out
+
+
+def _signal_table(items: list[dict[str, Any]], st: dict[str, ParagraphStyle], width: float,
+                  who_link) -> Table:
+    rows = []
+    for x in items:
+        kind = fmt.TYPE_RU.get(x["type"], x["type"])
+        who = fmt.AUDIENCE_RU.get(x["audience"], x["audience"])
+        meta = f"{kind} · {who} · острота {x['intensity']} из 5"
+        if x.get("chat_title"):
+            meta += f" · {x['chat_title']}"
+        cell = [Paragraph(_t(meta), st["meta"]), Paragraph(_t(x["summary"]), st["body"])]
+        cell += _quote(x, st, width, who_link)
+        rows.append([cell])
+    t = Table(rows, colWidths=[width])
+    t.setStyle(TableStyle([
+        ("LINEBELOW", (0, 0), (-1, -2), 0.5, HAIR),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return t
+
+
 def _num(st: dict[str, ParagraphStyle], value: int, muted: bool = False) -> Paragraph:
     style = ParagraphStyle("n", st["cell"], alignment=2,
                            textColor=MUTED if muted else INK)
@@ -270,7 +320,8 @@ def _date_line(day: datetime) -> str:
 
 def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
            bot_username: str | None = None) -> bytes:
-    """PDF итогов дня. data — из report.daily.collect (+ highlights, since, until)."""
+    """PDF итогов дня. data — из report.daily.collect (+ summary, highlights,
+    opportunities, since, until)."""
     notes = notes or {}
     st = _styles()
     day: datetime = data["day"]
@@ -299,15 +350,26 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
     total = sum(data["types"].values())
     story.append(Tiles([
         (fmt.fmt_num(msgs), "сообщений"),
+        (fmt.fmt_num(data.get("people_total", 0)), "участников"),
         (fmt.fmt_num(threads), "обсуждений"),
         (fmt.fmt_num(total), "сигналов"),
         (fmt.fmt_num(len(data["new_pains"])), "новых болей"),
     ]))
 
-    if data.get("highlights"):
-        rows: list[Any] = [Paragraph("Главное за день", st["card_title"]), Spacer(1, 4)]
-        rows += [Paragraph(_t(h), st["bullet"], bulletText="•") for h in data["highlights"]]
+    if data.get("summary") or data.get("highlights"):
+        rows: list[Any] = [Paragraph("Главное за сутки", st["card_title"]), Spacer(1, 4)]
+        if data.get("summary"):
+            rows += [Paragraph(_t(data["summary"]), st["body"]), Spacer(1, 6)]
+        rows += [Paragraph(_t(h), st["bullet"], bulletText="•")
+                 for h in data.get("highlights", [])]
         story += [Spacer(1, 14), _card(rows, width, bar=ACCENT)]
+    if data.get("opportunities"):
+        rows = [Paragraph("Возможности для бизнеса", st["card_title"]),
+                Paragraph("Что можно предложить этим людям — прямо из сигналов суток.",
+                          st["meta"]), Spacer(1, 4)]
+        rows += [Paragraph(_t(x), st["bullet"], bulletText="•")
+                 for x in data["opportunities"]]
+        story += [Spacer(1, 10), _card(rows, width)]
 
     # чаты
     story.append(Paragraph("Чаты", st["h2"]))
@@ -324,15 +386,16 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
             if quiet:
                 name += ' <font color="#898781">· тишина</font>'
             body.append([Paragraph(name, st["cell"]), _num(st, c["msgs"], quiet),
-                         _num(st, c["threads"], quiet), _num(st, c["signals"], quiet)])
-        story.append(_table(["Чат", "Сообщений", "Обсуждений", "Сигналов"], body,
-                            [width * 0.52, width * 0.16, width * 0.16, width * 0.16], st))
+                         _num(st, c.get("people", 0), quiet), _num(st, c["threads"], quiet),
+                         _num(st, c["signals"], quiet)])
+        story.append(_table(["Чат", "Сообщений", "Участников", "Обсуждений", "Сигналов"], body,
+                            [width * 0.40] + [width * 0.15] * 4, st))
 
     # о чём говорили
     if data["topics"]:
         story += [
             Paragraph("О чём говорили", st["h2"]),
-            Paragraph("Сигналов за день по болям", st["lead"]),
+            Paragraph("Сигналов за сутки по болям", st["lead"]),
             bar_chart([(t["label"], t["n"]) for t in data["topics"]], width),
         ]
 
@@ -351,8 +414,15 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
                 Paragraph(_a(_t(p["label"]), link, color="#0b0b0b"), st["card_title"]),
                 Paragraph(meta, st["meta"]),
             ]
-            if p.get("quote"):
-                rows += _quote(p["quote"], st, width, who_link)
+            card = p.get("card") or {}
+            statement = card.get("statement") or p.get("statement")
+            if statement:
+                rows += [Spacer(1, 4), Paragraph(_t(statement), st["body"])]
+            rows += _listing("Как сейчас выкручиваются", card.get("current_workarounds"), st)
+            for q in p.get("quotes") or ([p["quote"]] if p.get("quote") else []):
+                rows += _quote(q, st, width, who_link)
+            rows += _listing("Что можно предложить", card.get("product_hypotheses"), st)
+            rows += _listing("Что стоит выяснить", card.get("open_questions"), st)
             story += _cards_flow(head, i, _card(rows, width))
 
     # острые сигналы
@@ -391,14 +461,52 @@ def render(data: dict[str, Any], notes: dict[str, Any] | None = None,
         story.append(_table(["Боль", "За сутки", "Обычно"], body,
                             [width * 0.55, width * 0.15, width * 0.30], st))
 
+    # все сигналы суток, по болям
+    if data.get("signals"):
+        story.append(Paragraph("Все сигналы за сутки", st["h2"]))
+        story.append(Paragraph("Сгруппированы по болям, внутри — самые острые первыми.",
+                               st["lead"]))
+        for title, items, cluster_id in _by_pain(data["signals"]):
+            label = _t(title)
+            if cluster_id:
+                label = _a(label, bot_link(f"pain_{cluster_id}"), color="#0b0b0b")
+            story.append(Paragraph(f"{label} · {_t(fmt.signals_word(len(items)))}", st["h3"]))
+            story.append(_signal_table(items, st, width, who_link))
+
+    # кто писал
+    if data.get("people"):
+        story.append(Paragraph("Кто писал за сутки", st["h2"]))
+        story.append(Paragraph(
+            "Сведения о людях добавляются в боте кнопкой «Добавить инфо о человеке» — "
+            "они попадают в отчёт и учитываются при разборе.", st["lead"]))
+        body = []
+        for x in data["people"]:
+            name = _t(x.get("a_name") or "участник " + x["author_label"].removeprefix("u:"))
+            name = _a(name, who_link(x["author_label"]), color="#0b0b0b")
+            if x.get("username"):
+                name += f'<br/><font color="#898781">@{_t(x["username"])}</font>'
+            known = ", ".join(v for v in (x.get("a_role"), x.get("a_company")) if v)
+            about = _t(known) if known else '<font color="#898781">нет сведений</font>'
+            if x.get("note"):
+                about += f'<br/><font color="#52514e">{_t(x["note"])}</font>'
+            body.append([Paragraph(name, st["cell"]), Paragraph(about, st["cell"]),
+                         _num(st, x["msgs"]), _num(st, x["signals"], not x["signals"])])
+        story.append(_table(["Участник", "Кто это", "Сообщений", "Сигналов"], body,
+                            [width * 0.30, width * 0.44, width * 0.13, width * 0.13], st,
+                            right_from=2))
+        rest = data.get("people_total", 0) - len(data["people"])
+        if rest > 0:
+            story.append(Paragraph(_t(f"И ещё {fmt.people_word(rest)} с меньшим числом "
+                                      "сообщений."), st["small"]))
+
     # итог и заметки
     story.append(Spacer(1, 14))
     if total:
         parts = [f"{fmt.TYPE_RU.get(k, k)} — {v}" for k, v in data["types"].items()]
-        story.append(Paragraph(_t(f"Всего за день: {fmt.signals_word(total)} ("
+        story.append(Paragraph(_t(f"Всего за сутки: {fmt.signals_word(total)} ("
                                   + ", ".join(parts) + ")."), st["small"]))
     else:
-        story.append(Paragraph(_t(f"Новых сигналов нет. Сообщений за день: {msgs}."),
+        story.append(Paragraph(_t(f"Новых сигналов нет. Сообщений за сутки: {msgs}."),
                                st["small"]))
 
     warnings = _warnings(notes)

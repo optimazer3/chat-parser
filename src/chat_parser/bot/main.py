@@ -56,9 +56,9 @@ async def _broadcast(bot: Bot, text: str) -> None:
 
 
 async def send_report(bot: Bot, mark_sent: bool = True) -> DailyReport:
-    """Итоги дня всем админам: PDF в Telegram и, если настроено, на почту."""
+    """Итоги дня на почту (в Telegram — только если почта не сработала)."""
     report = await jobs.run_job(live.build_report(mark_sent))
-    await delivery.deliver(bot, settings.admin_ids, report, email=mark_sent)
+    await delivery.deliver(bot, settings.admin_ids, report)
     return report
 
 
@@ -100,12 +100,10 @@ async def announce_keyboard(bot: Bot) -> None:
         try:
             await bot.send_message(
                 admin,
-                f"⌨️ Кнопки внизу на месте. Итоги дня приходят в {at} ({clock.tz_label()}) — "
-                "поменять время можно кнопкой ⏰ Время отчёта. Кнопка 👤 Инфо о человеке — "
-                "записать, из какой компании человек и кем работает. Временная кнопка "
-                "📤 Отправить отчёт сейчас — для проверки: итоги за последние сутки сразу, "
-                "расписание не меняется. Если кнопки когда-нибудь пропадут — отправь /start. "
-                "Подробности — /help",
+                f"⌨️ Обновил бота. Итоги дня теперь приходят только на почту, каждый день "
+                f"в {at} ({clock.tz_label()}): обзор в письме и подробный PDF во вложении. "
+                "Внизу две кнопки: ➕ Добавить чат — список чатов с удалением, и 👤 Добавить "
+                "инфо о человеке — кто есть кто попадёт в отчёты. Подробности — /help",
                 reply_markup=MAIN_KB,
             )
         except Exception as e:  # noqa: BLE001

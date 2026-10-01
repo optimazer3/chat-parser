@@ -413,6 +413,9 @@ def fmt_person(c: dict[str, Any]) -> str:
     lines.append(f"Роль: {esc(c['role']) if c.get('role') else '— не указано'}")
     if c.get("note"):
         lines.append(f"Заметка: {esc(c['note'])}")
+    if c.get("company") or c.get("role"):
+        sign = people.display(c.get("name"), label, c.get("company"), c.get("role"))
+        lines.append(f"<i>В отчётах: {esc(sign)}</i>")
     if c.get("company_hint") or c.get("role_hint"):
         hint = ", ".join(esc(x) for x in (c.get("role_hint"), c.get("company_hint")) if x)
         lines += ["", f"💡 <b>Подсказка по словам самого участника:</b> {hint}"]

@@ -24,17 +24,39 @@ from .schema import Extraction
 from .validate import validate, validate_people
 
 
-async def extract_one(llm: LLM, text: str) -> Extraction:
+async def extract_one(llm: LLM, text: str, who: str = "") -> Extraction:
+    """who — блок «Кто есть кто» перед перепиской; цитаты проверяются только по text."""
+    prompt = who + text
     try:
         return await llm.structured(
-            SYSTEM_EXTRACT, text, Extraction, max_tokens=settings.extract_max_tokens
+            SYSTEM_EXTRACT, prompt, Extraction, max_tokens=settings.extract_max_tokens
         )
     except TokenBudgetExhausted:
         # Редкий тяжёлый тред: модель рассуждает дольше обычного. Поднимать лимит
         # для всех тредов дорого, поэтому повторяем только этот.
         return await llm.structured(
-            SYSTEM_EXTRACT, text, Extraction, max_tokens=settings.extract_max_tokens_retry
+            SYSTEM_EXTRACT, prompt, Extraction, max_tokens=settings.extract_max_tokens_retry
         )
+
+
+async def who_is_who(pool: asyncpg.Pool, chat_id: int, message_ids: list[int]) -> str:
+    """Что пользователь записал об авторах треда: псевдоним — роль, компания.
+    Имена и ники в модель не уходят."""
+    rows = await pool.fetch(
+        """
+        select distinct a.author_label, a.role, a.company
+          from messages m join authors a on a.author_hash = m.author_hash
+         where m.chat_id = $1 and m.message_id = any($2::bigint[])
+           and (a.company is not null or a.role is not null)
+         order by a.author_label
+        """,
+        chat_id, message_ids,
+    )
+    if not rows:
+        return ""
+    lines = [f"{r['author_label']} — " + ", ".join(x for x in (r["role"], r["company"]) if x)
+             for r in rows]
+    return "Кто есть кто (сведения от пользователя):\n" + "\n".join(lines) + "\n\nПереписка:\n"
 
 
 async def reset_for_redo(pool: asyncpg.Pool) -> int:
@@ -163,7 +185,7 @@ async def run(
                 await progress(root_id, "пустой тред, пропущен")
                 return
             try:
-                extraction = await extract_one(llm, text)
+                extraction = await extract_one(llm, text, await who_is_who(pool, chat_id, ids))
             except (LLMError, Exception) as e:  # noqa: BLE001 — один тред не валит прогон
                 stats["failed"] += 1
                 await pool.execute(

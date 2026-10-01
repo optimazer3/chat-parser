@@ -238,36 +238,50 @@ async def collect_day(job: dict[str, Any], now: datetime) -> dict[str, Any]:
     return stats
 
 
-async def day_highlights(since: datetime, until: datetime, fresh: datetime) -> list[str]:
-    """3-5 выводов дня от нейросети. Мало сигналов — пропускаем."""
+EMPTY_DIGEST: dict[str, Any] = {"summary": "", "highlights": [], "opportunities": []}
+
+
+async def day_digest(since: datetime, until: datetime, fresh: datetime) -> dict[str, Any]:
+    """Обзор суток, главные выводы и возможности от нейросети. Мало сигналов —
+    пропускаем. Кто автор (роль, компания из сведений пользователя) — тоже даём:
+    так выводы точнее. Имена и ники не уходят."""
     pool = await db.get_pool()
     rows = await pool.fetch(
         """
-        select s.type, s.audience, s.intensity, s.summary, c.label pain
+        select s.type, s.audience, s.intensity, s.summary, c.label pain, a.role, a.company
           from signals s left join clusters c on c.id = s.cluster_id
+          left join authors a on a.author_label = s.author_label
          where s.created_at >= $1 and s.created_at < $2 and s.ts >= $3
            and s.confidence >= 0.5
-         order by s.intensity desc, s.id limit 150
+         order by s.intensity desc, s.id limit 200
         """,
         since, until, fresh,
     )
     if len(rows) < 3:
-        return []
-    listing = "\n".join(
-        f"- [{r['type']}, {r['audience']}, острота {r['intensity']}]"
-        + (f" (боль: {r['pain']})" if r["pain"] else "") + f" {r['summary']}"
-        for r in rows
-    )
+        return dict(EMPTY_DIGEST)
+
+    def line(r) -> str:
+        who = ", ".join(x for x in (r["role"], r["company"]) if x)
+        return (f"- [{r['type']}, {r['audience']}, острота {r['intensity']}]"
+                + (f" (автор: {who})" if who else "")
+                + (f" (боль: {r['pain']})" if r["pain"] else "") + f" {r['summary']}")
+
+    listing = "\n".join(line(r) for r in rows)
     llm = build_llm(settings.synth_model)
     started, finished = time.monotonic(), False
     try:
-        digest = await llm.structured(SYSTEM_DAY, f"Сигналы за день:\n{listing}", DayDigest,
+        digest = await llm.structured(SYSTEM_DAY, f"Сигналы за сутки:\n{listing}", DayDigest,
                                       max_tokens=8000)
         finished = True
-        return [h.strip() for h in digest.highlights if h.strip()][:5]
     finally:
         await usage.record(pool, "digest", llm, seconds=time.monotonic() - started,
                            cancelled=not finished, source="live")
+    return {"summary": digest.summary.strip(), "highlights": _items(digest.highlights, 7),
+            "opportunities": _items(digest.opportunities, 4)}
+
+
+def _items(items: list[str], limit: int) -> list[str]:
+    return [x.strip() for x in items if x.strip()][:limit]
 
 
 # ------------------------------------------------------------ дневной отчёт
@@ -291,7 +305,7 @@ async def build_report(mark_sent: bool = True, catch_up: bool = False,
         fresh = now - CONTEXT
 
         run = await collect_day(job, now)
-        highlights: list[str] = []
+        digest = dict(EMPTY_DIGEST)
         if not run["paused"]:
             # Раскладка по болям, описания новых болей и выводы дня нужны самому
             # отчёту, поэтому идут и при исчерпанном лимите: это единицы запросов.
@@ -308,12 +322,13 @@ async def build_report(mark_sent: bool = True, catch_up: bool = False,
         if not run["paused"]:
             job["progress"] = "пишу выводы дня"
             try:
-                highlights = await day_highlights(since, until, fresh)
+                digest = await day_digest(since, until, fresh)
             except Exception as e:  # noqa: BLE001 — отчёт важнее выводов
                 log.warning("выводы дня не получились: %s", e)
 
+        job["progress"] = "собираю отчёт"
         data = await daily.collect(pool, since, until, fresh)
-        data.update(highlights=highlights, since=since, until=until)
+        data.update(digest, since=since, until=until)
         backlog = await pool.fetchval(
             "select count(*) from threads where status = 'pending' and ended_at < $1", fresh
         )

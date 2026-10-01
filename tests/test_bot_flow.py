@@ -56,8 +56,10 @@ async def harness(monkeypatch, tmp_path):
     from chat_parser import db
     from chat_parser.analyze.schema import (
         AssignItem, Assignment, Card, ClusterDraft, Clustering, DayDigest, Extraction,
-        Merging, PersonHint, Signal,
+        Merging, PersonAbout, PersonHint, Signal,
     )
+    from chat_parser.llm import LLMError
+    from chat_parser.people import parse_fields
     from chat_parser.bot import jobs
     from chat_parser.bot.auth import AdminOnly
     from chat_parser.bot.handlers import router
@@ -110,7 +112,9 @@ async def harness(monkeypatch, tmp_path):
                 for sid, text in re.findall(r"^(\d+)\t\w+\t(.*)$", known[1], re.M)
             ])
         if schema is DayDigest:
-            return DayDigest(highlights=["Поставщики срывают сроки, владельцы теряют клиентов",
+            return DayDigest(summary="Сутки прошли под знаком поставок и нехватки приборов.",
+                             opportunities=["Региональный склад оправ с доставкой за 3 дня"],
+                             highlights=["Поставщики срывают сроки, владельцы теряют клиентов",
                                          "Не хватает диагностических приборов"])
         if schema is Merging:
             return Merging(groups=[])
@@ -119,6 +123,11 @@ async def harness(monkeypatch, tmp_path):
             return Card(title="t", statement="s", who="владельцы", when="при открытии",
                         current_workarounds=["возят прибор"], evidence_ids=ids,
                         product_hypotheses=["аренда"], open_questions=["сколько салонов"])
+        if schema is PersonAbout:
+            if state.get("person_fail"):
+                raise LLMError("модель не ответила")
+            company, role, details = parse_fields(user)
+            return PersonAbout(company=company or "", role=role or "", details=details or "")
         raise AssertionError(schema)
 
     monkeypatch.setattr(LLM, "structured", fake_structured)
@@ -392,7 +401,8 @@ async def test_stop_button_during_extract(harness, monkeypatch):
 
 async def test_add_chat_without_api_keys_is_remembered(harness):
     h = harness
-    assert "Пришли ссылку на чат" in await h.say("➕ Добавить чат")
+    out = await h.say("➕ Добавить чат")
+    assert "Чаты, за которыми я слежу</b> · 0" in out and "пришли ссылку на чат" in out
 
     out = await h.say("https://t.me/Optika_Pro/")
     assert "Запомнил: https://t.me/optika_pro" in out and "ключи Telegram API" in out
@@ -488,7 +498,7 @@ async def test_add_public_chat_loads_history(harness, telegram_api):
 
     chats = await h.say("/chats")
     assert '<a href="https://t.me/optika_pro">Оптики Про</a>' in chats
-    assert "3 сообщения" in chats and "обсуждений: 1" in chats and "сообщ." not in chats
+    assert "3 сообщения, за сутки 0 · 3 человека · 0 сигналов" in chats and "сообщ." not in chats
     assert telegram_api == []  # в открытый чат вступать не пришлось
 
 
@@ -561,7 +571,9 @@ TODAY = [  # (автор, текст, ответ на)
 
 @pytest.fixture
 async def evening(harness, telegram_api, monkeypatch):
-    """Аккаунт-сборщик «читает» чаты: сегодня в «Оптиках Про» пять сообщений."""
+    """Аккаунт-сборщик «читает» чаты: сегодня в «Оптиках Про» пять сообщений.
+    Почта настроена, письма перехватываются в h.letters."""
+    from chat_parser import mailer
     from chat_parser.bot import live
     from chat_parser.config import settings
     from chat_parser.ingest import collector
@@ -569,6 +581,11 @@ async def evening(harness, telegram_api, monkeypatch):
 
     h = harness
     monkeypatch.setattr(settings, "live_quiet_minutes", 0)
+    monkeypatch.setattr(settings, "report_email_to", "owner@example.com")
+    monkeypatch.setattr(settings, "smtp_user", "bot@gmail.com")
+    monkeypatch.setattr(settings, "smtp_password", "app-password")
+    h.letters = []
+    monkeypatch.setattr(mailer, "_send_sync", h.letters.append)
     monkeypatch.setattr(live, "connect_client", telegram_api_client)
     await h.pool.execute("insert into chats (id, title, username) values ($1, $2, $3)",
                          PRO, "Оптики Про", "optika_pro")
@@ -598,6 +615,11 @@ async def evening(harness, telegram_api, monkeypatch):
 
     monkeypatch.setattr(collector, "sync_chat", sync_chat)
     return h
+
+
+def letter_pdf(letter) -> bytes:
+    (att,) = list(letter.iter_attachments())
+    return att.get_content()
 
 
 def pdf_text(pdf: bytes) -> str:
@@ -649,10 +671,11 @@ async def test_evening_report(evening, monkeypatch):
     h.session.sent.clear()
     report = await main.send_report(h.bot)
     text = report.text
-    # админу пришёл один PDF с короткой подписью
-    assert h.session.sent == [report.caption]
-    (name, pdf, _), = h.session.files
-    assert name == report.filename and pdf.startswith(b"%PDF")
+    # отчёт ушёл на почту одним письмом с PDF, в Telegram — ничего
+    assert h.session.sent == [] and h.session.files == []
+    (letter,) = h.letters
+    (att,) = list(letter.iter_attachments())
+    assert att.get_filename() == report.filename and att.get_content().startswith(b"%PDF")
 
     # переписка: чат без загруженной истории — сутки и сутки контекста, архивный — с курсора
     modes = {chat_id: (mode, since) for chat_id, mode, since in h.calls}
@@ -706,8 +729,9 @@ async def test_evening_report(evening, monkeypatch):
     out = await h.say("/live")
     assert "включено" in out and "сегодняшние уже отправлены" in out and "[live:report]" in out
     assert "Следующие итоги: завтра в 22:00" in out
-    await h.press("live:report")
-    again = pdf_text(h.session.files[-1][1])
+    out = await h.press("live:report")
+    assert "ушли на почту: owner@example.com" in out and h.session.files == []
+    again = pdf_text(letter_pdf(h.letters[-1]))
     assert "тишина" not in again.split("Оптики Про")[1][:20]
     assert "Срыв сроков поставки" in again and "Новых сигналов нет" not in again
     assert [m for c, m, _ in h.calls if c == PRO] == ["recent", "incremental"]
@@ -821,8 +845,11 @@ async def test_delete_chat_from_list(evening):
     await live.build_report()
     await h.pool.execute("insert into chat_requests (link) values ('https://t.me/optika_new')")
 
-    chats = await h.say("💬 Список чатов")
-    assert f"[ppl:{PRO}] [del:{PRO}]" in chats and "[delreq:" in chats
+    chats = await h.say("➕ Добавить чат")
+    assert '<a href="https://t.me/optika_pro">Оптики Про</a></b>' in chats
+    assert "5 сообщений, за сутки 5 · 3 человека · 5 сигналов" in chats
+    assert f"[del:{PRO}]" in chats and "[delreq:" in chats and "[ppl:" not in chats
+    assert "🗑 Удалить: Оптики Про" in h.session.labels
 
     out = await h.press(f"del:{PRO}")
     assert "Удалить чат <b>Оптики Про</b>?" in out and f"[delok:{PRO}]" in out
@@ -839,7 +866,7 @@ async def test_delete_chat_from_list(evening):
 
     req = await h.pool.fetchval("select id from chat_requests")
     assert "Убрал из ожидания: https://t.me/optika_new" in await h.press(f"delreq:{req}")
-    chats = await h.say("💬 Список чатов")
+    chats = await h.say("➕ Добавить чат")
     assert "Оптики Про" not in chats and "Ждут подключения" not in chats
 
 
@@ -972,53 +999,7 @@ async def test_report_loop_wakes_on_new_time(harness, monkeypatch):
         loop.cancel()
 
 
-# ------------------------------------------------------ сведения о людях
-
-
-async def test_person_info_by_username(evening):
-    from chat_parser.bot import live
-    from chat_parser.config import settings
-    from chat_parser.pii import author_hash, author_label
-
-    h = evening
-    await live.build_report(mark_sent=False)  # участники уже писали, их ники в базе
-
-    prompt = await h.say("👤 Инфо о человеке")
-    assert prompt.startswith("👤 Информация о человеке") and "@ivan_optika Оптика Люкс" in prompt
-    out = await h.say("@ivan_optika Оптика Люкс, владелец, знакомы по выставке")
-    assert "✅ Сохранил." in out and "👤 <b>Иван Петров</b> (@ivan_optika)" in out
-    assert "Компания: Оптика Люкс" in out and "Роль: владелец" in out
-    assert "Заметка: знакомы по выставке" in out
-    assert "по словам самого участника" not in out  # внесли сами — подсказка не нужна
-
-    # и без ответа на подсказку; регистр ника не важен; не присланное не меняется
-    out = await h.say("@IVAN_OPTIKA роль: продавец")
-    assert "Компания: Оптика Люкс" in out and "Роль: продавец" in out
-    assert "Заметка: знакомы по выставке" in out
-    out = await h.say("/who_bbbbbbbb Линзы Плюс")
-    assert "👤 <b>Мария</b>" in out and "Компания: Линзы Плюс" in out
-    await h.say("👤 Инфо о человеке")
-    out = await h.say("@olga")  # в ответ на подсказку один ник — просто карточка
-    assert "Ольга Смирнова" in out and "Сохранил" not in out
-    await h.say("👤 Инфо о человеке")
-    assert "Не вижу @username" in await h.say("Иван Петров, Оптика Люкс")
-    out = await h.say("@maria_opt Линзы Плюс")  # после подсказки об ошибке ждём снова
-    assert "Не нашёл @maria_opt" in out
-
-    # ещё не писал в чатах — нашёлся в Telegram, сведения записаны заранее
-    out = await h.say("@petr_lens Линзы Центр, закупщик")
-    assert "👤 <b>Пётр Смирнов</b> (@petr_lens)" in out and "Компания: Линзы Центр" in out
-    assert "пока нет сообщений" in out
-    label = author_label(author_hash(555, settings.author_salt))
-    assert await h.pool.fetchval(
-        "select role from authors where author_label = $1", label) == "закупщик"
-    out = await h.say("@nobody_here Оптика")
-    assert "Не нашёл @nobody_here ни среди участников чатов, ни в Telegram" in out
-    assert "чат или канал" in await h.say("@optika_news Новости")
-
-    assert "— Иван Петров · Оптика Люкс, продавец /who_aaaaaaaa" in await h.say("/signals 30")
-    # один @ник без текста — по-прежнему добавление чата
-    assert "Подключил чат" in await h.say("@optika_pro")
+# ------------------------------------------------------ подсказки бота
 
 
 async def test_prompts_keep_keyboard_and_can_be_left(harness, monkeypatch):
@@ -1028,7 +1009,7 @@ async def test_prompts_keep_keyboard_and_can_be_left(harness, monkeypatch):
 
     h = harness
     await h.press("rt:custom")
-    assert "Чатов пока нет" in await h.say("💬 Список чатов")  # кнопка сработала как обычно
+    assert "Пока ни одного" in await h.say("➕ Добавить чат")  # кнопка сработала как обычно
     assert await h.say("21:30") == ""  # это уже не ответ на подсказку
     assert await live.report_time() == (22, 0)
 
@@ -1051,118 +1032,180 @@ async def test_prompts_keep_keyboard_and_can_be_left(harness, monkeypatch):
     assert await live.report_time() == (21, 30)
 
 
-# ------------------------------------------------------- PDF и почта
+# ------------------------------------------------- сведения о людях
 
 
-async def test_report_pdf_and_email(evening, monkeypatch):
+async def test_person_info_in_two_steps(evening):
+    from chat_parser.bot import live
+    from chat_parser.config import settings
+    from chat_parser.pii import author_hash, author_label
+
+    h = evening
+    await live.build_report(mark_sent=False)  # участники уже писали, их ники в базе
+
+    prompt = await h.say("👤 Добавить инфо о человеке")
+    assert prompt.startswith("👤 Информация о человеке") and "Пришли @username" in prompt
+    out = await h.say("@ivan_optika")
+    assert "👤 <b>Иван Петров (@ivan_optika)</b>" in out and "Теперь напиши, кто это" in out
+    out = await h.say("Оптика Люкс, владелец, знакомы по выставке")
+    assert "✅ Записал." in out and "Компания: Оптика Люкс" in out and "Роль: владелец" in out
+    assert "Заметка: знакомы по выставке" in out
+    assert "В отчётах: Иван Петров · Оптика Люкс, владелец" in out
+    assert "по словам самого участника" not in out  # внесли сами — подсказка не нужна
+
+    # сразу одним сообщением; не присланное не меняется, заметка дописывается
+    out = await h.say("@IVAN_OPTIKA роль: продавец")
+    assert "Компания: Оптика Люкс" in out and "Роль: продавец" in out
+    out = await h.say("@ivan_optika заметка: закупает оправы у Essilor")
+    assert "Заметка: знакомы по выставке\nзакупает оправы у Essilor" in out
+    out = await h.say("/who_bbbbbbbb Линзы Плюс")
+    assert "👤 <b>Мария</b>" in out and "Компания: Линзы Плюс" in out
+
+    # нейросеть не ответила — описание целиком в заметке, ничего не потеряно
+    h.state["person_fail"] = True
+    await h.say("👤 Добавить инфо о человеке")
+    await h.say("@olga")
+    out = await h.say("ведёт приём в двух салонах по субботам")
+    assert "нейросеть сейчас не ответила" in out
+    assert "Заметка: ведёт приём в двух салонах по субботам" in out
+    h.state["person_fail"] = False
+
+    # ника нет в базе — ищу в Telegram; не нашёлся — жду другой ник
+    await h.say("👤 Добавить инфо о человеке")
+    out = await h.say("@nobody_here")
+    assert "Не нашёл @nobody_here ни среди участников чатов, ни в Telegram" in out
+    out = await h.say("@petr_lens")  # ещё не писал в чатах — нашёлся в Telegram
+    assert "👤 <b>Пётр Смирнов (@petr_lens)</b>" in out and "Пока ничего не записано" in out
+    out = await h.say("Линзы Центр, закупщик")
+    assert "Компания: Линзы Центр" in out and "пока нет сообщений" in out
+    label = author_label(author_hash(555, settings.author_salt))
+    assert await h.pool.fetchval(
+        "select role from authors where author_label = $1", label) == "закупщик"
+    assert "чат или канал" in await h.say("@optika_news Новости")
+    await h.say("👤 Добавить инфо о человеке")
+    assert "Не вижу @username" in await h.say("Иван Петров из Оптики Люкс")
+
+    assert "— Иван Петров · Оптика Люкс, продавец /who_aaaaaaaa" in await h.say("/signals 30")
+    assert "Подключил чат" in await h.say("@optika_pro")  # один @ник вне подсказки — чат
+
+
+async def test_people_info_used_in_report(evening):
+    """Что записано о людях, видно в отчёте и учитывается моделью; имён она не видит."""
+    from chat_parser.bot import main
+
+    h = evening
+    await h.pool.execute(
+        "insert into authors (author_hash, author_label, name, username, company, role, note) "
+        "values ($1, 'u:aaaaaaaa', 'Иван Петров', 'ivan_optika', 'Оптика Люкс', 'владелец', "
+        "'закупает оправы у Essilor')", "a" * 16)
+    await main.send_report(h.bot)
+
+    prompts = h.state["prompts"]
+    extract = next(p for p in prompts if "Кто есть кто" in p)
+    assert "u:aaaaaaaa — владелец, Оптика Люкс" in extract
+    assert "(автор: владелец, Оптика Люкс)" in next(p for p in prompts if "Сигналы за сутки" in p)
+    joined = "\n".join(prompts)
+    for private in ("Иван", "ivan_optika", "Essilor"):  # имя, ник и заметка — не для модели
+        assert private not in joined, private
+
+    text = pdf_text(letter_pdf(h.letters[-1]))
+    for part in ("Кто писал за сутки", "Иван Петров", "@ivan_optika", "владелец, Оптика Люкс",
+                 "закупает оправы у Essilor", "нет сведений",
+                 "Иван Петров · Оптика Люкс, владелец"):
+        assert part in text, part
+
+
+# ----------------------------------------------- отчёт на почту
+
+
+async def test_report_goes_to_email(evening, monkeypatch):
     import smtplib
 
     from chat_parser import mailer
     from chat_parser.bot import main
-    from chat_parser.config import settings
 
     h = evening
-    monkeypatch.setattr(settings, "report_email_to", "owner@example.com")
-    monkeypatch.setattr(settings, "smtp_user", "bot@gmail.com")
-    monkeypatch.setattr(settings, "smtp_password", "app-password")
-    letters = []
-    monkeypatch.setattr(mailer, "_send_sync", letters.append)
-
     cid = await _old_pain(h)
-    h.session.files.clear()
+    h.session.sent.clear()
     report = await main.send_report(h.bot)
     new_id = await h.pool.fetchval(
         "select id from clusters where label = 'Срыв сроков поставки'")
+    assert h.session.sent == [] and h.session.files == []  # в Telegram ничего
 
-    (name, pdf, caption), = h.session.files
-    assert caption.startswith("📊 <b>Итоги дня") and f"/pain_{new_id}" in caption
-    assert "5 сообщений · 1 обсуждение · 5 сигналов" in caption
+    (letter,) = h.letters
+    assert letter["To"] == "owner@example.com" and "Итоги дня" in letter["Subject"]
+    body = letter.get_body(("html",)).get_content()
+    for part in ("Главное за сутки", "Сутки прошли под знаком поставок", "Возможности для бизнеса",
+                 "Новые боли", "Срыв сроков поставки", "Острые сигналы", "острота 5 из 5",
+                 "Ольга Смирнова", "https://t.me/optika_pro/3", "во вложении (PDF)"):
+        assert part in body, part
+    plain = letter.get_body(("plain",)).get_content()
+    assert "Сутки прошли под знаком поставок" in plain and "Срыв сроков поставки" in plain
+
+    pdf = letter_pdf(letter)
     text = pdf_text(pdf)
-    for part in ("Итоги дня", "Оптики Про", "Поставщики срывают сроки", "Срыв сроков поставки",
-                 "острота 5 из 5", "Ольга Смирнова", "Нехватка оборудования"):
+    for part in ("Главное за сутки", "Возможности для бизнеса", "Новые боли",
+                 "Как сейчас выкручиваются", "возят прибор", "Что можно предложить",
+                 "Острые сигналы", "Всплески", "Все сигналы за сутки", "Кто писал за сутки",
+                 "Ольга Смирнова", "Мария"):
         assert part in text, part
     links = pdf_links(pdf)
-    assert "https://t.me/optika_pro/3" in links  # цитата — ссылка на сообщение
-    assert f"https://t.me/test_bot?start=pain_{new_id}" in links  # боль — карточка в боте
+    assert "https://t.me/optika_pro/3" in links
+    assert f"https://t.me/test_bot?start=pain_{new_id}" in links
     assert f"https://t.me/test_bot?start=pain_{cid}" in links
-
-    (letter,) = letters  # и то же самое — на почту
-    assert letter["To"] == "owner@example.com" and "Итоги дня" in letter["Subject"]
-    (att,) = list(letter.iter_attachments())
-    assert att.get_filename() == name == report.filename and att.get_content() == pdf
-    assert "Срыв сроков поставки" in letter.get_body(("plain",)).get_content()
+    assert report.filename == list(letter.iter_attachments())[0].get_filename()
 
     # ссылки из PDF открывают карточки в боте
     assert "возят прибор" in await h.say(f"/start pain_{new_id}")
     assert "👤 <b>Иван Петров</b>" in await h.say("/start who_aaaaaaaa")
-    assert "Я слежу за чатами" in await h.say("/start")
 
-    # «Итоги дня сейчас» — только в Telegram, на почту не дублируем
-    await h.press("live:report")
-    assert len(letters) == 1 and h.session.files[-1][1].startswith(b"%PDF")
-
-    # почта не сработала — отчёт в Telegram всё равно пришёл, а об ошибке сказано
+    # письмо не ушло — отчёт приходит в Telegram, чтобы не потерялся
     def broken(msg):
         raise smtplib.SMTPAuthenticationError(535, b"Username and Password not accepted")
 
     monkeypatch.setattr(mailer, "_send_sync", broken)
     h.session.sent.clear()
     await main.send_report(h.bot)
-    assert h.session.sent[0].startswith("📊 <b>Итоги дня")
-    assert "⚠️ Итоги дня не ушли на почту: почтовый сервер не принял логин" in h.session.sent[1]
+    assert "⚠️ Итоги дня не ушли на почту: почтовый сервер не принял логин" in h.session.sent[0]
+    assert h.session.files and h.session.files[-1][1].startswith(b"%PDF")
 
     # /live: куда уходит почта и проверка одной кнопкой
-    monkeypatch.setattr(mailer, "_send_sync", letters.append)
+    monkeypatch.setattr(mailer, "_send_sync", h.letters.append)
     out = await h.say("/live")
-    assert "дублирую на почту: owner@example.com" in out and "[live:mail]" in out
+    assert "отправляю на почту: owner@example.com" in out and "[live:mail]" in out
     assert "✅ Письмо ушло: owner@example.com" in await h.press("live:mail")
-    assert letters[-1]["Subject"].startswith("Проверка почты")
 
 
-async def test_report_without_email_and_pdf_fallback(evening, monkeypatch):
+async def test_without_email_report_comes_to_telegram(evening, monkeypatch):
     from chat_parser.bot import main
+    from chat_parser.config import settings
     from chat_parser.report import daily
 
     h = evening
-    out = await h.say("/live")
-    assert "На почту не отправляю" in out and "[live:mail]" not in out
+    monkeypatch.setattr(settings, "smtp_password", "")
+    h.session.sent.clear()
+    await main.send_report(h.bot)
+    assert h.session.sent[0].startswith("⚠️ Почта не настроена")
+    assert h.session.files[-1][1].startswith(b"%PDF") and h.letters == []
 
-    # PDF не собрался — отчёт всё равно доходит, текстом
+    # и PDF не собрался — тогда текстом
     monkeypatch.setattr(daily.DailyReport, "pdf", lambda self, bot_username=None: None)
+    h.session.files.clear()
     h.session.sent.clear()
     report = await main.send_report(h.bot)
-    assert h.session.files == [] and h.session.sent == [report.text]
+    assert h.session.files == [] and h.session.sent[1:] == [report.text]
 
 
-async def test_send_report_now_button(evening, monkeypatch):
-    """Временная кнопка: итоги за сутки сразу — PDF, копия на почту, расписание не трогаем."""
-    from chat_parser import db, mailer
+async def test_old_send_now_button_sends_to_email(evening):
+    """Кнопка прошлой версии ещё может висеть у кого-то на клавиатуре."""
+    from chat_parser import db
     from chat_parser.bot import live
-    from chat_parser.config import settings
 
     h = evening
-    monkeypatch.setattr(settings, "report_email_to", "owner@example.com")
-    monkeypatch.setattr(settings, "smtp_user", "bot@gmail.com")
-    monkeypatch.setattr(settings, "smtp_password", "app-password")
-    letters = []
-    monkeypatch.setattr(mailer, "_send_sync", letters.append)
-    await _old_pain(h)
     before = await live.next_report_at()
-
     out = await h.say("📤 Отправить отчёт сейчас")
-    assert "Собираю итоги за последние сутки" in out and "[stop:" in out  # можно остановить
-    assert "✅ Готово — итоги за последние сутки ниже. Копия ушла на почту: owner@example.com." in out
-    (name, pdf, caption), = h.session.files
-    assert pdf.startswith(b"%PDF") and "5 сообщений" in caption
-    assert len(letters) == 1 and list(letters[0].iter_attachments())[0].get_content() == pdf
+    assert "Собираю итоги за последние сутки" in out and "[stop:" in out
+    assert "✅ Итоги за последние сутки ушли на почту: owner@example.com." in out
+    assert len(h.letters) == 1 and h.session.files == []
     assert await live.next_report_at() == before  # по расписанию придёт как обычно
     assert await db.get_setting(live.REPORT_DATE_KEY) is None
-
-    # и ещё раз — снова за полные сутки, а не «с прошлого отчёта»
-    h.session.files.clear()
-    out = await h.say("📤 Отправить отчёт сейчас")
-    assert "5 сообщений" in h.session.files[0][2]
-
-    # без почты — так и говорит
-    monkeypatch.setattr(settings, "smtp_password", "")
-    assert "На почту не отправлял: она не настроена." in await h.say("📤 Отправить отчёт сейчас")
