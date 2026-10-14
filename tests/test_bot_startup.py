@@ -70,3 +70,39 @@ def test_tracebacks_do_not_print_variables():
     from chat_parser.cli import app
 
     assert app.pretty_exceptions_show_locals is False
+
+
+@pytest.mark.asyncio
+async def test_paused_supabase_is_explained(bot_settings, monkeypatch):
+    """Проект Supabase на паузе: вместо трассировки — что нажать."""
+    import asyncpg
+    from aiogram.types import User
+
+    from chat_parser import db
+
+    async def get_me(self, **kw):
+        return User(id=1, is_bot=True, first_name="bot", username="test_bot")
+
+    async def apply_schema():
+        raise asyncpg.exceptions.InternalServerError(
+            "(ENOTFOUND) tenant/user postgres.sqrprtazaljwrlnscfux not found")
+
+    monkeypatch.setattr(Bot, "get_me", get_me)
+    monkeypatch.setattr(db, "apply_schema", apply_schema)
+    with pytest.raises(SystemExit) as err:
+        await main.run_bot()
+    text = str(err.value)
+    assert "База данных недоступна" in text and "«sqrprtazaljwrlnscfux»" in text
+    assert "Restore project" in text and "Session pooler" in text
+
+
+def test_db_error_hints():
+    from chat_parser.db import explain_error
+
+    assert "Restore project" in explain_error("Tenant or user not found")
+    assert "Reset database password" in explain_error(
+        'password authentication failed for user "postgres"')
+    assert "Session pooler" in explain_error("[Errno 11001] getaddrinfo failed")
+    assert "вторая копия бота" in explain_error("Max client connections reached")
+    assert "не на паузе" in explain_error(TimeoutError())
+    assert explain_error("какая-то другая ошибка") is None

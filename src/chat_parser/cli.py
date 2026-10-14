@@ -265,7 +265,11 @@ def doctor() -> None:
         if err:
             print(f"  [red]FAIL[/red] {err}")
             ref = settings.supabase_direct_ref
-            if ref:
+            hint = db.explain_error(err)
+            if hint and not ref:
+                for line in hint.splitlines():
+                    print(f"  [yellow]{line}[/yellow]")
+            elif ref:
                 print("  [yellow]В DATABASE_URL прямое подключение (db.….supabase.co) —[/yellow]")
                 print("  [yellow]у новых проектов оно работает только по IPv6.[/yellow]")
                 print("  Нужен Session pooler: Supabase -> кнопка Connect вверху проекта")

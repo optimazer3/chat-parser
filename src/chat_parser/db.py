@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import asyncpg
@@ -77,6 +78,37 @@ async def missing_tables() -> list[str]:
     )
     present = {r["tablename"] for r in rows}
     return [t for t in EXPECTED_TABLES if t not in present]
+
+
+def explain_error(error: BaseException | str) -> str | None:
+    """Что делать при частых ошибках подключения к Supabase; None — подсказки нет."""
+    text = str(error)
+    low = text.lower()
+    if "tenant/user" in low or "tenant or user not found" in low:
+        ref = re.search(r"postgres\.([a-z0-9]+)", text)
+        project = f" «{ref.group(1)}»" if ref else ""
+        return (
+            f"Supabase не нашёл проект{project}. Чаще всего проект на паузе: на бесплатном "
+            "тарифе Supabase ставит его на паузу, если неделю к нему никто не обращался.\n"
+            "1. Открой https://supabase.com/dashboard → свой проект. Если там «Paused» — нажми "
+            "«Restore project» и подожди 2–5 минут, пока он запустится.\n"
+            "2. Если проект активен — в DATABASE_URL неверный адрес пулера: в Supabase нажми "
+            "Connect → Session pooler, скопируй строку целиком и вставь в .env, подставив свой "
+            "пароль (регион и начало адреса, aws-0 или aws-1, должны совпасть)."
+        )
+    if "password authentication failed" in low:
+        return ("Неверный пароль базы в DATABASE_URL. В Supabase: Project Settings → Database → "
+                "Reset database password, потом обнови пароль в .env.")
+    if "getaddrinfo" in low or "name or service not known" in low or "nodename" in low:
+        return ("Не получилось найти сервер базы. Проверь интернет. Если в DATABASE_URL адрес "
+                "db.….supabase.co — замени строку на Session pooler (Connect → Session pooler).")
+    if "max client connections" in low or "too many connections" in low:
+        return ("У базы закончились подключения. Проверь, не запущена ли вторая копия бота "
+                "(ещё одно окно start-bot.bat), и закрой лишнюю.")
+    if isinstance(error, TimeoutError) or "timed out" in low or "таймаут" in low:
+        return ("Сервер базы не отвечает. Проверь интернет и что проект в Supabase не на паузе "
+                "(https://supabase.com/dashboard).")
+    return None
 
 
 def safe_dsn() -> str:

@@ -172,7 +172,13 @@ async def run_bot() -> None:
         me = await check_bot(bot)
         # Схема идемпотентна: так новые таблицы появляются после обновления
         # кода без ручного init-db.
-        await db.apply_schema()
+        try:
+            await db.apply_schema()
+        except Exception as e:  # noqa: BLE001 — понятная подсказка вместо трассировки
+            hint = db.explain_error(e)
+            if hint is None:
+                raise
+            raise SystemExit(f"\n❌ База данных недоступна: {e}\n\n{hint}") from None
         dp = Dispatcher()
         guard = AdminOnly(settings.admin_ids)
         dp.message.outer_middleware(guard)
