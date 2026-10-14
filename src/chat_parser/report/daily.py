@@ -103,7 +103,7 @@ async def collect(
                (select count(distinct m.author_label) from messages m
                  where m.chat_id = c.id and m.ts >= $1 and m.ts < $2) people,
                (select max(message_id) from messages m where m.chat_id = c.id) last_msg
-          from chats c where c.is_active
+          from chats c where c.is_active and c.in_daily
          order by msgs desc, c.id
         """,
         since, until, fresh,

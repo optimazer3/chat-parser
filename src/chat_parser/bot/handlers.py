@@ -734,7 +734,8 @@ async def cmd_chats(message: Message) -> None:
     pool = await db.get_pool()
     rows = await pool.fetch(
         """
-        select c.id, c.title, c.username, c.link, c.is_active, cu.last_run, cu.note,
+        select c.id, c.title, c.username, c.link, c.is_active, c.in_daily, cu.last_run,
+               cu.note,
                (select count(*) from messages m where m.chat_id = c.id) msgs,
                (select count(*) from messages m
                  where m.chat_id = c.id and m.ts >= now() - interval '24 hours') day_msgs,
@@ -757,6 +758,8 @@ async def cmd_chats(message: Message) -> None:
         lines.append(f"<b>{i}. {name}</b>")
         lines.append(f"{fmt.messages_word(r['msgs'])}, за сутки {fmt.fmt_num(r['day_msgs'])} · "
                      f"{fmt.people_word(r['people'])} · {fmt.signals_word(r['signals'])}")
+        if not r["in_daily"]:
+            lines.append(f"📅 только еженедельный отчёт — тема «{fmt.esc(settings.weekly_topic)}»")
         if not r["is_active"]:
             lines.append(f"⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
         else:
@@ -1151,7 +1154,14 @@ async def cmd_live(message: Message) -> None:
         lines.append("Почта не настроена — итоги дня приходят сюда. Нужны REPORT_EMAIL_TO, "
                      "SMTP_USER и SMTP_PASSWORD в .env.")
     toggle = ("⏸ Поставить на паузу", "live:off") if on else ("▶️ Включить", "live:on")
+    from . import weekly
+
+    if weekly.enabled():
+        lines.append(f"Еженедельный отчёт «Отклик на темы» ({fmt.esc(settings.weekly_chat)} · "
+                     f"{fmt.esc(settings.weekly_topic)}): {fmt.when_next(await weekly.next_at())}")
     rows = [[toggle], [("📤 Итоги дня сейчас", "live:report")]]
+    if weekly.enabled():
+        rows.append([("📅 Еженедельный отчёт сейчас", "weekly:now")])
     if settings.email_ready:
         rows.append([("✉️ Проверить почту", "live:mail")])
     await message.answer("\n".join(lines), reply_markup=_kb(*rows))
@@ -1166,13 +1176,42 @@ async def btn_send_now(message: Message, bot: Bot) -> None:
 async def _report_now(message: Message, bot: Bot, catch_up: bool = False) -> None:
     """Итоги за последние сутки прямо сейчас — на почту. catch_up — сегодняшние,
     пропавшие из-за смены времени: считаются отправленными. Расписание не трогает."""
-    from . import delivery, live
+    from . import live
 
-    head = "📤 Собираю итоги за последние сутки…"
+    await _send_now(
+        message, bot, "📤 Собираю итоги за последние сутки…",
+        lambda job_id: live.build_report(mark_sent=catch_up, catch_up=catch_up, job_id=job_id),
+        sent="Итоги за последние сутки ушли на почту", below="Итоги за последние сутки — ниже.",
+    )
+
+
+@router.message(Command("weekly"))
+async def cmd_weekly(message: Message, bot: Bot) -> None:
+    """Еженедельный отчёт прямо сейчас — для проверки. Расписание не трогает."""
+    from . import weekly
+
+    if not weekly.enabled():
+        await message.answer("Еженедельный отчёт выключен: в .env пустой WEEKLY_CHAT.")
+        return
+    await _send_now(message, bot, "📅 Собираю еженедельный отчёт…",
+                    lambda job_id: weekly.build(job_id=job_id, mark_sent=False),
+                    sent="Еженедельный отчёт ушёл на почту", below="Еженедельный отчёт — ниже.")
+
+
+@router.callback_query(F.data == "weekly:now")
+async def cb_weekly(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    await _drop_markup(call)
+    if call.message is not None:
+        await cmd_weekly(call.message, bot)
+
+
+async def _send_now(message: Message, bot: Bot, head: str, make, sent: str, below: str) -> None:
+    """Собрать отчёт с прогрессом и ⏹ и отправить на почту."""
+    from . import delivery
+
     job_id, progress = await _start_live(message, head)
-    task = asyncio.ensure_future(jobs.run_job(
-        live.build_report(mark_sent=catch_up, catch_up=catch_up, job_id=job_id)
-    ))
+    task = asyncio.ensure_future(jobs.run_job(make(job_id)))
     try:
         shown = ""
         while not task.done():  # показываем, на каком шаге сбор
@@ -1195,11 +1234,10 @@ async def _report_now(message: Message, bot: Bot, catch_up: bool = False) -> Non
         if not task.done():
             task.cancel()
     if await delivery.deliver(bot, [message.chat.id], report):
-        await progress.set("✅ Итоги за последние сутки ушли на почту: "
-                           + fmt.esc(", ".join(settings.email_recipients))
+        await progress.set(f"✅ {sent}: " + fmt.esc(", ".join(settings.email_recipients))
                            + ". Отчёт по расписанию придёт как обычно.", final=True)
     else:
-        await progress.set("Итоги за последние сутки — ниже.", final=True)
+        await progress.set(below, final=True)
 
 
 @router.callback_query(F.data == "live:mail")

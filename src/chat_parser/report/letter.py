@@ -166,11 +166,16 @@ def html(data: dict[str, Any], notes: dict[str, Any] | None = None) -> str:
                 size=13, color=INK2))
     b.append(_p("— chat-parser, мониторинг чатов рынка оптики", size=12, color=MUTED))
 
+    return wrap("".join(b))
+
+
+def wrap(body: str) -> str:
+    """Страница письма: колонка до 640 пикселей по центру."""
     return (f'<!doctype html><html lang="ru"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"></head>'
             f'<body style="margin:0;padding:0;background:#ffffff">'
             f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
             f'<tr><td align="center" style="padding:20px 12px">'
             f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-            f'style="max-width:640px"><tr><td>{"".join(b)}</td></tr></table>'
+            f'style="max-width:640px"><tr><td>{body}</td></tr></table>'
             f"</td></tr></table></body></html>")

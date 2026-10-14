@@ -108,6 +108,26 @@ class DayDigest(BaseModel):
     )
 
 
+class PostVerdict(BaseModel):
+    id: int
+    is_post: bool = Field(description="пост — автор раскрывает тему; иначе реплика или вопрос")
+    theme: str = Field(description="тема поста в 2-5 словах; для реплик — пусто")
+    summary: str = Field(description="о чём пост, одной фразой; для реплик — пусто")
+
+
+class PostBatch(BaseModel):
+    items: list[PostVerdict]
+
+
+class WeeklyDigest(BaseModel):
+    summary: str = Field(description="что откликается за неделю, месяц и полгода, 3-5 предложений")
+    focus: list[str] = Field(description="3-6 выводов о темах фокусного автора")
+    others: list[str] = Field(default_factory=list,
+                              description="2-4 вывода об интересном у других участников")
+    ideas: list[str] = Field(default_factory=list,
+                             description="3-5 тем для будущих постов из того, что откликается")
+
+
 class PersonAbout(BaseModel):
     """Описание участника, которое прислал пользователь, — по полям."""
 

@@ -56,7 +56,7 @@ async def harness(monkeypatch, tmp_path):
     from chat_parser import db
     from chat_parser.analyze.schema import (
         AssignItem, Assignment, Card, ClusterDraft, Clustering, DayDigest, Extraction,
-        Merging, PersonAbout, PersonHint, Signal,
+        Merging, PersonAbout, PersonHint, PostBatch, PostVerdict, Signal, WeeklyDigest,
     )
     from chat_parser.llm import LLMError
     from chat_parser.people import parse_fields
@@ -123,6 +123,25 @@ async def harness(monkeypatch, tmp_path):
             return Card(title="t", statement="s", who="владельцы", when="при открытии",
                         current_workarounds=["возят прибор"], evidence_ids=ids,
                         product_hypotheses=["аренда"], open_questions=["сколько салонов"])
+        if schema is PostBatch:
+            items = []
+            for block in user.split("Сообщения:\n", 1)[1].split("\n\n[id "):
+                head, body = block.lstrip("[id ").split("\n", 1)
+                low = body.lower()
+                is_post = len(body) >= 200 and not low.startswith("кто знает")
+                theme = ("Мотивация продавцов" if "мотивац" in low else
+                         "Закупка оправ" if "оправ" in low else
+                         "Аренда помещения" if "аренд" in low else "Разное")
+                items.append(PostVerdict(id=int(head.split("]")[0].split()[0]), is_post=is_post,
+                                         theme=theme if is_post else "",
+                                         summary=body[:60] if is_post else ""))
+            return PostBatch(items=items)
+        if schema is WeeklyDigest:
+            return WeeklyDigest(
+                summary="Лучше всего заходят посты про мотивацию продавцов.",
+                focus=["Мотивация продавцов откликается сильнее всего."],
+                others=["У других выделяется аренда помещения."],
+                ideas=["Разбор системы бонусов для продавцов."])
         if schema is PersonAbout:
             if state.get("person_fail"):
                 raise LLMError("модель не ответила")
@@ -1180,7 +1199,7 @@ async def test_report_goes_to_email(evening, monkeypatch):
     monkeypatch.setattr(mailer, "_send_sync", broken)
     h.session.sent.clear()
     await main.send_report(h.bot)
-    assert "⚠️ Итоги дня не ушли на почту: почтовый сервер не принял логин" in h.session.sent[0]
+    assert "⚠️ Отчёт не ушёл на почту: почтовый сервер не принял логин" in h.session.sent[0]
     assert h.session.files and h.session.files[-1][1].startswith(b"%PDF")
 
     # /live: куда уходит почта и проверка одной кнопкой
@@ -1223,3 +1242,167 @@ async def test_old_send_now_button_sends_to_email(evening):
     assert len(h.letters) == 1 and h.session.files == []
     assert await live.next_report_at() == before  # по расписанию придёт как обычно
     assert await db.get_setting(live.REPORT_DATE_KEY) is None
+
+
+# ------------------------------------------ еженедельный отчёт по теме форума
+
+OPTIKI = -1009000000077  # «Оптики go», группа с темами
+
+
+def _forum_messages():
+    from telethon.tl.types import (
+        Message, MessageReactions, MessageReplyHeader, PeerChannel, PeerUser, ReactionCount,
+        ReactionEmoji, User,
+    )
+
+    now = datetime.now(timezone.utc)
+    people_ = {900: ("Анжелла", "Шаталина"), 901: ("Павел", "Орлов"), 902: ("Кирилл", None)}
+
+    def msg(mid, uid, days, text, reply=None, likes=0, fire=0):
+        results = [ReactionCount(reaction=ReactionEmoji(emoticon=e), count=n)
+                   for e, n in (("👍", likes), ("🔥", fire)) if n]
+        head = (MessageReplyHeader(reply_to_msg_id=reply, reply_to_top_id=12) if reply
+                else MessageReplyHeader(forum_topic=True, reply_to_msg_id=12))
+        m = Message(id=mid, peer_id=PeerChannel(9000000077), date=now - timedelta(days=days),
+                    message=text, from_id=PeerUser(uid), reply_to=head,
+                    reactions=MessageReactions(results=results) if results else None)
+        first, last = people_[uid]
+        m._sender = User(id=uid, first_name=first, last_name=last)
+        return m
+
+    long = " Подробно рассказываю, как это устроено у нас в салонах, какие цифры и что не сработало." * 3
+    # номера растут со временем, как в Telegram
+    msgs = [
+        msg(100, 900, 200, "Совсем старый пост про мотивацию." + long, likes=99),
+        msg(101, 900, 100, "Ещё раз про мотивацию продавцов — итоги полугода." + long, likes=60),
+        msg(102, 900, 20, "Закупка оправ: где брать и как не переплатить." + long, likes=15),
+        msg(103, 901, 10, "Мой опыт с оправами из Китая." + long, likes=2),
+        msg(104, 900, 3, "Как я выстроила мотивацию продавцов: оклад плюс процент." + long,
+            likes=30, fire=10),
+        msg(105, 901, 3, "согласен, у нас так же", reply=104),
+        msg(106, 902, 3, "спасибо, очень полезно", reply=104),
+        msg(107, 901, 2, "+1", reply=104),
+        msg(108, 901, 2, "Аренда помещения под салон: на что смотреть в договоре." + long,
+            likes=45),
+        msg(109, 902, 1, "Кто знает, где взять кассу подешевле? " + long),
+    ]
+    return {m.id: m for m in msgs}
+
+
+@pytest.fixture
+async def forum(evening, monkeypatch):
+    """В «Оптики go» тема «Бизнес. Управление ресурсами» с постами и реакциями."""
+    from types import SimpleNamespace
+
+    from telethon.tl.types import ForumTopic, PeerChannel, PeerNotifySettings, PeerUser
+
+    from chat_parser.bot import weekly
+
+    h = evening
+    await h.pool.execute("insert into chats (id, title, username) values ($1, $2, $3)",
+                         OPTIKI, "Оптики go", "optiki_go")
+    h.forum = _forum_messages()
+
+    def topic(tid, title):
+        return ForumTopic(id=tid, date=datetime.now(timezone.utc), peer=PeerChannel(1),
+                          title=title, icon_color=0, top_message=tid, read_inbox_max_id=0,
+                          read_outbox_max_id=0, unread_count=0, unread_mentions_count=0,
+                          unread_reactions_count=0, unread_poll_votes_count=0,
+                          from_id=PeerUser(1), notify_settings=PeerNotifySettings())
+
+    class FakeForum:
+        async def get_entity(self, ref):
+            assert ref == OPTIKI
+            return "optiki"
+
+        async def __call__(self, request):
+            return SimpleNamespace(topics=[topic(1, "Общий"),
+                                           topic(12, "Бизнес. Управление ресурсами")])
+
+        def iter_messages(self, entity, reply_to=None, **kw):
+            assert reply_to == 12
+
+            async def gen():
+                for mid in sorted(h.forum, reverse=True):  # от новых к старым
+                    yield h.forum[mid]
+            return gen()
+
+        async def disconnect(self):
+            pass
+
+    async def connect():
+        return FakeForum()
+
+    monkeypatch.setattr(weekly, "connect_client", connect)
+    return h
+
+
+async def test_weekly_report(forum, monkeypatch):
+    from telethon.tl.types import MessageReactions, ReactionCount, ReactionEmoji
+
+    from chat_parser import clock, db
+    from chat_parser.bot import live, main, weekly
+    from chat_parser.config import settings
+
+    h = forum
+    # группа еженедельного отчёта в ежедневный не входит
+    await live.build_report(mark_sent=False)
+    assert OPTIKI not in {c for c, _, _ in h.calls}
+    assert await h.pool.fetchval("select in_daily from chats where id = $1", OPTIKI) is False
+    assert "📅 только еженедельный отчёт — тема «Бизнес. Управление ресурсами»" in \
+        await h.say("➕ Добавить чат")
+    out = await h.say("/live")
+    assert "Еженедельный отчёт «Отклик на темы»" in out and "[weekly:now]" in out
+
+    h.letters.clear()
+    out = await h.say("/weekly")
+    assert "Собираю еженедельный отчёт" in out and "[stop:" in out
+    assert "✅ Еженедельный отчёт ушёл на почту: owner@example.com" in out
+    (letter,) = h.letters
+    assert letter["Subject"].startswith("Отклик на темы · Оптики go — неделя по ")
+    text = pdf_text(letter_pdf(letter))
+    for part in ("Еженедельный отчёт", "Лучше всего заходят посты про мотивацию продавцов",
+                 "Идеи для постов", "Анжелла Шаталина", "За неделю · 1 пост · 40 реакций",
+                 "За месяц · 2 поста · 55 реакций", "За полгода · 3 поста · 115 реакций",
+                 "Мотивация продавцов", "Закупка оправ", "40 реакций · 3 комментария",
+                 "Другие участники", "Аренда помещения", "Павел Орлов"):
+        assert part in text, part
+    assert "Совсем старый пост" not in text  # старше полугода
+    html = letter.get_body(("html",)).get_content()
+    assert "40 реакций (👍 30 · 🔥 10) · 3 комментария" in html
+    assert "https://t.me/optiki_go/12/104" in html
+
+    rows = {r["message_id"]: dict(r) for r in await h.pool.fetch(
+        "select * from topic_messages order by message_id")}
+    assert set(rows) == set(range(101, 110))  # 100 старше полугода — не читали
+    assert rows[104]["is_post"] and rows[104]["theme"] == "Мотивация продавцов"
+    assert rows[105]["is_post"] is False and rows[105]["reply_to"] == 104
+    assert rows[109]["is_post"] is False  # длинный, но это вопрос, а не пост
+    weekly_prompt = next(p for p in h.state["prompts"] if "## За неделю" in p)
+    assert "Анжелла" not in weekly_prompt and "Шаталина" not in weekly_prompt
+
+    # при следующем сборе реакции обновляются, разобранное заново не разбирается
+    calls = len(h.state["prompts"])
+    h.forum[104].reactions = MessageReactions(
+        results=[ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=55)])
+    await h.say("/weekly")
+    assert await h.pool.fetchval(
+        "select reactions from topic_messages where message_id = 104") == 55
+    assert not any("Сообщения:\n" in p for p in h.state["prompts"][calls:])
+
+    # по расписанию: понедельник, 10:00; «сейчас» расписание не сдвигает
+    nxt = await weekly.next_at()
+    assert nxt.astimezone(clock.tz()).weekday() == 0 and nxt.astimezone(clock.tz()).hour == 10
+    await db.set_setting(weekly.NEXT_KEY,
+                         (clock.now() - timedelta(minutes=1)).isoformat())
+    assert await weekly.due()
+    await main.send_weekly(h.bot)
+    assert not await weekly.due() and len(h.letters) == 3
+    assert (await weekly.next_at()) > clock.now()
+
+    # темы с таким названием нет — письмо объясняет, какие есть
+    monkeypatch.setattr(settings, "weekly_topic", "Логистика")
+    await h.say("/weekly")
+    plain = h.letters[-1].get_body(("plain",)).get_content()
+    assert "Тема «Логистика» не найдена. В группе есть: «Общий», «Бизнес. Управление ресурсами»" \
+        in plain

@@ -23,7 +23,7 @@ from ..net import aiogram_proxy, network_hint
 from . import format as fmt
 from . import jobs
 from .auth import AdminOnly
-from . import delivery, live
+from . import delivery, live, weekly
 from ..report.daily import DailyReport
 from .handlers import KEYBOARD_KEY, KEYBOARD_VERSION, MAIN_KB, router
 
@@ -88,6 +88,36 @@ async def report_loop(bot: Bot) -> None:
             await asyncio.wait_for(live.schedule_changed.wait(), timeout=max(wait, 1) + 1)
         except asyncio.TimeoutError:
             pass
+
+
+async def send_weekly(bot: Bot, mark_sent: bool = True):
+    """Еженедельный отчёт на почту (в Telegram — только если почта не сработала)."""
+    report = await jobs.run_job(weekly.build(mark_sent=mark_sent))
+    await delivery.deliver(bot, settings.admin_ids, report)
+    return report
+
+
+async def weekly_loop(bot: Bot) -> None:
+    """Еженедельный отчёт в WEEKLY_WEEKDAY, WEEKLY_HOUR. Бот был выключен —
+    отчёт уйдёт сразу после запуска."""
+    while True:
+        try:
+            if await weekly.due():
+                await send_weekly(bot)
+            wait = (await weekly.next_at() - clock.now()).total_seconds()
+        except jobs.Busy:
+            wait = 60  # идёт другая операция — чуть позже
+        except jobs.Cancelled:
+            try:
+                await weekly.advance(await weekly.next_at())  # остановили ⏹ — до следующей недели
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("не удалось сдвинуть расписание недели: %s", e)
+                wait = 60
+        except Exception as e:  # noqa: BLE001
+            log.warning("еженедельный отчёт не собрался: %s: %s", type(e).__name__, e)
+            wait = 300
+        await asyncio.sleep(min(max(wait, 1) + 1, 3600))  # раз в час сверяемся с расписанием
 
 
 async def announce_keyboard(bot: Bot) -> None:
@@ -179,6 +209,7 @@ async def run_bot() -> None:
             if hint is None:
                 raise
             raise SystemExit(f"\n❌ База данных недоступна: {e}\n\n{hint}") from None
+        await weekly.mark_chats(await db.get_pool())  # группа недельного отчёта — не в ежедневном
         dp = Dispatcher()
         guard = AdminOnly(settings.admin_ids)
         dp.message.outer_middleware(guard)
@@ -192,6 +223,8 @@ async def run_bot() -> None:
             if await jobs.pending_requests():
                 background.append(asyncio.create_task(connect_saved(bot)))
             background.append(asyncio.create_task(report_loop(bot)))
+            if weekly.enabled():
+                background.append(asyncio.create_task(weekly_loop(bot)))
         await dp.start_polling(bot)
     finally:
         for t in background:

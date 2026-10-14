@@ -83,6 +83,18 @@ async def resolve(client: TelegramClient, ref: str, join: bool = False):
     return upd.chats[0]
 
 
+async def entity_for(client: TelegramClient, chat_id: int, username: str | None = None):
+    """Чат по id. Со строковой сессией кэш сущностей при запуске пуст, и Telethon
+    может не найти чат по одному номеру — тогда по @username или по списку диалогов."""
+    try:
+        return await client.get_entity(chat_id)
+    except ValueError:
+        if username:
+            return await client.get_entity(username)
+        await client.get_dialogs()  # заполняет кэш: аккаунт состоит в этом чате
+        return await client.get_entity(chat_id)
+
+
 def _media_type(msg: Message) -> str | None:
     return type(msg.media).__name__ if msg.media else None
 
@@ -200,7 +212,7 @@ async def sync_chat(
     if cur and cur["retry_after"] and cur["retry_after"] > datetime.now(timezone.utc):
         return {"chat_id": chat_id, "skipped": "flood_wait", "until": cur["retry_after"]}
 
-    entity = await client.get_entity(chat_id)
+    entity = await entity_for(client, chat_id)
     oldest, newest = (cur["oldest_id"], cur["newest_id"]) if cur else (None, None)
 
     if mode == "backfill":

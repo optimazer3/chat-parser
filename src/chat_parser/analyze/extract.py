@@ -133,6 +133,7 @@ async def run(
     ended_after: datetime | None = None,
     ended_before: datetime | None = None,
     usage_source: str = "manual",
+    daily_only: bool = False,
 ) -> dict:
     """ended_after/ended_before — только обсуждения, закончившиеся в этом
     промежутке: так автоматический разбор берёт свежие затихшие обсуждения
@@ -146,12 +147,14 @@ async def run(
          where status = 'pending'
            and ($2::timestamptz is null or ended_at >= $2)
            and ($3::timestamptz is null or ended_at <= $3)
+           and (not $4::bool or chat_id in (select id from chats where in_daily))
          order by started_at desc
          limit $1
         """,
         limit or 1_000_000,
         ended_after,
         ended_before,
+        daily_only,
     )
     sem = asyncio.Semaphore(settings.extract_concurrency)
     stats = {"threads": 0, "signals": 0, "dropped": 0, "empty": 0, "failed": 0}

@@ -17,7 +17,10 @@ from aiogram.types import BufferedInputFile
 from .. import mailer
 from ..config import settings
 from ..report.daily import DailyReport
+from ..report.weekly import WeeklyReport
 from . import format as fmt
+
+Report = DailyReport | WeeklyReport
 
 log = logging.getLogger("chat_parser.delivery")
 
@@ -29,7 +32,7 @@ async def _bot_username(bot: Bot) -> str | None:
         return None
 
 
-async def to_email(report: DailyReport, pdf: bytes | None) -> str | None:
+async def to_email(report: Report, pdf: bytes | None) -> str | None:
     """None — письмо ушло; иначе — что пошло не так."""
     text = report.plain()
     if pdf is None:
@@ -43,7 +46,7 @@ async def to_email(report: DailyReport, pdf: bytes | None) -> str | None:
     return None
 
 
-async def _fallback(bot: Bot, chat_ids: list[int], report: DailyReport, pdf: bytes | None,
+async def _fallback(bot: Bot, chat_ids: list[int], report: Report, pdf: bytes | None,
                     problem: str) -> None:
     """Почта не сработала — отчёт приходит сюда, чтобы не потерялся."""
     for chat_id in chat_ids:
@@ -60,13 +63,13 @@ async def _fallback(bot: Bot, chat_ids: list[int], report: DailyReport, pdf: byt
             log.warning("итоги дня не доставлены %s: %s", chat_id, e)
 
 
-async def deliver(bot: Bot, chat_ids: Iterable[int], report: DailyReport) -> bool:
-    """Отправить итоги на почту. True — письмо ушло."""
+async def deliver(bot: Bot, chat_ids: Iterable[int], report: Report) -> bool:
+    """Отправить отчёт (ежедневный или еженедельный) на почту. True — письмо ушло."""
     chat_ids = list(chat_ids)
     pdf = await asyncio.to_thread(report.pdf, await _bot_username(bot))
     if not settings.email_ready:
         await _fallback(bot, chat_ids, report, pdf,
-                        "⚠️ Почта не настроена, поэтому итоги дня присылаю сюда. Чтобы они "
+                        "⚠️ Почта не настроена, поэтому отчёт присылаю сюда. Чтобы отчёты "
                         "приходили на почту, заполни в .env REPORT_EMAIL_TO, SMTP_USER и "
                         "SMTP_PASSWORD и перезапусти бота.")
         return False
@@ -74,5 +77,5 @@ async def deliver(bot: Bot, chat_ids: Iterable[int], report: DailyReport) -> boo
     if error is None:
         return True
     await _fallback(bot, chat_ids, report, pdf,
-                    f"⚠️ Итоги дня не ушли на почту: {fmt.esc(error)}\nПрисылаю их сюда.")
+                    f"⚠️ Отчёт не ушёл на почту: {fmt.esc(error)}\nПрисылаю его сюда.")
     return False

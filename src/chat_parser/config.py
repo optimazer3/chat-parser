@@ -103,6 +103,14 @@ class Settings(BaseSettings):
     smtp_from: str = ""              # от кого; пусто — SMTP_USER
     smtp_proxy: str = ""             # socks5://… если SMTP-сервер напрямую недоступен
 
+    # --- Еженедельный отчёт: отклик на посты в теме группы-форума ---
+    weekly_chat: str = "Оптики go"          # группа: название, @username или ссылка; пусто — выкл
+    weekly_topic: str = "Бизнес. Управление ресурсами"  # тема внутри группы
+    weekly_focus: str = "Анжелла Шаталина"  # чьи посты разбирать первыми; через запятую, можно @ник
+    weekly_weekday: int = 0                 # 0 — понедельник … 6 — воскресенье
+    weekly_hour: int = 10                   # по местному времени (DISPLAY_UTC_OFFSET)
+    weekly_post_min_chars: int = 200        # короче — разговорная реплика, а не пост
+
     # --- Пороги нормализации ---
     thread_gap_minutes: int = 10
     thread_max_messages: int = 80

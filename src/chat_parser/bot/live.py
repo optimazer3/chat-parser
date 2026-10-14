@@ -164,10 +164,13 @@ async def collect_day(job: dict[str, Any], now: datetime) -> dict[str, Any]:
     stats: dict[str, Any] = {"saved": 0, "threads": 0, "extracted": 0, "signals": 0,
                              "budget_hit": False, "paused": False, "errors": []}
 
+    from . import weekly
+
+    await weekly.mark_chats(pool)  # группу недельного отчёта вечером не трогаем
     chats = [dict(r) for r in await pool.fetch(
         """
         select c.id, c.title, cu.newest_id from chats c left join cursors cu on cu.chat_id = c.id
-         where c.is_active order by c.id
+         where c.is_active and c.in_daily order by c.id
         """
     )]
     changed: list[int] = []
@@ -231,7 +234,7 @@ async def collect_day(job: dict[str, Any], now: datetime) -> dict[str, Any]:
             pool, batch, on_progress=progress,
             ended_after=now - CONTEXT,
             ended_before=now - timedelta(minutes=settings.live_quiet_minutes),
-            usage_source="live",
+            usage_source="live", daily_only=True,
         )
         n = res["threads"] + res["failed"]
         stats["extracted"] += n
@@ -333,7 +336,8 @@ async def build_report(mark_sent: bool = True, catch_up: bool = False,
         data = await daily.collect(pool, since, until, fresh)
         data.update(digest, since=since, until=until)
         backlog = await pool.fetchval(
-            "select count(*) from threads where status = 'pending' and ended_at < $1", fresh
+            "select count(*) from threads where status = 'pending' and ended_at < $1 "
+            "and chat_id in (select id from chats where in_daily)", fresh
         )
         hit = await budget_hit_today()
         notes = {

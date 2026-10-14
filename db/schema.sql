@@ -198,3 +198,33 @@ alter table llm_usage enable row level security;
 alter table chat_requests enable row level security;
 alter table bot_settings enable row level security;
 alter table authors enable row level security;
+
+-- ------------------------------------------------- еженедельный отчёт
+-- Группа, по которой строится еженедельный отчёт, в ежедневный не входит.
+alter table chats add column if not exists in_daily boolean not null default true;
+
+-- Сообщения темы группы-форума с откликом. Отдельно от messages: реакции здесь
+-- обновляются при каждом сборе, а модель помечает, пост это или реплика.
+create table if not exists topic_messages (
+    chat_id          bigint      not null references chats(id) on delete cascade,
+    topic_id         bigint      not null,
+    message_id       bigint      not null,
+    ts               timestamptz not null,
+    author_hash      text,
+    author_label     text,
+    text             text,
+    reply_to         bigint,                -- ответ на сообщение темы; null — само по себе
+    reactions        int         not null default 0,
+    reactions_detail jsonb,                 -- {"👍": 12, "🔥": 3}
+    views            int,
+    forwards         int,
+    is_post          boolean,               -- решение модели; null — ещё не смотрели
+    theme            text,                  -- тема поста в 2-5 словах
+    summary          text,                  -- о чём пост, одной фразой
+    analyzed_at      timestamptz,
+    updated_at       timestamptz not null default now(),
+    primary key (chat_id, message_id)
+);
+create index if not exists topic_messages_ts_idx    on topic_messages (chat_id, topic_id, ts);
+create index if not exists topic_messages_reply_idx on topic_messages (chat_id, reply_to);
+alter table topic_messages enable row level security;
