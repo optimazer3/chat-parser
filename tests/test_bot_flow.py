@@ -1381,14 +1381,21 @@ async def test_weekly_report(forum, monkeypatch):
     weekly_prompt = next(p for p in h.state["prompts"] if "## За неделю" in p)
     assert "Анжелла" not in weekly_prompt and "Шаталина" not in weekly_prompt
 
-    # при следующем сборе реакции обновляются, разобранное заново не разбирается
+    # полгода прочитаны один раз; дальше каждую неделю — только последний месяц:
+    # реакции свежих постов обновляются, у постов старше месяца — прежние цифры
+    assert await db.get_setting(weekly.FULL_READ_KEY.format(chat=OPTIKI, topic=12))
     calls = len(h.state["prompts"])
     h.forum[104].reactions = MessageReactions(
         results=[ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=55)])
+    h.forum[101].reactions = MessageReactions(  # пост 100-дневной давности
+        results=[ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=99)])
     await h.say("/weekly")
-    assert await h.pool.fetchval(
-        "select reactions from topic_messages where message_id = 104") == 55
-    assert not any("Сообщения:\n" in p for p in h.state["prompts"][calls:])
+    reactions = dict(await h.pool.fetch(
+        "select message_id, reactions from topic_messages where message_id in (101, 104)"))
+    assert reactions == {104: 55, 101: 60}
+    assert not any("Сообщения:\n" in p for p in h.state["prompts"][calls:])  # заново не разбирали
+    text = pdf_text(letter_pdf(h.letters[-1]))
+    assert "За полгода · 3 поста" in text  # полгода в отчёте остались
 
     # по расписанию: понедельник, 10:00; «сейчас» расписание не сдвигает
     nxt = await weekly.next_at()

@@ -110,6 +110,9 @@ class Settings(BaseSettings):
     weekly_weekday: int = 0                 # 0 — понедельник … 6 — воскресенье
     weekly_hour: int = 10                   # по местному времени (DISPLAY_UTC_OFFSET)
     weekly_post_min_chars: int = 200        # короче — разговорная реплика, а не пост
+    # Полгода темы читаются один раз; дальше каждую неделю — только последние
+    # столько дней: новые посты и свежие реакции. У старших — последние цифры.
+    weekly_refresh_days: int = 30
 
     # --- Пороги нормализации ---
     thread_gap_minutes: int = 10

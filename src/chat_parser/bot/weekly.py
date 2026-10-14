@@ -1,8 +1,9 @@
 """Еженедельный отчёт «Отклик на темы» по теме группы-форума.
 
 Раз в неделю (WEEKLY_WEEKDAY, WEEKLY_HOUR по местному времени) аккаунт-сборщик
-забирает сообщения темы за полгода — так обновляются реакции и на старых
-постах, — нейросеть разбирает новые сообщения (пост или реплика, тема), и на
+забирает сообщения темы: в первый раз за полгода, потом — за последний месяц
+(WEEKLY_REFRESH_DAYS): новые посты и свежие реакции. Нейросеть разбирает новые
+сообщения (пост или реплика, тема), и на
 почту уходит отчёт: какие темы откликаются за неделю, месяц и полгода, сначала
 у автора в фокусе. Сама группа в ежедневный отчёт не входит.
 """
@@ -33,7 +34,16 @@ log = logging.getLogger("chat_parser.weekly")
 
 NEXT_KEY = "weekly_next_at"
 SENT_KEY = "weekly_sent_at"
+FULL_READ_KEY = "weekly_full_read:{chat}:{topic}"  # полгода темы уже прочитаны
 HALF_YEAR = timedelta(days=183)
+
+
+async def read_since(chat_id: int, topic_id: int, now: datetime) -> datetime:
+    """С какого момента читать тему: в первый раз — полгода, потом — последний
+    месяц. Реакции на посты старше месяца почти не меняются."""
+    if await db.get_setting(FULL_READ_KEY.format(chat=chat_id, topic=topic_id)):
+        return now - timedelta(days=settings.weekly_refresh_days)
+    return now - HALF_YEAR
 
 
 def enabled() -> bool:
@@ -215,9 +225,13 @@ async def _build(pool: asyncpg.Pool, job: dict[str, Any], now: datetime) -> Week
             job["progress"] = f"читаю тему: {n} сообщений"
 
         job["progress"] = "читаю тему"
+        since = await read_since(chat["id"], topic_id, now)
         try:
-            await topics_mod.sync_topic(client, pool, chat["id"], topic_id, now - HALF_YEAR,
+            await topics_mod.sync_topic(client, pool, chat["id"], topic_id, since,
                                         on_progress=read_progress)
+            if since <= now - HALF_YEAR:  # полгода прочитаны целиком — дальше только месяц
+                await db.set_setting(FULL_READ_KEY.format(chat=chat["id"], topic=topic_id),
+                                     now.isoformat())
         except Exception as e:  # noqa: BLE001 — отчёт по уже собранному лучше, чем никакого
             log.warning("тема не прочитана: %s", e)
             warnings.append(f"Тему не удалось дочитать ({e}) — реакции могут быть не "
