@@ -88,6 +88,39 @@ async def test_new_chat_gets_history_then_only_new(pool):
     assert await pool.fetchval("select count(*) from messages") == 251
 
 
+@pytest.mark.parametrize("private", [False, True])
+async def test_history_uses_saved_address_in_fresh_session(pool, private):
+    from telethon.tl.functions.messages import CheckChatInviteRequest
+    from telethon.tl.types import ChatInviteAlready
+
+    from chat_parser.ingest import collector
+
+    channel = PeerChannel(1234567890)
+    link = "https://t.me/+auditTestInvite" if private else "https://t.me/test_optics"
+    username = None if private else "test_optics"
+    await pool.execute("update chats set username = $2, link = $3 where id = $1",
+                       CHAT, username, link)
+
+    class FreshClient(FakeClient):
+        async def get_entity(self, ref):
+            if username and ref == username:
+                return channel
+            assert ref == CHAT
+            raise ValueError("Could not find the input entity")
+
+        async def __call__(self, request):
+            assert private and isinstance(request, CheckChatInviteRequest)
+            assert request.hash == "auditTestInvite"
+            return ChatInviteAlready(chat=channel)
+
+        async def get_dialogs(self):
+            pytest.fail("saved channel is resolvable without scanning dialogs")
+
+    result = await collector.sync_chat_full(FreshClient(2), pool, CHAT)
+    assert result["saved"] == 2
+    assert await pool.fetchval("select count(*) from messages where chat_id = $1", CHAT) == 2
+
+
 async def test_stopped_history_resumes_without_duplicates(pool):
     from chat_parser.ingest import collector
 

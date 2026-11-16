@@ -39,6 +39,10 @@ class JoinPending(RuntimeError):
     """Заявка на вступление отправлена, ждёт одобрения админа."""
 
 
+class InvalidInvite(RuntimeError):
+    """Telegram больше не принимает ссылку-приглашение."""
+
+
 def invite_hash(ref: str) -> str | None:
     m = INVITE_RE.search(ref.strip())
     return m.group(1) if m else None
@@ -58,9 +62,9 @@ async def resolve(client: TelegramClient, ref: str, join: bool = False):
     try:
         info = await client(functions.messages.CheckChatInviteRequest(h))
     except errors.InviteHashExpiredError as e:
-        raise RuntimeError("ссылка-приглашение протухла, попроси новую") from e
+        raise InvalidInvite("ссылка-приглашение протухла, попроси новую") from e
     except errors.InviteHashInvalidError as e:
-        raise RuntimeError("ссылка-приглашение невалидна") from e
+        raise InvalidInvite("ссылка-приглашение невалидна") from e
 
     # Уже участник, либо превью с временным доступом к истории
     if isinstance(info, (types.ChatInviteAlready, types.ChatInvitePeek)):
@@ -83,16 +87,40 @@ async def resolve(client: TelegramClient, ref: str, join: bool = False):
     return upd.chats[0]
 
 
-async def entity_for(client: TelegramClient, chat_id: int, username: str | None = None):
-    """Чат по id. Со строковой сессией кэш сущностей при запуске пуст, и Telethon
-    может не найти чат по одному номеру — тогда по @username или по списку диалогов."""
+async def entity_for(
+    client: TelegramClient, chat_id: int, username: str | None = None, link: str | None = None
+):
+    """Находит чат в новой сессии по сохранённому адресу или диалогам аккаунта."""
     try:
         return await client.get_entity(chat_id)
     except ValueError:
-        if username:
-            return await client.get_entity(username)
-        await client.get_dialogs()  # заполняет кэш: аккаунт состоит в этом чате
+        pass
+
+    for ref in (username, link):
+        if not ref:
+            continue
+        try:
+            entity = await resolve(client, ref)
+        except (ValueError, errors.UsernameInvalidError, InvalidInvite, NeedsJoin):
+            continue
+        # Старый @username может уже принадлежать другому каналу.
+        if utils.get_peer_id(entity) == chat_id:
+            return entity
+
+    await client.get_dialogs()  # заполняет кэш для чатов, в которых состоит аккаунт
+    try:
         return await client.get_entity(chat_id)
+    except ValueError as e:
+        raise ValueError(
+            "Аккаунт-сборщик не может найти канал. Открой его в Telegram под тем же аккаунтом. "
+            "Для публичного канала отправь боту актуальный @username, для закрытого проверь "
+            "доступ аккаунта и отправь действующую ссылку-приглашение."
+        ) from e
+
+
+async def registered_entity(client: TelegramClient, pool: asyncpg.Pool, chat_id: int):
+    chat = await pool.fetchrow("select username, link from chats where id = $1", chat_id)
+    return await entity_for(client, chat_id, chat["username"], chat["link"])
 
 
 def _media_type(msg: Message) -> str | None:
@@ -182,7 +210,7 @@ async def register_chat(
         "insert into cursors (chat_id) values ($1) on conflict (chat_id) do nothing", chat_id
     )
     await pool.execute(
-        "update chats set link = coalesce(link, $2), is_active = true where id = $1",
+        "update chats set link = $2, is_active = true where id = $1",
         chat_id, ref.strip(),
     )
     return chat_id
@@ -212,7 +240,7 @@ async def sync_chat(
     if cur and cur["retry_after"] and cur["retry_after"] > datetime.now(timezone.utc):
         return {"chat_id": chat_id, "skipped": "flood_wait", "until": cur["retry_after"]}
 
-    entity = await entity_for(client, chat_id)
+    entity = await registered_entity(client, pool, chat_id)
     oldest, newest = (cur["oldest_id"], cur["newest_id"]) if cur else (None, None)
 
     if mode == "backfill":

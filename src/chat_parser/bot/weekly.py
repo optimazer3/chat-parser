@@ -25,6 +25,7 @@ from ..analyze.schema import WeeklyDigest
 from ..config import settings
 from ..ingest import topics as topics_mod
 from ..ingest.client import connect_client
+from ..ingest.collector import entity_for
 from ..llm import build_llm
 from ..report import weekly as report_mod
 from ..report.weekly import WeeklyReport
@@ -212,7 +213,7 @@ async def _build(pool: asyncpg.Pool, job: dict[str, Any], now: datetime) -> Week
     client = await connect_client()
     try:
         job["progress"] = "ищу тему в группе"
-        entity = await topics_mod.entity_for(client, chat["id"], chat["username"])
+        entity = await entity_for(client, chat["id"], chat["username"], chat["link"])
         topics = await topics_mod.forum_topics(client, entity)
         found = topics_mod.match_topic(settings.weekly_topic, topics)
         if found is None:
@@ -228,7 +229,7 @@ async def _build(pool: asyncpg.Pool, job: dict[str, Any], now: datetime) -> Week
         since = await read_since(chat["id"], topic_id, now)
         try:
             await topics_mod.sync_topic(client, pool, chat["id"], topic_id, since,
-                                        on_progress=read_progress)
+                                        on_progress=read_progress, entity=entity)
             if since <= now - HALF_YEAR:  # полгода прочитаны целиком — дальше только месяц
                 await db.set_setting(FULL_READ_KEY.format(chat=chat["id"], topic=topic_id),
                                      now.isoformat())

@@ -158,7 +158,12 @@ def test_problem_report():
 
 async def test_chat_found_when_session_cache_is_empty():
     """Строковая сессия: по одному номеру чат не находится — ищем через диалоги."""
+    from telethon.tl.types import PeerChannel
+
     from chat_parser.ingest.collector import entity_for
+
+    chat_id = -1000000000123
+    channel = PeerChannel(123)
 
     class Client:
         def __init__(self):
@@ -166,8 +171,10 @@ async def test_chat_found_when_session_cache_is_empty():
 
         async def get_entity(self, ref):
             self.calls.append(ref)
+            if ref == "stale_name":
+                return PeerChannel(456)
             if ref == "optiki_go" or self.cached:
-                return "чат"
+                return channel
             raise ValueError("Could not find the input entity")
 
         async def get_dialogs(self):
@@ -175,8 +182,8 @@ async def test_chat_found_when_session_cache_is_empty():
             self.cached = True
 
     c = Client()
-    assert await entity_for(c, -100123, "optiki_go") == "чат"
-    assert c.calls == [-100123, "optiki_go"]
+    assert await entity_for(c, chat_id, "optiki_go") == channel
+    assert c.calls == [chat_id, "optiki_go"]
     c = Client()
-    assert await entity_for(c, -100123) == "чат"
-    assert c.calls == [-100123, "dialogs", -100123]
+    assert await entity_for(c, chat_id, "stale_name") == channel
+    assert c.calls == [chat_id, "stale_name", "dialogs", chat_id]

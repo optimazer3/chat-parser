@@ -19,7 +19,7 @@ from telethon.tl.types import ForumTopic, Message
 from ..config import settings
 from ..people import upsert_authors
 from ..pii import author_hash, author_label, mask_text
-from .collector import entity_for, sender_names
+from .collector import registered_entity, sender_names
 
 BATCH = 200
 
@@ -105,9 +105,10 @@ async def save(pool: asyncpg.Pool, rows: list[tuple], authors: dict[str, tuple])
 
 
 async def sync_topic(client: TelegramClient, pool: asyncpg.Pool, chat_id: int, topic_id: int,
-                     since: datetime, on_progress=None) -> dict[str, int]:
+                     since: datetime, on_progress=None, *, entity: Any = None) -> dict[str, int]:
     """Сообщения темы с since (от новых к старым) — новые и обновлённые реакции."""
-    entity = await entity_for(client, chat_id)
+    if entity is None:
+        entity = await registered_entity(client, pool, chat_id)
     rows: list[tuple] = []
     authors: dict[str, tuple] = {}
     seen = 0

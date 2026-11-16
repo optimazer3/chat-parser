@@ -299,7 +299,7 @@ async def refresh_names(chat_id: int) -> int:
         pool = await db.get_pool()
         client = await connect_client()
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await collector.registered_entity(client, pool, chat_id)
             items = []
             async for user in client.iter_participants(entity, limit=10000):
                 h = author_hash(user.id, settings.author_salt)
