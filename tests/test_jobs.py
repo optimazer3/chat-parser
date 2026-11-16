@@ -143,16 +143,12 @@ def test_stopped_message_says_what_is_kept():
 
 
 
-def test_only_evening_run_no_polling():
-    """Разбор идёт раз в день вечером, опроса каждые N минут нет."""
-    from chat_parser.bot import live, main
+def test_bot_exposes_only_weekly_reports():
+    from chat_parser.bot import main
     from chat_parser.bot.handlers import MAIN_KB, help_text
-    from chat_parser.config import settings
 
-    assert not hasattr(main, "live_loop") and hasattr(main, "report_loop")
-    assert not hasattr(settings, "live_poll_minutes")
-    assert "21:30" in help_text("21:30") and "(МСК)" in help_text("21:30")
+    assert hasattr(main, "weekly_loop") and not hasattr(main, "report_loop")
+    assert "Раз в неделю" in help_text()
     assert [b.text for row in MAIN_KB.keyboard for b in row] == [
-        "➕ Добавить чат", "👤 Добавить инфо о человеке", "⏰ Время отчёта",
+        "➕ Добавить чат", "👤 Добавить инфо о человеке", "📅 Еженедельный отчёт",
     ]
-    assert live.DAY.total_seconds() == 24 * 3600 and live.CONTEXT.total_seconds() == 48 * 3600

@@ -346,8 +346,9 @@ async def test_full_flow_through_bot(harness, monkeypatch):
     assert "номера меняются" in await say("/pain_999999")
 
     before = h.session.documents
-    await say("📄 Отчёт")
+    assert "PDF отправлен сюда" in await say("📄 Отчёт")
     assert h.session.documents == before + 1
+    assert h.session.files[-1][1].startswith(b"%PDF")
 
     out = await say("/redo")
     assert "[redo:yes]" in out
@@ -593,7 +594,7 @@ async def evening(harness, telegram_api, monkeypatch):
     """Аккаунт-сборщик «читает» чаты: сегодня в «Оптиках Про» пять сообщений.
     Почта настроена, письма перехватываются в h.letters."""
     from chat_parser import mailer
-    from chat_parser.bot import live
+    from chat_parser.bot import live, weekly
     from chat_parser.config import settings
     from chat_parser.ingest import collector
     from chat_parser.people import upsert_authors
@@ -606,6 +607,7 @@ async def evening(harness, telegram_api, monkeypatch):
     h.letters = []
     monkeypatch.setattr(mailer, "_send_sync", h.letters.append)
     monkeypatch.setattr(live, "connect_client", telegram_api_client)
+    monkeypatch.setattr(weekly, "connect_client", telegram_api_client)
     await h.pool.execute("insert into chats (id, title, username) values ($1, $2, $3)",
                          PRO, "Оптики Про", "optika_pro")
     await h.pool.execute("insert into cursors (chat_id) values ($1)", PRO)
@@ -675,87 +677,6 @@ async def _old_pain(h) -> int:
     return await h.pool.fetchval("select id from clusters")
 
 
-async def test_evening_report(evening, monkeypatch):
-    from chat_parser import clock
-    from chat_parser.bot import live, main
-
-    h = evening
-    cid = await _old_pain(h)
-    old_n = await h.pool.fetchval("select n_signals from clusters where id = $1", cid)
-    assert "За последние 30 дней болей пока нет" in await h.say("🔝 Топ болей за месяц")
-
-    late, early = clock.now().replace(hour=23, minute=0), clock.now().replace(hour=21)
-    assert await live.report_due(late) and not await live.report_due(early)
-
-    h.session.sent.clear()
-    report = await main.send_report(h.bot)
-    text = report.text
-    # отчёт ушёл на почту одним письмом с PDF, в Telegram — ничего
-    assert h.session.sent == [] and h.session.files == []
-    (letter,) = h.letters
-    (att,) = list(letter.iter_attachments())
-    assert att.get_filename() == report.filename and att.get_content().startswith(b"%PDF")
-
-    # переписка: чат без загруженной истории — сутки и сутки контекста, архивный — с курсора
-    modes = {chat_id: (mode, since) for chat_id, mode, since in h.calls}
-    assert modes[PRO][0] == "recent"
-    assert timedelta(hours=47) < datetime.now(timezone.utc) - modes[PRO][1] < timedelta(hours=49)
-    assert {m for m, _ in modes.values()} == {"recent", "incremental"}
-
-    assert "📊 <b>Итоги дня ·" in text
-    assert '<a href="https://t.me/optika_pro">Оптики Про</a>: 5 сообщений' in text
-    assert "Оптики — обмен опытом</a>: тишина" in text
-    assert "🧭 <b>Главное за день</b>" in text and "Поставщики срывают сроки" in text
-
-    new_id = await h.pool.fetchval(
-        "select id from clusters where label = 'Срыв сроков поставки'")
-    new_part = text.split("🆕 <b>Новые боли</b>")[1].split("🔥")[0]
-    assert f"<b>Срыв сроков поставки</b> — 2 человека, 2 сигнала → /pain_{new_id}" in new_part
-    assert "Нехватка оборудования" not in new_part  # известная боль — не новая
-    assert "↗ сообщение в чате" in new_part
-
-    sharp = text.split("🔥 <b>Острые сигналы</b>")[1].split("📈")[0]
-    assert "острота 5 из 5" in sharp and f"→ /pain_{cid}" in sharp
-    assert "— Ольга Смирнова /who_cccccccc" in sharp
-    assert '<a href="https://t.me/optika_pro/3">' in sharp
-    assert sharp.count("острота") == 1  # остальное молча копится в базе
-
-    assert "📈 <b>Всплески</b>" in text
-    assert f"Нехватка оборудования — за сутки 3, раньше почти не упоминалась → /pain_{cid}" in text
-    assert "Всего за день: 5 сигналов" in text
-    assert "токен" not in text and "лимит" not in text and "пауз" not in text
-
-    # известная боль сохранила номер и пополнилась, у новой есть описание
-    assert await h.pool.fetchval("select n_signals from clusters where id = $1", cid) == old_n + 3
-    assert "возят прибор" in await h.say(f"/pain_{new_id}")
-    top = await h.say("🔝 Топ болей за месяц")
-    assert "Нехватка оборудования" in top and "Срыв сроков поставки" in top
-
-    # расход автоматического разбора отделён от ручного
-    live_stages = {r["stage"] for r in await h.pool.fetch(
-        "select distinct stage from llm_usage where source = 'live'")}
-    assert live_stages == {"extract", "assign", "cards", "digest"}
-    assert await h.pool.fetchval(
-        "select count(*) from llm_usage where source = 'manual' and stage = 'assign'") == 0
-
-    # отправлен — сегодня больше не придёт; архив из файла автоматически не трогается
-    assert not await live.report_due(late)
-    assert await h.pool.fetchval(
-        "select count(*) from threads where chat_id <> $1 and status = 'pending'", PRO) == 0
-
-    # «Итоги дня сейчас» из /live: снова за полные сутки (не с прошлого отчёта)
-    # и не сбивает вечерний
-    out = await h.say("/live")
-    assert "включено" in out and "сегодняшние уже отправлены" in out and "[live:report]" in out
-    assert "Следующие итоги: завтра в 22:00" in out
-    out = await h.press("live:report")
-    assert "ушли на почту: owner@example.com" in out and h.session.files == []
-    again = pdf_text(letter_pdf(h.letters[-1]))
-    assert "тишина" not in again.split("Оптики Про")[1][:20]
-    assert "Срыв сроков поставки" in again and "Новых сигналов нет" not in again
-    assert [m for c, m, _ in h.calls if c == PRO] == ["recent", "incremental"]
-
-
 async def test_evening_paused_and_budget(evening, monkeypatch):
     from chat_parser.bot import live
     from chat_parser.config import settings
@@ -763,15 +684,14 @@ async def test_evening_paused_and_budget(evening, monkeypatch):
     h = evening
     await h.send_export()  # архив не разбирали — вечером он не разбирается сам
 
-    out = await h.press("live:off")
-    assert "на паузе" in out
+    await live.set_enabled(False)
     text = (await live.build_report()).text
     assert "⏸ Разбор на паузе" in text and "Оптики Про</a>: 5 сообщений" in text
     assert await h.pool.fetchval("select count(*) from signals") == 0
     assert await h.pool.fetchval("select count(*) from llm_usage where source = 'live'") == 0
     assert "В архиве ждут ручного разбора: 3 обсуждения" in text
 
-    await h.press("live:on")
+    await live.set_enabled(True)
     monkeypatch.setattr(settings, "llm_price_in", 10.0)
     monkeypatch.setattr(settings, "llm_price_out", 10.0)
     await h.pool.execute("insert into llm_usage (stage, prompt_tokens, source) "
@@ -785,8 +705,7 @@ async def test_evening_paused_and_budget(evening, monkeypatch):
     assert await h.pool.fetchval("select count(*) from signals") == 0
     assert await h.pool.fetchval(
         "select count(*) from threads where chat_id = $1 and status = 'pending'", PRO) >= 1
-    out = await h.say("/live")
-    assert "Потрачено сегодня: 31.00 из 30 ₽" in out and "лимит исчерпан" in out
+    assert await live.spent_today() == pytest.approx(31.0)
 
 
 async def test_discussion_going_at_report_time_is_not_lost(evening, monkeypatch):
@@ -902,65 +821,6 @@ async def test_new_keyboard_is_sent_once(harness):
 # ---------------------------------------------------------- время отчёта
 
 
-async def test_report_time(harness, monkeypatch):
-    from chat_parser import clock, db
-    from chat_parser.bot import live
-
-    h = harness
-    fixed = clock.now().replace(hour=15, minute=0, second=0, microsecond=0)
-    t = {"now": fixed}
-    monkeypatch.setattr(clock, "now", lambda: t["now"])
-    live.schedule_changed.clear()
-
-    out = await h.say("⏰ Время отчёта")
-    assert "Отчёт приходит на почту в <b>22:00</b> (МСК), следующий — сегодня в 22:00" in out
-    assert "[rt:2100]" in out and "[rt:custom]" in out and "[rt:soon]" in out
-    assert "[cancel]" in out
-
-    out = await h.press("rt:2100")
-    assert "Отчёт теперь приходит на почту в <b>21:00</b> (МСК). Следующий — сегодня в 21:00." in out
-    assert live.schedule_changed.is_set()  # цикл отчёта проснётся и пересчитает ожидание
-    assert await live.report_time() == (21, 0)
-    assert not await live.report_due(fixed)
-    assert await live.report_due(fixed.replace(hour=21, minute=1))
-    await h.say("⏰ Время отчёта")
-    assert "✓ 21:00" in h.session.labels and "22:00" in h.session.labels
-
-    prompt = await h.press("rt:custom")
-    assert prompt.startswith("⏰ Во сколько присылать итоги дня?")
-    out = await h.say("25:00")
-    assert "Не понял «25:00»" in out
-    out = await h.say("21:45")  # после ошибки бот ждёт ответ снова
-    assert "<b>21:45</b>" in out and "сегодня в 21:45" in out
-
-    # время уже прошло, а сегодняшнего отчёта не было — предлагаем отправить сейчас
-    out = await h.say("9", reply_to=prompt)
-    assert "Следующий — завтра в 9:00" in out and "9:00 сегодня уже прошло" in out
-    assert "[live:catchup]" in out
-    out = await h.press("live:catchup")
-    assert "Почта не настроена" in out and h.session.files  # без почты — сюда, PDF
-    assert await db.get_setting(live.REPORT_DATE_KEY) == fixed.date().isoformat()
-    tomorrow_9 = fixed.replace(hour=9) + timedelta(days=1)
-    assert await live.next_report_at() == tomorrow_9  # расписание не сдвинулось
-
-    # сегодня отчёт уже был, но выбранное время впереди — придёт ещё раз сегодня
-    out = await h.press("rt:2300")
-    assert "Следующий — сегодня в 23:00" in out and "уже прошло" not in out
-    assert "Каждый день в <b>23:00</b> (МСК)" in await h.say("/help")
-
-    # для проверки: «через 5 минут», и так несколько раз за день
-    out = await h.press("rt:soon")
-    assert "<b>15:05</b>" in out and "Следующий — сегодня в 15:05" in out
-    t["now"] = fixed.replace(minute=6)  # отчёт по расписанию пришёл в 15:05
-    assert await live.report_due()
-    await live.build_report()
-    assert not await live.report_due()
-    out = await h.press("rt:soon")
-    assert "Следующий — сегодня в 15:11" in out
-    t["now"] = fixed.replace(minute=12)
-    assert await live.report_due()
-
-
 async def test_schedule_edge_cases(harness, monkeypatch):
     from chat_parser import clock, db
     from chat_parser.bot import live
@@ -997,72 +857,6 @@ async def test_schedule_edge_cases(harness, monkeypatch):
     monkeypatch.setattr(live, "collect_day", collect_and_change)
     await live.build_report()
     assert await live.next_report_at() == day1.replace(hour=23, minute=59) + timedelta(days=2)
-
-
-async def test_report_loop_wakes_on_new_time(harness, monkeypatch):
-    import asyncio
-
-    from chat_parser import clock, db
-    from chat_parser.bot import live, main
-
-    sent = []
-
-    async def fake_send(bot, mark_sent=True):
-        sent.append(clock.now())
-        await live.skip_pending()
-
-    monkeypatch.setattr(main, "send_report", fake_send)
-    fixed = clock.now().replace(hour=15, minute=0, second=0, microsecond=0)
-    monkeypatch.setattr(clock, "now", lambda: fixed)
-    await live.set_report_time(21, 0)
-
-    loop = asyncio.create_task(main.report_loop(harness.bot))
-    try:
-        await asyncio.sleep(0.2)
-        assert sent == []  # до 21:00 ещё шесть часов — цикл спит
-        # время «наступило»: так бывает, если его перенесли на уже прошедшее
-        await db.set_setting(live.NEXT_REPORT_KEY, (fixed - timedelta(minutes=1)).isoformat())
-        live.schedule_changed.set()
-        for _ in range(50):
-            await asyncio.sleep(0.05)
-            if sent:
-                break
-        assert len(sent) == 1
-    finally:
-        loop.cancel()
-
-
-# ------------------------------------------------------ подсказки бота
-
-
-async def test_prompts_keep_keyboard_and_can_be_left(harness, monkeypatch):
-    """Бот ждёт ответ на подсказку, но кнопки внизу работают как обычно:
-    нажал другую кнопку, команду или «Отмена» — ждать перестаёт."""
-    from chat_parser.bot import handlers, live
-
-    h = harness
-    await h.press("rt:custom")
-    assert "Пока ни одного" in await h.say("➕ Добавить чат")  # кнопка сработала как обычно
-    assert await h.say("21:30") == ""  # это уже не ответ на подсказку
-    assert await live.report_time() == (22, 0)
-
-    await h.press("rt:custom")
-    await h.say("/status")
-    assert await h.say("21:30") == ""
-
-    await h.press("rt:custom")
-    await h.press("cancel")
-    assert await h.say("21:30") == ""
-
-    await h.press("rt:custom")
-    monkeypatch.setattr(handlers, "AWAIT_SECONDS", -1)  # прошло больше 15 минут
-    await h.press("rt:custom")
-    assert await h.say("21:30") == ""
-
-    monkeypatch.setattr(handlers, "AWAIT_SECONDS", 900)
-    await h.press("rt:custom")
-    assert "<b>21:30</b>" in await h.say("21:30")
-    assert await live.report_time() == (21, 30)
 
 
 # ------------------------------------------------- сведения о людях
@@ -1122,294 +916,77 @@ async def test_person_info_in_two_steps(evening):
     assert "Подключил чат" in await h.say("@optika_pro")  # один @ник вне подсказки — чат
 
 
-async def test_people_info_used_in_report(evening):
-    """Что записано о людях, видно в отчёте и учитывается моделью; имён она не видит."""
-    from chat_parser.bot import main
+async def test_weekly_includes_existing_channels_and_uses_pdf_only(evening, monkeypatch):
+    from chat_parser import clock, db
+    from chat_parser.bot import main, weekly
 
     h = evening
+    await h.send_export()  # канал из предыдущего импорта уже есть в базе
+    await h.pool.execute("update chats set in_daily = false where id = $1", PRO)
     await h.pool.execute(
-        "insert into authors (author_hash, author_label, name, username, company, role, note) "
-        "values ($1, 'u:aaaaaaaa', 'Иван Петров', 'ivan_optika', 'Оптика Люкс', 'владелец', "
-        "'закупает оправы у Essilor')", "a" * 16)
-    await main.send_report(h.bot)
+        "insert into chats (id, title, is_active) values (-99, 'Старый канал', false)"
+    )
+    until = clock.now() - timedelta(minutes=1)
+    await db.set_setting(weekly.NEXT_KEY, until.isoformat())
 
-    prompts = h.state["prompts"]
-    extract = next(p for p in prompts if "Кто есть кто" in p)
-    assert "u:aaaaaaaa — владелец, Оптика Люкс" in extract
-    assert "(автор: владелец, Оптика Люкс)" in next(p for p in prompts if "Сигналы за сутки" in p)
-    joined = "\n".join(prompts)
-    for private in ("Иван", "ivan_optika", "Essilor"):  # имя, ник и заметка — не для модели
-        assert private not in joined, private
+    report = await main.send_weekly(h.bot)
+    assert report.until == until and report.since == until - timedelta(days=7)
+    channels = {channel["title"]: channel for channel in report.channels}
+    assert set(channels) == {
+        "Оптики Про", "Оптики — обмен опытом", "Старый канал",
+    }
+    assert channels["Оптики — обмен опытом"]["messages"] == 0
+    assert len(channels["Оптики Про"]["signals"]) == 3
+    assert (PRO, "recent", report.since) in h.calls
+    assert len(h.letters) == 1 and not h.session.files
+    letter = h.letters[0]
+    assert "Еженедельный отчёт по каналам" in letter["Subject"]
+    assert letter.get_body(("plain",)).get_content().strip() == "PDF во вложении."
+    pdf = letter_pdf(letter)
+    text = pdf_text(pdf)
+    for part in ("Оптики Про", "Оптики — обмен опытом", "Старый канал",
+                 "5 сообщений", "сбор отключён", "Источник"):
+        assert part in text, text
+    assert "срочно нужен второй пупиллометр" in text
+    assert "Кто писал" not in text and "Возможности для бизнеса" not in text
+    assert "https://t.me/optika_pro/3" in pdf_links(pdf)
+    assert await weekly.next_at() > clock.now()
+    assert not await weekly.due()
 
-    text = pdf_text(letter_pdf(h.letters[-1]))
-    for part in ("Кто писал за сутки", "Иван Петров", "@ivan_optika", "владелец, Оптика Люкс",
-                 "закупает оправы у Essilor", "нет сведений",
-                 "Иван Петров · Оптика Люкс, владелец"):
-        assert part in text, part
 
-
-# ----------------------------------------------- отчёт на почту
-
-
-async def test_report_goes_to_email(evening, monkeypatch):
+async def test_weekly_manual_pdf_uses_telegram_fallback_without_moving_slot(evening, monkeypatch):
     import smtplib
 
     from chat_parser import mailer
-    from chat_parser.bot import main
-
-    h = evening
-    cid = await _old_pain(h)
-    h.session.sent.clear()
-    report = await main.send_report(h.bot)
-    new_id = await h.pool.fetchval(
-        "select id from clusters where label = 'Срыв сроков поставки'")
-    assert h.session.sent == [] and h.session.files == []  # в Telegram ничего
-
-    (letter,) = h.letters
-    assert letter["To"] == "owner@example.com" and "Итоги дня" in letter["Subject"]
-    body = letter.get_body(("html",)).get_content()
-    for part in ("Главное за сутки", "Сутки прошли под знаком поставок", "Возможности для бизнеса",
-                 "Новые боли", "Срыв сроков поставки", "Острые сигналы", "острота 5 из 5",
-                 "Ольга Смирнова", "https://t.me/optika_pro/3", "во вложении (PDF)"):
-        assert part in body, part
-    plain = letter.get_body(("plain",)).get_content()
-    assert "Сутки прошли под знаком поставок" in plain and "Срыв сроков поставки" in plain
-
-    pdf = letter_pdf(letter)
-    text = pdf_text(pdf)
-    for part in ("Главное за сутки", "Возможности для бизнеса", "Новые боли",
-                 "Как сейчас выкручиваются", "возят прибор", "Что можно предложить",
-                 "Острые сигналы", "Всплески", "Все сигналы за сутки", "Кто писал за сутки",
-                 "Ольга Смирнова", "Мария"):
-        assert part in text, part
-    links = pdf_links(pdf)
-    assert "https://t.me/optika_pro/3" in links
-    assert f"https://t.me/test_bot?start=pain_{new_id}" in links
-    assert f"https://t.me/test_bot?start=pain_{cid}" in links
-    assert report.filename == list(letter.iter_attachments())[0].get_filename()
-
-    # ссылки из PDF открывают карточки в боте
-    assert "возят прибор" in await h.say(f"/start pain_{new_id}")
-    assert "👤 <b>Иван Петров</b>" in await h.say("/start who_aaaaaaaa")
-
-    # письмо не ушло — отчёт приходит в Telegram, чтобы не потерялся
-    def broken(msg):
-        raise smtplib.SMTPAuthenticationError(535, b"Username and Password not accepted")
-
-    monkeypatch.setattr(mailer, "_send_sync", broken)
-    h.session.sent.clear()
-    await main.send_report(h.bot)
-    assert "⚠️ Отчёт не ушёл на почту: почтовый сервер не принял логин" in h.session.sent[0]
-    assert h.session.files and h.session.files[-1][1].startswith(b"%PDF")
-
-    # /live: куда уходит почта и проверка одной кнопкой
-    monkeypatch.setattr(mailer, "_send_sync", h.letters.append)
-    out = await h.say("/live")
-    assert "отправляю на почту: owner@example.com" in out and "[live:mail]" in out
-    assert "✅ Письмо ушло: owner@example.com" in await h.press("live:mail")
-
-
-async def test_without_email_report_comes_to_telegram(evening, monkeypatch):
-    from chat_parser.bot import main
-    from chat_parser.config import settings
-    from chat_parser.report import daily
-
-    h = evening
-    monkeypatch.setattr(settings, "smtp_password", "")
-    h.session.sent.clear()
-    await main.send_report(h.bot)
-    assert h.session.sent[0].startswith("⚠️ Почта не настроена")
-    assert h.session.files[-1][1].startswith(b"%PDF") and h.letters == []
-
-    # и PDF не собрался — тогда текстом
-    monkeypatch.setattr(daily.DailyReport, "pdf", lambda self, bot_username=None: None)
-    h.session.files.clear()
-    h.session.sent.clear()
-    report = await main.send_report(h.bot)
-    assert h.session.files == [] and h.session.sent[1:] == [report.text]
-
-
-async def test_old_send_now_button_sends_to_email(evening):
-    """Кнопка прошлой версии ещё может висеть у кого-то на клавиатуре."""
-    from chat_parser import db
-    from chat_parser.bot import live
-
-    h = evening
-    before = await live.next_report_at()
-    out = await h.say("📤 Отправить отчёт сейчас")
-    assert "Собираю итоги за последние сутки" in out and "[stop:" in out
-    assert "✅ Итоги за последние сутки ушли на почту: owner@example.com." in out
-    assert len(h.letters) == 1 and h.session.files == []
-    assert await live.next_report_at() == before  # по расписанию придёт как обычно
-    assert await db.get_setting(live.REPORT_DATE_KEY) is None
-
-
-# ------------------------------------------ еженедельный отчёт по теме форума
-
-OPTIKI = -1009000000077  # «Оптики go», группа с темами
-
-
-def _forum_messages():
-    from telethon.tl.types import (
-        Message, MessageReactions, MessageReplyHeader, PeerChannel, PeerUser, ReactionCount,
-        ReactionEmoji, User,
-    )
-
-    now = datetime.now(timezone.utc)
-    people_ = {900: ("Анжелла", "Шаталина"), 901: ("Павел", "Орлов"), 902: ("Кирилл", None)}
-
-    def msg(mid, uid, days, text, reply=None, likes=0, fire=0):
-        results = [ReactionCount(reaction=ReactionEmoji(emoticon=e), count=n)
-                   for e, n in (("👍", likes), ("🔥", fire)) if n]
-        head = (MessageReplyHeader(reply_to_msg_id=reply, reply_to_top_id=12) if reply
-                else MessageReplyHeader(forum_topic=True, reply_to_msg_id=12))
-        m = Message(id=mid, peer_id=PeerChannel(9000000077), date=now - timedelta(days=days),
-                    message=text, from_id=PeerUser(uid), reply_to=head,
-                    reactions=MessageReactions(results=results) if results else None)
-        first, last = people_[uid]
-        m._sender = User(id=uid, first_name=first, last_name=last)
-        return m
-
-    long = " Подробно рассказываю, как это устроено у нас в салонах, какие цифры и что не сработало." * 3
-    # номера растут со временем, как в Telegram
-    msgs = [
-        msg(100, 900, 200, "Совсем старый пост про мотивацию." + long, likes=99),
-        msg(101, 900, 100, "Ещё раз про мотивацию продавцов — итоги полугода." + long, likes=60),
-        msg(102, 900, 20, "Закупка оправ: где брать и как не переплатить." + long, likes=15),
-        msg(103, 901, 10, "Мой опыт с оправами из Китая." + long, likes=2),
-        msg(104, 900, 3, "Как я выстроила мотивацию продавцов: оклад плюс процент." + long,
-            likes=30, fire=10),
-        msg(105, 901, 3, "согласен, у нас так же", reply=104),
-        msg(106, 902, 3, "спасибо, очень полезно", reply=104),
-        msg(107, 901, 2, "+1", reply=104),
-        msg(108, 901, 2, "Аренда помещения под салон: на что смотреть в договоре." + long,
-            likes=45),
-        msg(109, 902, 1, "Кто знает, где взять кассу подешевле? " + long),
-    ]
-    return {m.id: m for m in msgs}
-
-
-@pytest.fixture
-async def forum(evening, monkeypatch):
-    """В «Оптики go» тема «Бизнес. Управление ресурсами» с постами и реакциями."""
-    from types import SimpleNamespace
-
-    from telethon.tl.types import ForumTopic, PeerChannel, PeerNotifySettings, PeerUser
-
     from chat_parser.bot import weekly
 
+    def broken(_mail):
+        raise smtplib.SMTPAuthenticationError(535, b"invalid credentials")
+
+    monkeypatch.setattr(mailer, "_send_sync", broken)
     h = evening
-    await h.pool.execute("insert into chats (id, title, username) values ($1, $2, $3)",
-                         OPTIKI, "Оптики go", "optiki_go")
-    h.forum = _forum_messages()
-
-    def topic(tid, title):
-        return ForumTopic(id=tid, date=datetime.now(timezone.utc), peer=PeerChannel(1),
-                          title=title, icon_color=0, top_message=tid, read_inbox_max_id=0,
-                          read_outbox_max_id=0, unread_count=0, unread_mentions_count=0,
-                          unread_reactions_count=0, unread_poll_votes_count=0,
-                          from_id=PeerUser(1), notify_settings=PeerNotifySettings())
-
-    class FakeForum:
-        async def get_entity(self, ref):
-            assert ref == OPTIKI
-            return "optiki"
-
-        async def __call__(self, request):
-            return SimpleNamespace(topics=[topic(1, "Общий"),
-                                           topic(12, "Бизнес. Управление ресурсами")])
-
-        def iter_messages(self, entity, reply_to=None, **kw):
-            assert reply_to == 12
-
-            async def gen():
-                for mid in sorted(h.forum, reverse=True):  # от новых к старым
-                    yield h.forum[mid]
-            return gen()
-
-        async def disconnect(self):
-            pass
-
-    async def connect():
-        return FakeForum()
-
-    monkeypatch.setattr(weekly, "connect_client", connect)
-    return h
+    scheduled = await weekly.next_at()
+    assert "[weekly:now]" in await h.say("📅 Еженедельный отчёт")
+    result = await h.press("weekly:now")
+    assert "✅ PDF отправлен сюда." in result
+    assert h.letters == [] and len(h.session.files) == 1
+    filename, data, caption = h.session.files[0]
+    assert filename.endswith(".pdf") and data.startswith(b"%PDF") and caption is None
+    assert await weekly.next_at() == scheduled
 
 
-async def test_weekly_report(forum, monkeypatch):
-    from telethon.tl.types import MessageReactions, ReactionCount, ReactionEmoji
-
+async def test_weekly_fanout_failure_keeps_due_slot(evening, monkeypatch):
     from chat_parser import clock, db
-    from chat_parser.bot import live, main, weekly
-    from chat_parser.config import settings
+    from chat_parser.bot import delivery, main, weekly
 
-    h = forum
-    # группа еженедельного отчёта в ежедневный не входит
-    await live.build_report(mark_sent=False)
-    assert OPTIKI not in {c for c, _, _ in h.calls}
-    assert await h.pool.fetchval("select in_daily from chats where id = $1", OPTIKI) is False
-    assert "📅 только еженедельный отчёт — тема «Бизнес. Управление ресурсами»" in \
-        await h.say("➕ Добавить чат")
-    out = await h.say("/live")
-    assert "Еженедельный отчёт «Отклик на темы»" in out and "[weekly:now]" in out
+    pending = clock.now() - timedelta(minutes=1)
+    await db.set_setting(weekly.NEXT_KEY, pending.isoformat())
 
-    h.letters.clear()
-    out = await h.say("/weekly")
-    assert "Собираю еженедельный отчёт" in out and "[stop:" in out
-    assert "✅ Еженедельный отчёт ушёл на почту: owner@example.com" in out
-    (letter,) = h.letters
-    assert letter["Subject"].startswith("Отклик на темы · Оптики go — неделя по ")
-    text = pdf_text(letter_pdf(letter))
-    for part in ("Еженедельный отчёт", "Лучше всего заходят посты про мотивацию продавцов",
-                 "Идеи для постов", "Анжелла Шаталина", "За неделю · 1 пост · 40 реакций",
-                 "За месяц · 2 поста · 55 реакций", "За полгода · 3 поста · 115 реакций",
-                 "Мотивация продавцов", "Закупка оправ", "40 реакций · 3 комментария",
-                 "Другие участники", "Аренда помещения", "Павел Орлов"):
-        assert part in text, part
-    assert "Совсем старый пост" not in text  # старше полугода
-    html = letter.get_body(("html",)).get_content()
-    assert "40 реакций (👍 30 · 🔥 10) · 3 комментария" in html
-    assert "https://t.me/optiki_go/12/104" in html
+    async def failed_delivery(_bot, _chat_ids, _report):
+        return None
 
-    rows = {r["message_id"]: dict(r) for r in await h.pool.fetch(
-        "select * from topic_messages order by message_id")}
-    assert set(rows) == set(range(101, 110))  # 100 старше полугода — не читали
-    assert rows[104]["is_post"] and rows[104]["theme"] == "Мотивация продавцов"
-    assert rows[105]["is_post"] is False and rows[105]["reply_to"] == 104
-    assert rows[109]["is_post"] is False  # длинный, но это вопрос, а не пост
-    weekly_prompt = next(p for p in h.state["prompts"] if "## За неделю" in p)
-    assert "Анжелла" not in weekly_prompt and "Шаталина" not in weekly_prompt
-
-    # полгода прочитаны один раз; дальше каждую неделю — только последний месяц:
-    # реакции свежих постов обновляются, у постов старше месяца — прежние цифры
-    assert await db.get_setting(weekly.FULL_READ_KEY.format(chat=OPTIKI, topic=12))
-    calls = len(h.state["prompts"])
-    h.forum[104].reactions = MessageReactions(
-        results=[ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=55)])
-    h.forum[101].reactions = MessageReactions(  # пост 100-дневной давности
-        results=[ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=99)])
-    await h.say("/weekly")
-    reactions = dict(await h.pool.fetch(
-        "select message_id, reactions from topic_messages where message_id in (101, 104)"))
-    assert reactions == {104: 55, 101: 60}
-    assert not any("Сообщения:\n" in p for p in h.state["prompts"][calls:])  # заново не разбирали
-    text = pdf_text(letter_pdf(h.letters[-1]))
-    assert "За полгода · 3 поста" in text  # полгода в отчёте остались
-
-    # по расписанию: понедельник, 10:00; «сейчас» расписание не сдвигает
-    nxt = await weekly.next_at()
-    assert nxt.astimezone(clock.tz()).weekday() == 0 and nxt.astimezone(clock.tz()).hour == 10
-    await db.set_setting(weekly.NEXT_KEY,
-                         (clock.now() - timedelta(minutes=1)).isoformat())
-    assert await weekly.due()
-    await main.send_weekly(h.bot)
-    assert not await weekly.due() and len(h.letters) == 3
-    assert (await weekly.next_at()) > clock.now()
-
-    # темы с таким названием нет — письмо объясняет, какие есть
-    monkeypatch.setattr(settings, "weekly_topic", "Логистика")
-    await h.say("/weekly")
-    plain = h.letters[-1].get_body(("plain",)).get_content()
-    assert "Тема «Логистика» не найдена. В группе есть: «Общий», «Бизнес. Управление ресурсами»" \
-        in plain
+    monkeypatch.setattr(delivery, "deliver", failed_delivery)
+    with pytest.raises(RuntimeError, match="не доставлен"):
+        await main.send_weekly(evening.bot)
+    assert await weekly.next_at() == pending and await weekly.due()
+    assert await db.get_setting(weekly.SENT_KEY) is None

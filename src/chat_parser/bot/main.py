@@ -1,4 +1,4 @@
-"""Запуск бота: polling + суточный планировщик в одном процессе.
+"""Запуск бота: polling + недельный планировщик в одном процессе.
 
 Бот — это панель управления (токен от @BotFather). Историю чатов он читать
 не может и не должен: этим занимается аккаунт-сборщик через MTProto. Две
@@ -23,8 +23,7 @@ from ..net import aiogram_proxy, network_hint
 from . import format as fmt
 from . import jobs
 from .auth import AdminOnly
-from . import delivery, live, weekly
-from ..report.daily import DailyReport
+from . import delivery, weekly
 from .handlers import KEYBOARD_KEY, KEYBOARD_VERSION, MAIN_KB, router
 
 log = logging.getLogger("chat_parser.bot")
@@ -36,7 +35,7 @@ COMMANDS = [
     BotCommand(command="top", description="топ болей"),
     BotCommand(command="pain", description="карточка боли по номеру"),
     BotCommand(command="signals", description="последние сигналы"),
-    BotCommand(command="report", description="отчёт файлом"),
+    BotCommand(command="report", description="еженедельный PDF"),
     BotCommand(command="redo", description="разобрать всё заново"),
     BotCommand(command="retry", description="повторить неудачные обсуждения"),
     BotCommand(command="run", description="полный цикл одной кнопкой"),
@@ -55,45 +54,13 @@ async def _broadcast(bot: Bot, text: str) -> None:
             log.warning("не доставлено %s: %s", admin, e)
 
 
-async def send_report(bot: Bot, mark_sent: bool = True) -> DailyReport:
-    """Итоги дня на почту (в Telegram — только если почта не сработала)."""
-    report = await jobs.run_job(live.build_report(mark_sent))
-    await delivery.deliver(bot, settings.admin_ids, report)
-    return report
-
-
-async def report_loop(bot: Bot) -> None:
-    """Итоги дня в выбранное время. Если в это время бот был выключен —
-    досылаются сразу после запуска. Смена времени в боте будит цикл."""
-    live.schedule_changed = asyncio.Event()  # событие привязывается к своему циклу asyncio
-    while True:
-        live.schedule_changed.clear()
-        try:
-            if await live.report_due():
-                await send_report(bot)
-            wait = (await live.next_report_at() - clock.now()).total_seconds()
-        except jobs.Busy:
-            wait = 60  # идёт другая операция — отчёт чуть позже
-        except jobs.Cancelled:
-            try:
-                await live.skip_pending()  # остановили кнопкой ⏹ — сегодня не повторяем
-                continue
-            except Exception as e:  # noqa: BLE001
-                log.warning("не удалось сдвинуть расписание: %s", e)
-                wait = 60
-        except Exception as e:  # noqa: BLE001
-            log.warning("дневной отчёт не собрался: %s: %s", type(e).__name__, e)
-            wait = 300
-        try:
-            await asyncio.wait_for(live.schedule_changed.wait(), timeout=max(wait, 1) + 1)
-        except asyncio.TimeoutError:
-            pass
-
-
-async def send_weekly(bot: Bot, mark_sent: bool = True):
-    """Еженедельный отчёт на почту (в Telegram — только если почта не сработала)."""
-    report = await jobs.run_job(weekly.build(mark_sent=mark_sent))
-    await delivery.deliver(bot, settings.admin_ids, report)
+async def send_weekly(bot: Bot):
+    pending = await weekly.next_at()
+    report = await jobs.run_job(weekly.build(until=pending))
+    if await delivery.deliver(bot, settings.admin_ids, report) is None:
+        raise RuntimeError("еженедельный PDF не доставлен")
+    await weekly.advance(pending)
+    await db.set_setting(weekly.SENT_KEY, clock.now().isoformat())
     return report
 
 
@@ -125,16 +92,12 @@ async def announce_keyboard(bot: Bot) -> None:
     Telegram остаётся старая, пока бот не пришлёт другую."""
     if await db.get_setting(KEYBOARD_KEY) == KEYBOARD_VERSION:
         return
-    at = clock.hhmm(*await live.report_time())
     for admin in settings.admin_ids:
         try:
             await bot.send_message(
                 admin,
-                f"⌨️ Обновил бота. Итоги дня теперь приходят только на почту, каждый день "
-                f"в {at} ({clock.tz_label()}): обзор в письме и подробный PDF во вложении. "
-                "Внизу три кнопки: ➕ Добавить чат — список чатов с удалением, 👤 Добавить "
-                "инфо о человеке — кто есть кто попадёт в отчёты, и ⏰ Время отчёта — когда "
-                "присылать отчёт на почту. Подробности — /help",
+                "Еженедельный PDF по всем каналам. Кнопка «Еженедельный отчёт» "
+                "покажет расписание и позволит получить файл сразу.",
                 reply_markup=MAIN_KB,
             )
         except Exception as e:  # noqa: BLE001
@@ -209,7 +172,6 @@ async def run_bot() -> None:
             if hint is None:
                 raise
             raise SystemExit(f"\n❌ База данных недоступна: {e}\n\n{hint}") from None
-        await weekly.mark_chats(await db.get_pool())  # группа недельного отчёта — не в ежедневном
         dp = Dispatcher()
         guard = AdminOnly(settings.admin_ids)
         dp.message.outer_middleware(guard)
@@ -218,13 +180,11 @@ async def run_bot() -> None:
         await bot.set_my_commands(COMMANDS)
         via = f", через прокси {settings.tg_proxy}" if settings.tg_proxy else ""
         log.info("бот @%s запущен%s, админов: %d", me.username, via, len(settings.admin_ids))
-        background = [asyncio.create_task(announce_keyboard(bot))]
+        background = [asyncio.create_task(announce_keyboard(bot)),
+                      asyncio.create_task(weekly_loop(bot))]
         if settings.telegram_ready:
             if await jobs.pending_requests():
                 background.append(asyncio.create_task(connect_saved(bot)))
-            background.append(asyncio.create_task(report_loop(bot)))
-            if weekly.enabled():
-                background.append(asyncio.create_task(weekly_loop(bot)))
         await dp.start_polling(bot)
     finally:
         for t in background:

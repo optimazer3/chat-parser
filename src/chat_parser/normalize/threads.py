@@ -90,7 +90,8 @@ def thread_hash(ids: list[int], texts: dict[int, str]) -> str:
 
 
 async def build_for_chat(
-    pool: asyncpg.Pool, chat_id: int, since: datetime | None = None
+    pool: asyncpg.Pool, chat_id: int, since: datetime | None = None,
+    *, until: datetime | None = None,
 ) -> dict:
     """since — собрать только обсуждения из сообщений не старше этого момента.
 
@@ -106,10 +107,12 @@ async def build_for_chat(
               from messages
              where chat_id = $1 and not is_bot and text <> ''
                and ($2::timestamptz is null or ts >= $2)
+               and ($3::timestamptz is null or ts < $3)
              order by message_id
             """,
             chat_id,
             since,
+            until,
         )
     ]
     if not rows:

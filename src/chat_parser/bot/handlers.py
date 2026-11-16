@@ -15,7 +15,6 @@ import re
 import tempfile
 import time
 import uuid
-from datetime import timedelta
 from pathlib import Path
 
 import asyncpg
@@ -24,7 +23,6 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart, Filter
 from aiogram.types import (
     CallbackQuery,
-    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -33,7 +31,7 @@ from aiogram.types import (
     User,
 )
 
-from .. import clock, db, usage
+from .. import db, usage
 from ..config import settings
 from ..ingest import collector
 from .. import people
@@ -41,7 +39,7 @@ from ..links import QUOTE_MESSAGE_SQL, BadChatRef, chat_link, message_link, norm
 from ..llm import build_llm
 from ..quotes import pick_quotes
 from . import format as fmt
-from . import jobs
+from . import jobs, weekly
 
 router = Router()
 
@@ -60,11 +58,12 @@ BTN_CHATS = "💬 Список чатов"
 BTN_PERSON = "👤 Добавить инфо о человеке"
 BTN_PERSON_OLD = "👤 Инфо о человеке"
 BTN_TIME = "⏰ Время отчёта"
+BTN_WEEKLY = "📅 Еженедельный отчёт"
 BTN_SEND_NOW = "📤 Отправить отчёт сейчас"
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "8"
+KEYBOARD_VERSION = "9"
 
 # Отчёты уходят на почту, в боте остаются три кнопки. Прежние кнопки убраны
 # с клавиатуры, но их обработчики оставлены: у кого-то ещё может висеть старая.
@@ -72,43 +71,22 @@ MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ADD)],
         [KeyboardButton(text=BTN_PERSON)],
-        [KeyboardButton(text=BTN_TIME)],
+        [KeyboardButton(text=BTN_WEEKLY)],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-def help_text(at: str = "22:00") -> str:
-    """at — во сколько приходят итоги дня, «21:30». Абзацы — одной строкой:
-    Telegram сам переносит текст по ширине экрана."""
-    budget = (f"не больше {settings.live_daily_budget:g} ₽ в день"
-              if settings.live_daily_budget > 0 else "без дневного лимита")
-    mail = (", ".join(settings.email_recipients) if settings.email_ready
-            else "почта пока не настроена — до тех пор присылаю отчёт сюда")
-    return "\n".join([
-        "👋 <b>Я слежу за чатами рынка оптики</b>",
-        "",
-        "Читаю переписку владельцев оптик, продавцов, врачей и покупателей и нахожу, на что "
-        "люди жалуются, что ищут и каких решений им не хватает.",
-        "",
-        "<b>Отчёт — на почту</b>",
-        f"Каждый день в <b>{at}</b> ({clock.tz_label()}) я читаю переписку подключённых чатов "
-        f"за последние сутки, разбираю её и отправляю подробный отчёт на почту "
-        f"({fmt.esc(mail)}). В письме — обзор суток, во вложении — PDF со всеми сигналами, "
-        "цитатами, новыми болями, всплесками и тем, кто что писал. Сюда отчёты не приходят.",
-        "",
-        "<b>Кнопки</b>",
-        "➕ <b>Добавить чат</b> — список чатов, за которыми я слежу; там же можно удалить чат. "
-        "Чтобы добавить новый — пришли ссылку на него.",
-        "👤 <b>Добавить инфо о человеке</b> — пришли @username, потом напиши, кто это. В отчётах "
-        "будет видно, кто что сказал, а при разборе я учту компанию и роль.",
-        "⏰ <b>Время отчёта</b> — во сколько присылать отчёт на почту.",
-        "",
-        "<b>Полезно знать</b>",
-        "• Каждая жалоба подтверждена дословной цитатой — выдуманное я отбрасываю.",
-        f"• На автоматический разбор трачу {budget}.",
-        "• Остальные команды — в меню слева.",
-    ])
+def help_text() -> str:
+    return (
+        "👋 <b>Мониторинг чатов рынка оптики</b>\n\n"
+        "Добавь канал по ссылке или @username. Раз в неделю я собираю PDF по всем "
+        "подключённым каналам: число сообщений и главные сигналы с цитатами. "
+        "Отчёт приходит на почту или в личный чат, если почта недоступна.\n\n"
+        "📅 <b>Еженедельный отчёт</b> — расписание и получение PDF сейчас.\n"
+        "➕ <b>Добавить чат</b> — управление каналами.\n"
+        "👤 <b>Добавить инфо о человеке</b> — компания, роль и заметка."
+    )
 
 
 class LiveMessage:
@@ -203,7 +181,7 @@ AWAIT_SECONDS = 15 * 60
 _awaiting: dict[int, tuple[str, float]] = {}  # кто -> (чего ждём, до какого момента)
 KEYBOARD_TEXTS = {BTN_STATUS, BTN_EXTRACT, BTN_CLUSTER, BTN_TOP, BTN_REPORT, BTN_HELP,
                   BTN_ADD, BTN_TOP_MONTH, BTN_CHATS, BTN_PERSON, BTN_PERSON_OLD, BTN_TIME,
-                  BTN_SEND_NOW}
+                  BTN_SEND_NOW, BTN_WEEKLY}
 CANCEL_KB = InlineKeyboardMarkup(
     inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel")]]
 )
@@ -232,9 +210,7 @@ class AwaitingAnswer(Filter):
 @router.message(F.text, AwaitingAnswer())
 async def on_awaited_answer(message: Message, awaiting: str) -> None:
     text = (message.text or "").strip()
-    if awaiting == "time":
-        await _time_answer(message, text)
-    elif awaiting == "person":
+    if awaiting == "person":
         await _person_info(message, text)
     elif awaiting.startswith("about:"):
         await _save_person(message, awaiting.removeprefix("about:"), text)
@@ -270,28 +246,7 @@ async def _person_edit(message: Message, kind: str, label: str, text: str) -> No
     await _send_person(message, label, prefix="✅ Сохранил.\n\n")
 
 
-TIME_PROMPT = "⏰ Во сколько присылать итоги дня?"
 PERSON_PROMPT = "👤 Информация о человеке"
-
-
-@router.message(F.reply_to_message.text.startswith(TIME_PROMPT))
-async def on_time_reply(message: Message) -> None:
-    await _time_answer(message, message.text or "")
-
-
-async def _time_answer(message: Message, text: str) -> None:
-    from . import live
-
-    parsed = live.parse_time(text)
-    if parsed is None:
-        await message.answer(
-            f"{TIME_PROMPT}\n\nНе понял «{fmt.esc(text)}». Напиши время, например "
-            "<b>21:30</b> или <b>9:00</b>.",
-            reply_markup=CANCEL_KB,
-        )
-        _await_answer(message.from_user, "time")
-        return
-    await _apply_time(message, *parsed)
 
 
 @router.message(F.reply_to_message.text.startswith(PERSON_PROMPT))
@@ -301,7 +256,7 @@ async def on_person_info_reply(message: Message) -> None:
 
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_link(message: Message, command: CommandObject) -> None:
-    """Ссылки из PDF итогов дня: t.me/<бот>?start=pain_12 или start=who_1a2b3c4d."""
+    """Открыть карточку боли или участника по ссылке."""
     arg = (command.args or "").strip()
     if m := re.fullmatch(r"pain_(\d+)", arg):
         await _send_pain(message, m.group(1))
@@ -315,10 +270,7 @@ async def cmd_start_link(message: Message, command: CommandObject) -> None:
 @router.message(Command("help"))
 @router.message(F.text == BTN_HELP)
 async def cmd_help(message: Message) -> None:
-    from . import live
-
-    at = clock.hhmm(*await live.report_time())
-    await message.answer(help_text(at), reply_markup=MAIN_KB)
+    await message.answer(help_text(), reply_markup=MAIN_KB)
 
 
 @router.message(Command("status"))
@@ -575,8 +527,8 @@ async def btn_top_month(message: Message) -> None:
     )]
     if not rows:
         await message.answer(
-            "За последние 30 дней болей пока нет. Топ пополняется вечером, вместе с "
-            "итогами дня. Боли за всё время — /top"
+            "За последние 30 дней болей пока нет. Чтобы обновить список, запусти /cluster. "
+            "Боли за всё время — /top"
         )
         return
     picked = []
@@ -655,19 +607,6 @@ async def _signals_with_links(tail: str, *args) -> list[dict]:
     return out
 
 
-async def _send_report(message: Message) -> None:
-    if not jobs.REPORT_PATH.is_file():
-        await message.answer("Отчёта ещё нет. Сначала 🧩 Пересчитать боли.")
-        return
-    await message.answer_document(FSInputFile(jobs.REPORT_PATH), caption="Полный отчёт")
-
-
-@router.message(Command("report"))
-@router.message(F.text == BTN_REPORT)
-async def cmd_report(message: Message) -> None:
-    await _send_report(message)
-
-
 # ------------------------------------------------------------- полный цикл
 
 
@@ -695,7 +634,6 @@ async def _do_run(message: Message, extract_limit: int | None) -> None:
     )
     await live.set("✅ Готово", final=True)
     await _reply_long(message, fmt.fmt_digest(stats, new_signals, new_msgs, list(top)))
-    await _send_report(message)
 
 
 @router.message(Command("run"))
@@ -734,7 +672,7 @@ async def cmd_chats(message: Message) -> None:
     pool = await db.get_pool()
     rows = await pool.fetch(
         """
-        select c.id, c.title, c.username, c.link, c.is_active, c.in_daily, cu.last_run,
+        select c.id, c.title, c.username, c.link, c.is_active, cu.last_run,
                cu.note,
                (select count(*) from messages m where m.chat_id = c.id) msgs,
                (select count(*) from messages m
@@ -758,8 +696,6 @@ async def cmd_chats(message: Message) -> None:
         lines.append(f"<b>{i}. {name}</b>")
         lines.append(f"{fmt.messages_word(r['msgs'])}, за сутки {fmt.fmt_num(r['day_msgs'])} · "
                      f"{fmt.people_word(r['people'])} · {fmt.signals_word(r['signals'])}")
-        if not r["in_daily"]:
-            lines.append(f"📅 только еженедельный отчёт — тема «{fmt.esc(settings.weekly_topic)}»")
         if not r["is_active"]:
             lines.append(f"⛔ отключён: {fmt.esc(r['note'] or 'нет доступа')}")
         else:
@@ -1116,128 +1052,69 @@ async def cmd_usage(message: Message) -> None:
     )
 
 
-# ------------------------------------------ скрытая: отслеживание и отчёт
+# ------------------------------------------------------- еженедельный отчёт
 
 
-@router.message(Command("live"))
+@router.message(Command("live", "time"), F.chat.type == "private")
+@router.message(F.text.in_({BTN_WEEKLY, BTN_TIME}), F.chat.type == "private")
 async def cmd_live(message: Message) -> None:
-    """Пауза отслеживания, расход за день и отчёт по запросу. Не в меню."""
-    from . import live
-
-    on = await live.is_enabled()
-    lines = [f"📡 Отслеживание: <b>{'включено' if on else 'на паузе'}</b>"]
-    if not settings.telegram_ready:
-        lines.append("Нужны ключи Telegram API — без них читать чаты я не могу.")
-    at = clock.hhmm(*await live.report_time())
-    lines.append(
-        f"Каждый день в {at} ({clock.tz_label()}) забираю переписку за сутки, разбираю "
-        "её и присылаю итоги дня. Поменять время — кнопка ⏰ Время отчёта."
-    )
-    spent = await live.spent_today()
-    if live.budget_enabled():
-        lines.append(f"Потрачено сегодня: {spent:.2f} из {settings.live_daily_budget:g} ₽")
-    hit = await live.budget_hit_today()
-    if hit:
-        lines.append(f"⚠️ Сегодня лимит исчерпан в {fmt.when(hit)}.")
-    raw = await db.get_setting(live.LAST_RUN_KEY)
-    if raw:
-        from datetime import datetime
-
-        lines.append(f"Последний разбор: {fmt.when(datetime.fromisoformat(raw))}")
-    sent = await db.get_setting(live.REPORT_DATE_KEY) == clock.now().date().isoformat()
-    lines.append(f"Следующие итоги: {fmt.when_next(await live.next_report_at())}"
-                 + (" (сегодняшние уже отправлены)" if sent else ""))
+    lines = [f"📅 Следующий еженедельный PDF: <b>{fmt.when_next(await weekly.next_at())}</b>."]
+    rows = [[("📥 Получить PDF сейчас", "weekly:now")]]
     if settings.email_ready:
-        lines.append("Итоги дня отправляю на почту: "
-                     + fmt.esc(", ".join(settings.email_recipients)))
-    else:
-        lines.append("Почта не настроена — итоги дня приходят сюда. Нужны REPORT_EMAIL_TO, "
-                     "SMTP_USER и SMTP_PASSWORD в .env.")
-    toggle = ("⏸ Поставить на паузу", "live:off") if on else ("▶️ Включить", "live:on")
-    from . import weekly
-
-    if weekly.enabled():
-        lines.append(f"Еженедельный отчёт «Отклик на темы» ({fmt.esc(settings.weekly_chat)} · "
-                     f"{fmt.esc(settings.weekly_topic)}): {fmt.when_next(await weekly.next_at())}")
-    rows = [[toggle], [("📤 Итоги дня сейчас", "live:report")]]
-    if weekly.enabled():
-        rows.append([("📅 Еженедельный отчёт сейчас", "weekly:now")])
-    if settings.email_ready:
+        lines.append("Почта: " + fmt.esc(", ".join(settings.email_recipients)))
         rows.append([("✉️ Проверить почту", "live:mail")])
+    else:
+        lines.append("Доставка в этот чат.")
     await message.answer("\n".join(lines), reply_markup=_kb(*rows))
 
 
-@router.message(F.text == BTN_SEND_NOW)
-async def btn_send_now(message: Message, bot: Bot) -> None:
-    """Кнопка из прошлой версии — у кого-то ещё может висеть старая клавиатура."""
-    await _report_now(message, bot)
-
-
-async def _report_now(message: Message, bot: Bot, catch_up: bool = False) -> None:
-    """Итоги за последние сутки прямо сейчас — на почту. catch_up — сегодняшние,
-    пропавшие из-за смены времени: считаются отправленными. Расписание не трогает."""
-    from . import live
-
-    await _send_now(
-        message, bot, "📤 Собираю итоги за последние сутки…",
-        lambda job_id: live.build_report(mark_sent=catch_up, catch_up=catch_up, job_id=job_id),
-        sent="Итоги за последние сутки ушли на почту", below="Итоги за последние сутки — ниже.",
-    )
-
-
-@router.message(Command("weekly"))
+@router.message(Command("report", "weekly"), F.chat.type == "private")
+@router.message(F.text.in_({BTN_SEND_NOW, BTN_REPORT}), F.chat.type == "private")
 async def cmd_weekly(message: Message, bot: Bot) -> None:
-    """Еженедельный отчёт прямо сейчас — для проверки. Расписание не трогает."""
-    from . import weekly
-
-    if not weekly.enabled():
-        await message.answer("Еженедельный отчёт выключен: в .env пустой WEEKLY_CHAT.")
-        return
-    await _send_now(message, bot, "📅 Собираю еженедельный отчёт…",
-                    lambda job_id: weekly.build(job_id=job_id, mark_sent=False),
-                    sent="Еженедельный отчёт ушёл на почту", below="Еженедельный отчёт — ниже.")
-
-
-@router.callback_query(F.data == "weekly:now")
-async def cb_weekly(call: CallbackQuery, bot: Bot) -> None:
-    await call.answer()
-    await _drop_markup(call)
-    if call.message is not None:
-        await cmd_weekly(call.message, bot)
-
-
-async def _send_now(message: Message, bot: Bot, head: str, make, sent: str, below: str) -> None:
-    """Собрать отчёт с прогрессом и ⏹ и отправить на почту."""
+    """Отправить недельный PDF по запросу без сдвига расписания."""
     from . import delivery
 
+    head = "📅 Собираю еженедельный PDF…"
     job_id, progress = await _start_live(message, head)
-    task = asyncio.ensure_future(jobs.run_job(make(job_id)))
+    task = asyncio.create_task(jobs.run_job(weekly.build(job_id=job_id)))
     try:
         shown = ""
-        while not task.done():  # показываем, на каком шаге сбор
+        while not task.done():
             await asyncio.wait({task}, timeout=3)
             job = jobs.current()
             if job and job["id"] == job_id and job.get("progress") not in ("", shown):
                 shown = job["progress"]
                 await progress.set(f"{head}\n{fmt.esc(shown)}")
         report = task.result()
+        sent = await delivery.deliver(bot, [message.chat.id], report)
     except jobs.Cancelled:
-        await progress.set(fmt.fmt_stopped("сбор итогов"), final=True)
+        await progress.set(fmt.fmt_stopped("сбор отчёта"), final=True)
         return
     except jobs.Busy as e:
         await progress.set(_busy(e), final=True)
         return
-    except Exception as e:  # noqa: BLE001
-        await progress.set(f"❌ Не получилось собрать: {fmt.esc(e)}", final=True)
+    except Exception as e:
+        await progress.set(f"❌ Не удалось подготовить PDF: {fmt.esc(e)}", final=True)
         return
     finally:
         if not task.done():
             task.cancel()
-    if await delivery.deliver(bot, [message.chat.id], report):
-        await progress.set(f"✅ {sent}: " + fmt.esc(", ".join(settings.email_recipients))
-                           + ". Отчёт по расписанию придёт как обычно.", final=True)
-    else:
-        await progress.set(below, final=True)
+
+    result = {
+        "email": "✅ PDF отправлен на почту.",
+        "telegram": "✅ PDF отправлен сюда.",
+        None: "❌ Не удалось доставить PDF.",
+    }
+    await progress.set(result[sent], final=True)
+
+
+@router.callback_query(F.data.in_({"weekly:now", "live:report", "live:catchup"}),
+                       F.message.chat.type == "private")
+async def cb_weekly(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    await _drop_markup(call)
+    if isinstance(call.message, Message):
+        await cmd_weekly(call.message, bot)
 
 
 @router.callback_query(F.data == "live:mail")
@@ -1251,7 +1128,7 @@ async def cb_live_mail(call: CallbackQuery) -> None:
     try:
         await mailer.send(
             "Проверка почты — мониторинг чатов оптики",
-            "Почта настроена правильно: итоги дня в PDF будут приходить сюда.\n\n"
+            "Почта настроена правильно. Еженедельный PDF будет приходить сюда.\n\n"
             "— chat-parser, мониторинг чатов рынка оптики",
         )
     except Exception as e:  # noqa: BLE001
@@ -1259,32 +1136,6 @@ async def cb_live_mail(call: CallbackQuery) -> None:
         return
     await status.edit_text("✅ Письмо ушло: " + fmt.esc(", ".join(settings.email_recipients))
                            + ". Если его нет во «Входящих» — загляни в «Спам».")
-
-
-@router.callback_query(F.data.in_({"live:on", "live:off"}))
-async def cb_live_toggle(call: CallbackQuery) -> None:
-    from . import live
-
-    on = call.data == "live:on"
-    await live.set_enabled(on)
-    await call.answer("Включено" if on else "На паузе")
-    await _drop_markup(call)
-    if call.message is not None:
-        await call.message.answer(
-            "▶️ Отслеживание включено." if on else
-            "⏸ Вечерний разбор на паузе: переписку я продолжаю собирать, но нейросеть "
-            "не запускаю. Итоги дня придут без разбора. Включить — /live"
-        )
-
-
-@router.callback_query(F.data.in_({"live:report", "live:catchup"}))
-async def cb_live_report(call: CallbackQuery, bot: Bot) -> None:
-    """live:report — итоги сейчас (по расписанию всё равно придут);
-    live:catchup — сегодняшние, пропавшие из-за смены времени."""
-    await call.answer()
-    await _drop_markup(call)
-    if call.message is not None:
-        await _report_now(call.message, bot, catch_up=call.data == "live:catchup")
 
 
 # ------------------------------------------------------ участники чатов
@@ -1305,73 +1156,6 @@ async def _send_person(message: Message, label: str, prefix: str = "") -> None:
     if c.get("company_hint") or c.get("role_hint"):
         rows.insert(0, [("✅ Верно, сохранить подсказку", f"pa:{code}")])
     await _reply_long(message, prefix + fmt.fmt_person(c), reply_markup=_kb(*rows))
-
-
-TIME_PRESETS = ("08:00", "09:00", "12:00", "18:00", "20:00", "21:00", "22:00", "23:00")
-
-
-@router.message(F.text == BTN_TIME)
-@router.message(Command("time"))
-async def cmd_time(message: Message) -> None:
-    from . import live
-
-    hour, minute = await live.report_time()
-    current = f"{hour:02d}:{minute:02d}"
-    nxt = await live.next_report_at()
-    buttons = [(("✓ " if t == current else "") + clock.hhmm(int(t[:2]), int(t[3:])),
-                "rt:" + t.replace(":", "")) for t in TIME_PRESETS]
-    await message.answer(
-        f"⏰ Отчёт приходит на почту в <b>{clock.hhmm(hour, minute)}</b> ({clock.tz_label()}), "
-        f"следующий — {fmt.when_next(nxt)}.\n\nВо сколько присылать? Выбери или нажми "
-        "«✍️ Другое время» и напиши своё, например 21:30. Время можно менять сколько "
-        "угодно раз за день — отчёт придёт в каждое новое время.",
-        reply_markup=_kb(buttons[:4], buttons[4:],
-                         [("⏱ Через 5 минут", "rt:soon"), ("✍️ Другое время", "rt:custom")],
-                         [("Отмена", "cancel")]),
-    )
-
-
-@router.callback_query(F.data.startswith("rt:"))
-async def cb_time(call: CallbackQuery) -> None:
-    from . import live
-
-    await call.answer()
-    await _drop_markup(call)
-    if call.message is None:
-        return
-    value = call.data.split(":", 1)[1]
-    if value == "soon":  # для проверки: отчёт на почту через несколько минут
-        soon = clock.now() + timedelta(minutes=5)
-        await _apply_time(call.message, soon.hour, soon.minute)
-        return
-    if value == "custom":
-        await call.message.answer(
-            f"{TIME_PROMPT}\n\nНапиши время по {clock.tz_label()}, например <b>21:30</b> "
-            "или <b>9</b>.",
-            reply_markup=CANCEL_KB,
-        )
-        _await_answer(call.from_user, "time")
-        return
-    parsed = live.parse_time(value[:2] + ":" + value[2:])
-    if parsed:
-        await _apply_time(call.message, *parsed)
-
-
-async def _apply_time(message: Message, hour: int, minute: int) -> None:
-    from . import live
-
-    nxt, skipped = await live.set_report_time(hour, minute)
-    at = clock.hhmm(hour, minute)
-    text = (f"✅ Отчёт теперь приходит на почту в <b>{at}</b> ({clock.tz_label()}). "
-            f"Следующий — {fmt.when_next(nxt)}.")
-    if skipped:
-        await message.answer(
-            text + f"\n\nВремя {at} сегодня уже прошло, поэтому сегодняшнего отчёта по "
-            "расписанию не будет. Отправить его на почту сейчас?",
-            reply_markup=_kb([("📤 Отправить отчёт сейчас", "live:catchup")]),
-        )
-    else:
-        await message.answer(text)
 
 
 @router.message(Command(re.compile(r"who_([0-9a-f]{8})")))

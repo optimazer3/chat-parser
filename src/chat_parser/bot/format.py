@@ -225,7 +225,7 @@ def fmt_digest(stats: dict[str, Any], new_signals: int, new_msgs: int, top: list
             lines.append(
                 f"• {esc(c['label'])} — {people_word(c['n_authors'])} → /pain_{c['id']}"
             )
-        lines.append("\nПодробности — нажми /pain_… · весь отчёт: /report")
+        lines.append("\nПодробности — нажми /pain_… · еженедельный PDF: /report")
     return "\n".join(lines)
 
 
