@@ -56,7 +56,8 @@ async def harness(monkeypatch, tmp_path):
     from chat_parser import db
     from chat_parser.analyze.schema import (
         AssignItem, Assignment, Card, ClusterDraft, Clustering, DayDigest, Extraction,
-        Merging, PersonAbout, PersonHint, PostBatch, PostVerdict, Signal, WeeklyDigest,
+        Merging, PersonAbout, PersonHint, PostBatch, PostTheme, PostThemes, PostVerdict, Signal,
+        WeeklyDigest,
     )
     from chat_parser.llm import LLMError
     from chat_parser.people import parse_fields
@@ -123,6 +124,15 @@ async def harness(monkeypatch, tmp_path):
             return Card(title="t", statement="s", who="владельцы", when="при открытии",
                         current_workarounds=["возят прибор"], evidence_ids=ids,
                         product_hypotheses=["аренда"], open_questions=["сколько салонов"])
+        if schema is PostThemes:
+            posts = json.loads(user)["публикации"]
+            return PostThemes(items=[
+                PostTheme(id=int(mid), theme=(
+                    "Мотивация продавцов" if "бонус" in text or "преми" in text
+                    else "Закупка оправ"
+                ))
+                for mid, text in posts.items()
+            ])
         if schema is PostBatch:
             items = []
             for block in user.split("Сообщения:\n", 1)[1].split("\n\n[id "):
@@ -916,12 +926,65 @@ async def test_person_info_in_two_steps(evening):
     assert "Подключил чат" in await h.say("@optika_pro")  # один @ник вне подсказки — чат
 
 
-async def test_weekly_includes_existing_channels_and_uses_pdf_only(evening, monkeypatch):
-    from chat_parser import clock, db
-    from chat_parser.bot import main, weekly
+@pytest.fixture
+def channels_telegram(evening, monkeypatch):
+    from types import SimpleNamespace
+
+    from telethon.tl.types import (
+        Message, MessageReactions, MessageReplies, PeerChannel, ReactionCount, ReactionEmoji,
+    )
+
+    from chat_parser import clock
+    from chat_parser.bot import weekly
 
     h = evening
-    await h.send_export()  # канал из предыдущего импорта уже есть в базе
+    h.calls.clear()
+    h.album_reactions = 30
+    now = clock.now()
+
+    def message(mid, days, text, reactions, comments=None, *, album=None, post=True):
+        replies = None if comments is None else MessageReplies(
+            replies=comments, replies_pts=1, comments=True, channel_id=123,
+        )
+        return Message(
+            id=mid, peer_id=PeerChannel(1234567890), date=now - timedelta(days=days),
+            message=text, post=post, grouped_id=album, replies=replies,
+            reactions=MessageReactions(results=[
+                ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=reactions),
+            ]),
+        )
+
+    class Client:
+        async def get_entity(self, ref):
+            return SimpleNamespace(id=ref, broadcast=ref == PRO, username="optika_pro")
+
+        async def disconnect(self):
+            pass
+
+        async def iter_messages(self, entity, offset_date):
+            h.calls.append((entity.id, offset_date))
+            yield message(7, 0, "Публикация после конца периода", 100)
+            yield message(6, 1, "Ответ на пост", 90, post=False)
+            yield message(5, 1, "", h.album_reactions, album=99)
+            yield message(4, 1, "Как нашли оправы к сезону", h.album_reactions, album=99)
+            yield message(3, 2, "Как меняли систему бонусов", 18, 29)
+            yield message(2, 4, "Что поменяли в премиях продавцов", 12, 4)
+            yield message(1, 8, "Пост из прошлой недели", 200)
+
+    async def connect():
+        return Client()
+
+    monkeypatch.setattr(weekly, "connect_client", connect)
+    return h
+
+
+async def test_weekly_ranks_channel_posts_and_uses_pdf_only(channels_telegram):
+    from chat_parser import clock, db
+    from chat_parser.bot import main, weekly
+    from chat_parser.report.channel_weekly import top_posts, top_themes
+
+    h = channels_telegram
+    await h.send_export()  # уже добавленная группа тоже видна в отчёте
     await h.pool.execute("update chats set in_daily = false where id = $1", PRO)
     await h.pool.execute(
         "insert into chats (id, title, is_active) values (-99, 'Старый канал', false)"
@@ -931,30 +994,62 @@ async def test_weekly_includes_existing_channels_and_uses_pdf_only(evening, monk
 
     report = await main.send_weekly(h.bot)
     assert report.until == until and report.since == until - timedelta(days=7)
-    channels = {channel["title"]: channel for channel in report.channels}
-    assert set(channels) == {
-        "Оптики Про", "Оптики — обмен опытом", "Старый канал",
-    }
-    assert channels["Оптики — обмен опытом"]["messages"] == 0
-    assert len(channels["Оптики Про"]["signals"]) == 3
-    assert (PRO, "recent", report.since) in h.calls
+    channels = {channel.title: channel for channel in report.channels}
+    assert set(channels) == {"Оптики Про", "Оптики — обмен опытом", "Старый канал"}
+    assert channels["Оптики — обмен опытом"].status.startswith("Группа")
+    pro = channels["Оптики Про"]
+    assert len(pro.posts) == 3
+    assert [(p.id, p.reactions, p.comments) for p in top_posts(pro.posts)] == [
+        (3, 18, 29), (4, 30, None), (2, 12, 4),
+    ]
+    assert [(theme, len(posts)) for theme, posts in top_themes(pro)] == [
+        ("Мотивация продавцов", 2), ("Закупка оправ", 1),
+    ]
+    assert h.calls == [(PRO, until)]
     assert len(h.letters) == 1 and not h.session.files
     letter = h.letters[0]
-    assert "Еженедельный отчёт по каналам" in letter["Subject"]
+    assert "Отклик на посты за неделю" in letter["Subject"]
     assert letter.get_body(("plain",)).get_content().strip() == "PDF во вложении."
     pdf = letter_pdf(letter)
     text = pdf_text(pdf)
-    for part in ("Оптики Про", "Оптики — обмен опытом", "Старый канал",
-                 "5 сообщений", "сбор отключён", "Источник"):
+    for part in ("Оптики Про", "Старый канал", "Публикаций 3", "Реакции 18",
+                 "Комментарии 29", "Комментарии н/д", "Темы для следующих постов",
+                 "Мотивация продавцов", "стоит проверить ещё одним постом"):
         assert part in text, text
-    assert "срочно нужен второй пупиллометр" in text
-    assert "Кто писал" not in text and "Возможности для бизнеса" not in text
+    assert "из прошлой недели" not in text and "Ответ на пост" not in text
     assert "https://t.me/optika_pro/3" in pdf_links(pdf)
     assert await weekly.next_at() > clock.now()
     assert not await weekly.due()
 
+    # Повторный отчёт для того же периода обновляет реакции уже опубликованных постов.
+    h.album_reactions = 80
+    updated = await weekly.build(until=until)
+    updated_pro = next(ch for ch in updated.channels if ch.id == PRO)
+    assert top_posts(updated_pro.posts)[0].id == 4
 
-async def test_weekly_manual_pdf_uses_telegram_fallback_without_moving_slot(evening, monkeypatch):
+
+async def test_weekly_labels_imported_reactions_with_unknown_comments(harness):
+    from chat_parser import clock
+    from chat_parser.bot import weekly
+
+    now = clock.now()
+    await harness.pool.execute(
+        "insert into chats (id, title, kind) values ($1, 'Импорт', 'public_channel')", PRO,
+    )
+    await harness.pool.execute(
+        "insert into messages (chat_id, message_id, ts, text, reactions) "
+        "values ($1, 1, $2, 'Новый подход к бонусам продавцов', 12)",
+        PRO, now - timedelta(days=1),
+    )
+    report = await weekly.build(until=now)
+    (channel,) = report.channels
+    (post,) = channel.posts
+    assert post.reactions == 12 and post.comments is None
+    text = pdf_text(report.pdf())
+    assert "Данные из импорта" in text and "Комментарии н/д" in text
+
+
+async def test_weekly_manual_pdf_uses_telegram_fallback_without_moving_slot(channels_telegram, monkeypatch):
     import smtplib
 
     from chat_parser import mailer
@@ -964,7 +1059,7 @@ async def test_weekly_manual_pdf_uses_telegram_fallback_without_moving_slot(even
         raise smtplib.SMTPAuthenticationError(535, b"invalid credentials")
 
     monkeypatch.setattr(mailer, "_send_sync", broken)
-    h = evening
+    h = channels_telegram
     scheduled = await weekly.next_at()
     assert "[weekly:now]" in await h.say("📅 Еженедельный отчёт")
     result = await h.press("weekly:now")
@@ -975,7 +1070,7 @@ async def test_weekly_manual_pdf_uses_telegram_fallback_without_moving_slot(even
     assert await weekly.next_at() == scheduled
 
 
-async def test_weekly_fanout_failure_keeps_due_slot(evening, monkeypatch):
+async def test_weekly_fanout_failure_keeps_due_slot(channels_telegram, monkeypatch):
     from chat_parser import clock, db
     from chat_parser.bot import delivery, main, weekly
 
@@ -987,6 +1082,6 @@ async def test_weekly_fanout_failure_keeps_due_slot(evening, monkeypatch):
 
     monkeypatch.setattr(delivery, "deliver", failed_delivery)
     with pytest.raises(RuntimeError, match="не доставлен"):
-        await main.send_weekly(evening.bot)
+        await main.send_weekly(channels_telegram.bot)
     assert await weekly.next_at() == pending and await weekly.due()
     assert await db.get_setting(weekly.SENT_KEY) is None

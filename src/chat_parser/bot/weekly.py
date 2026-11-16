@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timedelta
 from typing import Any
 
 import asyncpg
 
-from .. import clock, db
-from ..analyze import extract
+from telethon import TelegramClient, errors
+
+from .. import clock, db, usage
+from ..analyze.posts import channel_themes
 from ..config import settings
-from ..ingest import collector
+from ..ingest import channel_posts, collector
 from ..ingest.client import connect_client
-from ..normalize import threads
-from ..report import channel_weekly
+from ..llm import build_llm
+from ..report.channel_weekly import Channel, ChannelWeeklyReport
 from . import jobs
 
 log = logging.getLogger("chat_parser.weekly")
@@ -105,78 +108,95 @@ async def mark_chats(pool: asyncpg.Pool) -> dict[str, Any] | None:
 
 
 
-async def _sync_channels(
-    pool: asyncpg.Pool, channels: list[asyncpg.Record], since: datetime, job: dict[str, Any],
-) -> dict[int, str]:
-    if not channels or not settings.telegram_ready:
-        return {}
+async def _collect_channel(
+    pool: asyncpg.Pool, client: TelegramClient | None, row: asyncpg.Record,
+    since: datetime, until: datetime,
+) -> Channel:
+    title = row["title"] or row["username"] or f"Канал {row['id']}"
+    channel = Channel(row["id"], title, row["username"])
+    if not row["is_active"]:
+        channel.status = "Сбор отключён."
+    elif client is None:
+        channel.status = "Счётчики Telegram недоступны."
+    else:
+        try:
+            entity = await collector.entity_for(client, channel.id, channel.username, row["link"])
+            if not getattr(entity, "broadcast", False):
+                channel.status = "Группа. Метрики публикаций доступны для каналов."
+                return channel
+            channel.title = getattr(entity, "title", None) or channel.title
+            channel.username = getattr(entity, "username", None)
+            channel.posts = await channel_posts.read(client, entity, since, until)
+            return channel
+        except errors.FloodWaitError:
+            log.warning("Telegram отложил сбор публикаций канала %s", channel.id)
+            channel.status = "Сбор отложен Telegram."
+        except Exception:
+            log.exception("не удалось прочитать публикации канала %s", channel.id)
+            channel.status = "Не удалось загрузить публикации из Telegram."
 
-    try:
-        client = await connect_client()
-    except Exception:
-        log.exception("не удалось подключить аккаунт-сборщик")
-        return {channel["id"]: "сбор недоступен" for channel in channels}
-
-    issues = {}
-    try:
-        for index, channel in enumerate(channels, 1):
-            chat_id = channel["id"]
-            job["progress"] = f"загружаю каналы: {index} из {len(channels)}"
-            try:
-                if channel["newest_id"] is None:
-                    result = await collector.sync_chat(client, pool, chat_id, "recent", since=since)
-                else:
-                    result = await collector.sync_chat(client, pool, chat_id, "incremental")
-                if result.get("error") == "no_access":
-                    issues[chat_id] = "нет доступа к каналу"
-                elif result.get("flood_wait_until") or result.get("skipped") == "flood_wait":
-                    issues[chat_id] = "сбор отложен Telegram"
-            except Exception:
-                log.exception("не удалось обновить канал %s", chat_id)
-                issues[chat_id] = "ошибка загрузки"
-    finally:
-        await client.disconnect()
-    return issues
+    if row["kind"] in {"public_channel", "private_channel"}:
+        imported = await pool.fetch(
+            """
+            select message_id, ts, text, reactions from messages
+             where chat_id = $1 and ts >= $2 and ts < $3 and not is_bot
+             order by message_id
+            """,
+            channel.id, since, until,
+        )
+        if imported:
+            channel.status = "Данные из импорта. Счётчик комментариев недоступен."
+            channel.posts = [
+                channel_posts.Post(post["message_id"], post["ts"], post["text"] or "",
+                                   post["reactions"], None) for post in imported
+            ]
+    return channel
 
 
 async def build(job_id: str | None = None, *, until: datetime | None = None
-                ) -> channel_weekly.ChannelWeeklyReport:
-    """Собрать PDF-данные за семь суток. Планировщик передаёт конец своего выпуска."""
+                ) -> ChannelWeeklyReport:
+    """Собрать отклик на публикации за семь суток."""
     async with jobs.exclusive("еженедельный отчёт", job_id) as job:
         until = until or clock.now()
         since = until - timedelta(days=7)
         pool = await db.get_pool()
-        chats = await pool.fetch(
-            """
-            select c.id, c.is_active, cu.newest_id from chats c
-              left join cursors cu on cu.chat_id = c.id order by c.id
-            """
+        rows = await pool.fetch(
+            "select id, title, username, link, kind, is_active from chats "
+            "order by lower(coalesce(title, username, '')), id"
         )
-        issues = await _sync_channels(pool, [chat for chat in chats if chat["is_active"]],
-                                      since, job)
-        job["progress"] = "собираю обсуждения"
-        for chat in chats:
-            await threads.build_for_chat(pool, chat["id"], since, until=until)
+        client = None
+        if settings.telegram_ready and any(row["is_active"] for row in rows):
+            try:
+                client = await connect_client()
+            except Exception:
+                log.exception("не удалось подключить аккаунт-сборщик")
 
-        analysis_note = ""
-        if settings.llm_api_key and settings.llm_model and chats:
-            job["progress"] = "извлекаю сигналы"
+        channels = []
+        try:
+            for index, row in enumerate(rows, 1):
+                job["progress"] = f"читаю каналы: {index} из {len(rows)}"
+                channels.append(await _collect_channel(pool, client, row, since, until))
+        finally:
+            if client is not None:
+                await client.disconnect()
 
-            async def progress(done: int, total: int, _stats: dict) -> None:
-                job["progress"] = f"разбираю обсуждения: {done} из {total}"
+        if settings.llm_api_key and settings.llm_model:
+            eligible = [
+                channel for channel in channels
+                if any(p.engagement for p in channel.posts) and any(p.text for p in channel.posts)
+            ]
+            if eligible:
+                llm = build_llm()
+                started, finished = time.monotonic(), False
+                try:
+                    for index, channel in enumerate(eligible, 1):
+                        job["progress"] = f"определяю темы: {index} из {len(eligible)}"
+                        channel.labels = await channel_themes(
+                            llm, {post.id: post.text for post in channel.posts},
+                        )
+                    finished = True
+                finally:
+                    await usage.record(pool, "post_themes", llm, seconds=time.monotonic() - started,
+                                       cancelled=not finished, source="weekly")
 
-            stats = await extract.run(pool, on_progress=progress, ended_after=since,
-                                      ended_before=until, usage_source="weekly")
-            if stats["failed"]:
-                analysis_note = f"Не удалось разобрать обсуждений: {stats['failed']}."
-        elif chats and not (settings.llm_api_key and settings.llm_model):
-            analysis_note = "Автоматический разбор сообщений не настроен."
-
-        job["progress"] = "готовлю PDF"
-        report = await channel_weekly.collect(pool, since, until)
-        report.analysis_note = analysis_note
-        for channel in report.channels:
-            channel["status"] = issues.get(channel["id"]) or (
-                "" if channel["is_active"] else "сбор отключён"
-            )
-        return report
+        return ChannelWeeklyReport(since, until, channels)

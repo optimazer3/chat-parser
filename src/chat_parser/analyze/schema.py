@@ -119,6 +119,15 @@ class PostBatch(BaseModel):
     items: list[PostVerdict]
 
 
+class PostTheme(BaseModel):
+    id: int
+    theme: str = Field(description="краткая тема по тексту; пусто, если её нельзя определить")
+
+
+class PostThemes(BaseModel):
+    items: list[PostTheme]
+
+
 class WeeklyDigest(BaseModel):
     summary: str = Field(description="что откликается за неделю, месяц и полгода, 3-5 предложений")
     focus: list[str] = Field(description="3-6 выводов о темах фокусного автора")

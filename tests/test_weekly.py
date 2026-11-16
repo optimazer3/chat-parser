@@ -13,6 +13,20 @@ from chat_parser.config import settings
 from chat_parser.ingest.topics import TopicNotFound, match_topic, reaction_counts, reply_target
 from chat_parser.report.weekly import WeeklyReport, focus_matches, standout, themes_of
 
+
+def test_channel_theme_recommendations_require_typical_engagement():
+    from chat_parser.ingest.channel_posts import Post
+    from chat_parser.report.channel_weekly import Channel, top_themes
+
+    now = clock.now()
+    posts = [Post(1, now, "Разбор премий", 30, 10),
+             Post(2, now, "Бонусы продавцов", 25, 10),
+             Post(3, now, "Заявка на аренду", 5, 1),
+             Post(4, now, "Смета ремонта", 22, 8)]
+    channel = Channel(1, "Оптика", None, posts,
+                      {1: "Оплата труда", 2: "Оплата труда", 3: "Аренда", 4: "Ремонт"})
+    assert [(label, len(items)) for label, items in top_themes(channel)] == [("Оплата труда", 2)]
+
 TOPICS = [(1, "Общий"), (12, "Бизнес. Управление ресурсами"), (20, "Маркетинг")]
 
 
