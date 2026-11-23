@@ -141,6 +141,21 @@ async def test_schema_startup_timeout_is_explained(bot_settings, monkeypatch, ca
     assert "Шаг 2/3" in caplog.text
 
 
+async def test_schema_connection_closed_is_explained(bot_settings, monkeypatch):
+    import asyncpg
+    from aiogram.types import User
+    from chat_parser import db
+
+    monkeypatch.setattr(Bot, "get_me", AsyncMock(return_value=User(
+        id=1, is_bot=True, first_name="bot", username="test_bot",
+    )))
+    monkeypatch.setattr(db, "apply_schema", AsyncMock(side_effect=(
+        asyncpg.ConnectionDoesNotExistError("connection was closed in the middle of operation")
+    )))
+    with pytest.raises(SystemExit, match="Соединение с базой оборвалось"):
+        await main.run_bot()
+
+
 async def test_pool_cleanup_is_bounded(monkeypatch):
     from chat_parser import db
 

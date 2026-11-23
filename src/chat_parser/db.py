@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 
@@ -16,6 +17,8 @@ EXPECTED_TABLES = [
 ]
 
 _pool: asyncpg.Pool | None = None
+log = logging.getLogger("chat_parser.db")
+SCHEMA_RETRY_DELAY = 1
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -70,10 +73,20 @@ def schema_path() -> Path:
 
 async def apply_schema() -> list[str]:
     """Накатывает схему. Скрипт идемпотентный, повторный запуск безопасен."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(schema_path().read_text(encoding="utf-8"), timeout=30)
-    return await missing_tables()
+    schema = schema_path().read_text(encoding="utf-8")
+    for attempt in range(2):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(schema, timeout=30)
+            return await missing_tables()
+        except (asyncpg.ConnectionDoesNotExistError, asyncpg.ConnectionFailureError,
+                ConnectionResetError, ConnectionAbortedError):
+            if attempt == 1:
+                raise
+            log.warning("Supabase закрыл соединение при проверке таблиц. Переподключаюсь...")
+            await close_pool()
+            await asyncio.sleep(SCHEMA_RETRY_DELAY)
 
 
 async def missing_tables() -> list[str]:
@@ -89,6 +102,17 @@ def explain_error(error: BaseException | str) -> str | None:
     """Что делать при частых ошибках подключения к Supabase; None — подсказки нет."""
     text = str(error)
     low = text.lower()
+    if (isinstance(error, (asyncpg.ConnectionDoesNotExistError, asyncpg.ConnectionFailureError,
+                           ConnectionResetError, ConnectionAbortedError))
+            or "connection was closed" in low or "connection reset" in low):
+        return (
+            "Соединение с базой оборвалось во время запроса. Это возможно и у активного проекта.\n"
+            "1. В Supabase открой Connect → Session pooler и скопируй строку подключения "
+            "целиком в DATABASE_URL в .env, подставив пароль базы. Порт Session pooler — 5432.\n"
+            "2. Закрой другие окна бота и повтори запуск.\n"
+            "3. Если разрыв повторяется, попробуй другое интернет-подключение и проверь "
+            "Database Logs проекта на момент ошибки."
+        )
     if "tenant/user" in low or "tenant or user not found" in low:
         ref = re.search(r"postgres\.([a-z0-9]+)", text)
         project = f" «{ref.group(1)}»" if ref else ""
