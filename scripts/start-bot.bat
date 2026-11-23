@@ -4,7 +4,7 @@ rem Пока это окно открыто, бот работает. Закры
 chcp 65001 >nul
 cd /d "%~dp0.."
 
-if not exist ".venv\Scripts\activate.bat" (
+if not exist ".venv\Scripts\python.exe" (
     echo Не найдено виртуальное окружение .venv в папке %CD%
     echo Один раз выполни в этой папке:
     echo     python -m venv .venv
@@ -20,10 +20,11 @@ if not exist ".env" (
     exit /b 1
 )
 
-call .venv\Scripts\activate.bat
-echo Бот запускается. Не закрывай это окно - пока оно открыто, бот работает.
+set PYTHONUNBUFFERED=1
+set PYTHONUTF8=1
+echo Загружаю программу. Далее появятся шаги проверки Telegram и Supabase.
 echo.
-chat-parser bot
+".venv\Scripts\python.exe" -u -m chat_parser.cli bot
 echo.
 echo Бот остановлен.
 pause

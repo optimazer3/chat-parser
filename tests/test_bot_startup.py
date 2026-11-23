@@ -2,6 +2,8 @@
 и закрытая HTTP-сессия (раньше было «Unclosed client session»)."""
 
 import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.methods import GetMe
@@ -106,3 +108,92 @@ def test_db_error_hints():
     assert "вторая копия бота" in explain_error("Max client connections reached")
     assert "не на паузе" in explain_error(TimeoutError())
     assert explain_error("какая-то другая ошибка") is None
+
+
+async def test_telegram_startup_timeout_is_explained_and_closes(bot_settings, monkeypatch, caplog):
+    async def no_reply(self, **kwargs):
+        await asyncio.Event().wait()
+
+    closed = AsyncMock()
+    monkeypatch.setattr(Bot, "get_me", no_reply)
+    monkeypatch.setattr(main.AiohttpSession, "close", closed)
+    monkeypatch.setattr(main, "TELEGRAM_STARTUP_TIMEOUT", 0.01)
+    with caplog.at_level("INFO"), pytest.raises(SystemExit, match="Нет связи с серверами Telegram"):
+        await main.run_bot()
+    assert "Шаг 1/3" in caplog.text
+    closed.assert_awaited_once()
+
+
+async def test_schema_startup_timeout_is_explained(bot_settings, monkeypatch, caplog):
+    from aiogram.types import User
+    from chat_parser import db
+
+    async def no_database_reply():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(Bot, "get_me", AsyncMock(return_value=User(
+        id=1, is_bot=True, first_name="bot", username="test_bot",
+    )))
+    monkeypatch.setattr(db, "apply_schema", no_database_reply)
+    monkeypatch.setattr(main, "DATABASE_STARTUP_TIMEOUT", 0.01)
+    with caplog.at_level("INFO"), pytest.raises(SystemExit, match="Сервер базы не отвечает"):
+        await main.run_bot()
+    assert "Шаг 2/3" in caplog.text
+
+
+async def test_pool_cleanup_is_bounded(monkeypatch):
+    from chat_parser import db
+
+    class StuckPool:
+        async def close(self):
+            await asyncio.Event().wait()
+
+        def terminate(self):
+            self.terminated = True
+
+    pool = StuckPool()
+    wait_for = asyncio.wait_for
+
+    async def short_timeout(awaitable, *, timeout):
+        return await wait_for(awaitable, timeout=0.01)
+
+    monkeypatch.setattr(db, "_pool", pool)
+    monkeypatch.setattr(db.asyncio, "wait_for", short_timeout)
+    await db.close_pool()
+    assert pool.terminated and db._pool is None
+
+
+@pytest.mark.parametrize("commands_timeout", [False, True])
+async def test_startup_reaches_polling_or_explains_commands_timeout(
+    bot_settings, monkeypatch, caplog, commands_timeout,
+):
+    from aiogram.types import User
+    from chat_parser import db
+
+    monkeypatch.setattr(Bot, "get_me", AsyncMock(return_value=User(
+        id=1, is_bot=True, first_name="bot", username="test_bot",
+    )))
+    monkeypatch.setattr(db, "apply_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main, "announce_keyboard", AsyncMock())
+    monkeypatch.setattr(main, "weekly_loop", AsyncMock())
+    monkeypatch.setattr(main, "connect_saved", AsyncMock())
+    dispatcher = MagicMock()
+    dispatcher.start_polling = AsyncMock()
+    monkeypatch.setattr(main, "Dispatcher", lambda: dispatcher)
+
+    async def commands(self, *args, **kwargs):
+        if commands_timeout:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(Bot, "set_my_commands", commands)
+    monkeypatch.setattr(main, "TELEGRAM_STARTUP_TIMEOUT", 0.01)
+    with caplog.at_level("INFO"):
+        if commands_timeout:
+            with pytest.raises(SystemExit, match="зарегистрировать команды"):
+                await main.run_bot()
+            dispatcher.start_polling.assert_not_awaited()
+        else:
+            await main.run_bot()
+            dispatcher.start_polling.assert_awaited_once()
+            assert "Готов. Отправь /start" in caplog.text
+    assert "Шаг 3/3" in caplog.text

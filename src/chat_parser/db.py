@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -27,6 +28,7 @@ async def get_pool() -> asyncpg.Pool:
             # Supavisor в transaction-режиме (порт 6543) не поддерживает
             # серверные prepared statements. На session pooler безвредно.
             statement_cache_size=0,
+            timeout=15,
         )
     return _pool
 
@@ -34,8 +36,11 @@ async def get_pool() -> asyncpg.Pool:
 async def close_pool() -> None:
     global _pool
     if _pool is not None:
-        await _pool.close()
-        _pool = None
+        pool, _pool = _pool, None
+        try:
+            await asyncio.wait_for(pool.close(), timeout=5)
+        except TimeoutError:
+            pool.terminate()
 
 
 async def log_run(kind: str, stats: dict, error: str | None = None) -> None:
@@ -67,7 +72,7 @@ async def apply_schema() -> list[str]:
     """Накатывает схему. Скрипт идемпотентный, повторный запуск безопасен."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(schema_path().read_text(encoding="utf-8"))
+        await conn.execute(schema_path().read_text(encoding="utf-8"), timeout=30)
     return await missing_tables()
 
 

@@ -28,6 +28,9 @@ from .handlers import KEYBOARD_KEY, KEYBOARD_VERSION, MAIN_KB, router
 
 log = logging.getLogger("chat_parser.bot")
 
+TELEGRAM_STARTUP_TIMEOUT = 20
+DATABASE_STARTUP_TIMEOUT = 45
+
 COMMANDS = [
     BotCommand(command="status", description="что загружено и что выполняется"),
     BotCommand(command="extract", description="разобрать обсуждения"),
@@ -142,7 +145,8 @@ def build_bot() -> Bot:
 async def check_bot(bot: Bot) -> User:
     """get_me с понятными ошибками вместо трейсбека aiogram."""
     try:
-        return await bot.get_me()
+        async with asyncio.timeout(TELEGRAM_STARTUP_TIMEOUT):
+            return await bot.get_me(request_timeout=15)
     except TelegramUnauthorizedError:
         raise SystemExit(
             "TG_BOT_TOKEN не подходит — Telegram его не принял. "
@@ -150,6 +154,10 @@ async def check_bot(bot: Bot) -> User:
         ) from None
     except TelegramNetworkError as e:
         raise SystemExit(network_hint(e.message, settings.tg_proxy)) from None
+    except TimeoutError:
+        raise SystemExit(
+            network_hint("проверка заняла больше 20 секунд", settings.tg_proxy)
+        ) from None
 
 
 async def run_bot() -> None:
@@ -162,11 +170,17 @@ async def run_bot() -> None:
     try:
         # Связь проверяем до сборки диспетчера: router — модульный синглтон,
         # и его можно подключить только к одному диспетчеру за процесс.
+        log.info("Шаг 1/3. Проверяю связь с Telegram...")
         me = await check_bot(bot)
+        log.info("Telegram отвечает, бот @%s.", me.username)
         # Схема идемпотентна: так новые таблицы появляются после обновления
         # кода без ручного init-db.
         try:
-            await db.apply_schema()
+            log.info("Шаг 2/3. Подключаюсь к Supabase и проверяю таблицы...")
+            async with asyncio.timeout(DATABASE_STARTUP_TIMEOUT):
+                missing = await db.apply_schema()
+            if missing:
+                raise SystemExit("В базе отсутствуют таблицы: " + ", ".join(missing))
         except Exception as e:  # noqa: BLE001 — понятная подсказка вместо трассировки
             hint = db.explain_error(e)
             if hint is None:
@@ -177,17 +191,27 @@ async def run_bot() -> None:
         dp.message.outer_middleware(guard)
         dp.callback_query.outer_middleware(guard)
         dp.include_router(router)
-        await bot.set_my_commands(COMMANDS)
-        via = f", через прокси {settings.tg_proxy}" if settings.tg_proxy else ""
+        log.info("Шаг 3/3. Подключаю команды бота...")
+        try:
+            async with asyncio.timeout(TELEGRAM_STARTUP_TIMEOUT):
+                await bot.set_my_commands(COMMANDS, request_timeout=15)
+        except (TimeoutError, TelegramNetworkError):
+            raise SystemExit(
+                network_hint("не удалось зарегистрировать команды бота", settings.tg_proxy)
+            ) from None
+        via = ", через прокси" if settings.tg_proxy else ""
         log.info("бот @%s запущен%s, админов: %d", me.username, via, len(settings.admin_ids))
+        log.info("Готов. Отправь /start боту @%s в Telegram.", me.username)
         background = [asyncio.create_task(announce_keyboard(bot)),
                       asyncio.create_task(weekly_loop(bot))]
         if settings.telegram_ready:
-            if await jobs.pending_requests():
-                background.append(asyncio.create_task(connect_saved(bot)))
+            background.append(asyncio.create_task(connect_saved(bot)))
         await dp.start_polling(bot)
     finally:
         for t in background:
             t.cancel()
-        await db.close_pool()
-        await bot.session.close()
+        await asyncio.gather(*background, return_exceptions=True)
+        try:
+            await db.close_pool()
+        finally:
+            await bot.session.close()
