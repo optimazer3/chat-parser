@@ -1017,9 +1017,9 @@ async def test_weekly_ranks_channel_posts_and_uses_pdf_only(channels_telegram):
     assert "Посты и темы каналов за четыре недели" in letter["Subject"]
     assert "Оптики Про" in letter.get_body(("plain",)).get_content()
     pdf = letter_pdf(letter)
-    text = pdf_text(pdf)
+    text = " ".join(pdf_text(pdf).split())
     for part in ("Оптики Про", "Старый канал", "Публикаций за 4 недели 4",
-                 "Реакции 18", "Комментарии 29", "Темы для своих публикаций",
+                 "Все реакции 18", "Комментарии 29", "Темы для своих публикаций",
                  "Как выбрать оправы к сезону", "Все публикации за четыре недели"):
         assert part in text, text
     assert "из прошлой недели" in text and "Ответ на пост" not in text
