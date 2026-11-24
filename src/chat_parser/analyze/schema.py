@@ -128,6 +128,16 @@ class PostThemes(BaseModel):
     items: list[PostTheme]
 
 
+class PostIdea(BaseModel):
+    title: str = Field(description="конкретная тема собственного поста, до 100 символов")
+    angle: str = Field(description="что раскрыть в своём посте, 1-2 конкретных предложения")
+    evidence_ids: list[int] = Field(description="id публикаций из входа, подтверждающих интерес")
+
+
+class PostIdeas(BaseModel):
+    items: list[PostIdea]
+
+
 class WeeklyDigest(BaseModel):
     summary: str = Field(description="что откликается за неделю, месяц и полгода, 3-5 предложений")
     focus: list[str] = Field(description="3-6 выводов о темах фокусного автора")

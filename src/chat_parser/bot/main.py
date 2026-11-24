@@ -68,7 +68,7 @@ async def send_weekly(bot: Bot):
 
 
 async def weekly_loop(bot: Bot) -> None:
-    """Еженедельный отчёт в WEEKLY_WEEKDAY, WEEKLY_HOUR. Бот был выключен —
+    """Еженедельный отчёт по понедельникам в 09:00 МСК. Бот был выключен —
     отчёт уйдёт сразу после запуска."""
     while True:
         try:
@@ -100,7 +100,7 @@ async def announce_keyboard(bot: Bot) -> None:
             await bot.send_message(
                 admin,
                 "Еженедельный PDF по всем каналам. Кнопка «Еженедельный отчёт» "
-                "покажет расписание и позволит получить файл сразу.",
+                "сразу отправит файл на почту. По расписанию - понедельник, 09:00 МСК.",
                 reply_markup=MAIN_KB,
             )
         except Exception as e:  # noqa: BLE001

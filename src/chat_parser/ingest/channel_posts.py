@@ -19,6 +19,13 @@ class Post:
     text: str
     reactions: int
     comments: int | None
+    views: int | None = None
+    forwards: int | None = None
+    detail: dict[str, int] | None = None
+
+    @property
+    def likes(self) -> int | None:
+        return self.detail.get("👍", 0) if self.detail is not None else None
 
     @property
     def engagement(self) -> int:
@@ -26,7 +33,7 @@ class Post:
 
 
 async def read(client: TelegramClient, entity, since: datetime, until: datetime) -> list[Post]:
-    """Читаем неделю заново: счётчики меняются и после первой выгрузки сообщения."""
+    """Обновляет счётчики всех публикаций за заданный период."""
     posts = []
     albums: dict[int, Post] = {}
     async for msg in client.iter_messages(entity, offset_date=until):
@@ -35,8 +42,10 @@ async def read(client: TelegramClient, entity, since: datetime, until: datetime)
         if not isinstance(msg, Message) or not msg.post or msg.date >= until:
             continue
         replies = msg.replies
-        post = Post(msg.id, msg.date, mask_text(msg.message), sum(reaction_counts(msg).values()),
-                    replies.replies if replies and replies.comments else None)
+        detail = reaction_counts(msg)
+        post = Post(msg.id, msg.date, mask_text(msg.message), sum(detail.values()),
+                    replies.replies if replies and replies.comments else None,
+                    msg.views, msg.forwards, detail)
         if msg.grouped_id is None:
             posts.append(post)
             continue
@@ -47,6 +56,11 @@ async def read(client: TelegramClient, entity, since: datetime, until: datetime)
             lead = post if post.text or not prev.text else prev
             known_comments = [n for n in (post.comments, prev.comments) if n is not None]
             post = replace(lead, reactions=max(post.reactions, prev.reactions),
-                           comments=max(known_comments, default=None))
+                           comments=max(known_comments, default=None),
+                           views=max((v for v in (post.views, prev.views) if v is not None),
+                                     default=None),
+                           forwards=max((v for v in (post.forwards, prev.forwards) if v is not None),
+                                        default=None),
+                           detail=post.detail if post.reactions >= prev.reactions else prev.detail)
         albums[msg.grouped_id] = post
     return posts + list(albums.values())

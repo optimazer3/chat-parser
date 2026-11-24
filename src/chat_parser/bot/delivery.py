@@ -23,7 +23,7 @@ async def deliver(
     pdf = await asyncio.to_thread(report.pdf)
     if settings.email_ready:
         try:
-            await mailer.send(report.subject, "PDF во вложении.", pdf, report.filename)
+            await mailer.send(report.subject, report.email_text(), pdf, report.filename)
         except Exception:
             log.exception("еженедельный отчёт не ушёл на почту")
         else:

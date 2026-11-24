@@ -148,7 +148,7 @@ def test_bot_exposes_only_weekly_reports():
     from chat_parser.bot.handlers import MAIN_KB, help_text
 
     assert hasattr(main, "weekly_loop") and not hasattr(main, "report_loop")
-    assert "Раз в неделю" in help_text()
+    assert "Каждый понедельник в 09:00 МСК" in help_text()
     assert [b.text for row in MAIN_KB.keyboard for b in row] == [
         "➕ Добавить чат", "👤 Добавить инфо о человеке", "📅 Еженедельный отчёт",
     ]

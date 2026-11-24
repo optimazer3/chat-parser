@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
@@ -13,12 +13,12 @@ import asyncpg
 from telethon import TelegramClient, errors
 
 from .. import clock, db, usage
-from ..analyze.posts import channel_themes
+from ..analyze.posts import channel_themes, content_ideas
 from ..config import settings
 from ..ingest import channel_posts, collector
 from ..ingest.client import connect_client
-from ..llm import build_llm
-from ..report.channel_weekly import Channel, ChannelWeeklyReport
+from ..llm import LLMError, build_llm
+from ..report.channel_weekly import Channel, ChannelWeeklyReport, theme_candidates
 from . import jobs
 
 log = logging.getLogger("chat_parser.weekly")
@@ -27,6 +27,7 @@ NEXT_KEY = "weekly_next_at"
 SENT_KEY = "weekly_sent_at"
 FULL_READ_KEY = "weekly_full_read:{chat}:{topic}"  # полгода темы уже прочитаны
 HALF_YEAR = timedelta(days=183)
+MOSCOW = timezone(timedelta(hours=3))
 
 
 async def read_since(chat_id: int, topic_id: int, now: datetime) -> datetime:
@@ -42,10 +43,10 @@ async def read_since(chat_id: int, topic_id: int, now: datetime) -> datetime:
 
 
 def slot_after(at: datetime) -> datetime:
-    """Ближайшие WEEKLY_WEEKDAY, WEEKLY_HOUR:00 по местному времени строго после at."""
-    local = at.astimezone(clock.tz())
-    target = local.replace(hour=settings.weekly_hour % 24, minute=0, second=0, microsecond=0)
-    target += timedelta(days=(settings.weekly_weekday - local.weekday()) % 7)
+    """Ближайший понедельник, 09:00 МСК, строго после at."""
+    local = at.astimezone(MOSCOW)
+    target = local.replace(hour=9, minute=0, second=0, microsecond=0)
+    target += timedelta(days=-local.weekday())
     if target <= local:
         target += timedelta(days=7)
     return target
@@ -54,7 +55,13 @@ def slot_after(at: datetime) -> datetime:
 async def next_at() -> datetime:
     raw = await db.get_setting(NEXT_KEY)
     if raw:
-        return datetime.fromisoformat(raw)
+        old = datetime.fromisoformat(raw).astimezone(MOSCOW)
+        pending = (old - timedelta(days=old.weekday())).replace(
+            hour=9, minute=0, second=0, microsecond=0,
+        )
+        if pending != old:
+            await db.set_setting(NEXT_KEY, pending.isoformat())
+        return pending
     # Первый запуск: ближайший слот, без отчёта «задним числом».
     nxt = slot_after(clock.now())
     await db.set_setting(NEXT_KEY, nxt.isoformat())
@@ -155,10 +162,10 @@ async def _collect_channel(
 
 async def build(job_id: str | None = None, *, until: datetime | None = None
                 ) -> ChannelWeeklyReport:
-    """Собрать отклик на публикации за семь суток."""
+    """Собрать отклик на публикации за четыре недели."""
     async with jobs.exclusive("еженедельный отчёт", job_id) as job:
         until = until or clock.now()
-        since = until - timedelta(days=7)
+        since = until - timedelta(days=28)
         pool = await db.get_pool()
         rows = await pool.fetch(
             "select id, title, username, link, kind, is_active from chats "
@@ -194,6 +201,19 @@ async def build(job_id: str | None = None, *, until: datetime | None = None
                         channel.labels = await channel_themes(
                             llm, {post.id: post.text for post in channel.posts},
                         )
+                        candidates = theme_candidates(channel, until)
+                        evidence = {p.id: p for _, posts in candidates for p in posts}
+                        publications = [
+                            {"id": p.id, "theme": channel.labels[p.id], "text": p.text[:1500],
+                             "reactions": p.reactions, "comments": p.comments}
+                            for p in sorted(evidence.values(), key=lambda p: p.engagement,
+                                            reverse=True)[:12]
+                        ]
+                        try:
+                            channel.ideas = await content_ideas(llm, publications)
+                        except LLMError:
+                            log.warning("не удалось подготовить идеи по каналу %s", channel.id)
+                            channel.analysis_note = "Идеи временно недоступны. Темы и метрики приведены ниже."
                     finished = True
                 finally:
                     await usage.record(pool, "post_themes", llm, seconds=time.monotonic() - started,

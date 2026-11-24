@@ -30,6 +30,46 @@ def test_channel_theme_recommendations_require_typical_engagement():
 TOPICS = [(1, "Общий"), (12, "Бизнес. Управление ресурсами"), (20, "Маркетинг")]
 
 
+async def test_existing_schedule_moves_from_ten_to_nine(monkeypatch):
+    from unittest.mock import AsyncMock
+    from chat_parser import db
+
+    old = datetime(2026, 11, 30, 10, tzinfo=weekly.MOSCOW)
+    monkeypatch.setattr(db, "get_setting", AsyncMock(return_value=old.isoformat()))
+    save = AsyncMock()
+    monkeypatch.setattr(db, "set_setting", save)
+    expected = old.replace(hour=9)
+    assert await weekly.next_at() == expected
+    save.assert_awaited_once_with(weekly.NEXT_KEY, expected.isoformat())
+
+
+async def test_content_ideas_keep_only_evidence_from_input():
+    from unittest.mock import AsyncMock
+    from chat_parser.analyze.posts import content_ideas
+    from chat_parser.analyze.schema import PostIdea, PostIdeas
+
+    llm = type("LLM", (), {"structured": AsyncMock(return_value=PostIdeas(items=[
+        PostIdea(title="Чек-лист закупки", angle="Разобрать критерии отбора оправ.", evidence_ids=[7, 999]),
+        PostIdea(title="Чужая тема", angle="Не подтверждена.", evidence_ids=[999]),
+    ]))})()
+    result = await content_ideas(llm, [{"id": 7, "text": "Напишите @user_name про оправы"}])
+    assert len(result) == 1 and result[0]["evidence_ids"] == [7]
+    assert "@user_name" not in llm.structured.call_args.args[1]
+
+
+def test_theme_candidates_exclude_posts_less_than_one_day_old():
+    from chat_parser.ingest.channel_posts import Post
+    from chat_parser.report.channel_weekly import Channel, theme_candidates
+
+    now = clock.now()
+    recent = Post(1, now - timedelta(hours=2), "Слишком свежий", 500, 50)
+    older = Post(2, now - timedelta(days=2), "Устойчивый отклик", 20, 4)
+    channel = Channel(1, "Канал", None, [recent, older], {1: "Новинка", 2: "Практика"})
+    assert [(name, [p.id for p in posts]) for name, posts in theme_candidates(channel, now)] == [
+        ("Практика", [2]),
+    ]
+
+
 def test_topic_found_despite_typo():
     assert match_topic("Бизнес. Управления ресурсами", TOPICS) == TOPICS[1]
     assert match_topic("бизнес управление ресурсами", TOPICS) == TOPICS[1]
@@ -71,16 +111,16 @@ def test_focus_author():
     assert focus_matches("t.me/angella_sh", "кто угодно", "Angella_Sh")
 
 
-def test_every_monday_at_ten(monkeypatch):
+def test_every_monday_at_nine_moscow_even_with_old_settings(monkeypatch):
     monkeypatch.setattr(settings, "weekly_weekday", 0)
     monkeypatch.setattr(settings, "weekly_hour", 10)
-    tz = clock.tz()
-    monday = datetime(2026, 10, 12, 9, 0, tzinfo=tz)  # понедельник
-    assert weekly.slot_after(monday) == datetime(2026, 10, 12, 10, 0, tzinfo=tz)
+    tz = weekly.MOSCOW
+    monday = datetime(2026, 10, 12, 8, 0, tzinfo=tz)
+    assert weekly.slot_after(monday) == datetime(2026, 10, 12, 9, 0, tzinfo=tz)
     assert weekly.slot_after(monday.replace(hour=10, minute=30)) == datetime(
-        2026, 10, 19, 10, 0, tzinfo=tz)
+        2026, 10, 19, 9, 0, tzinfo=tz)
     wednesday = datetime(2026, 10, 14, 15, 0, tzinfo=tz)
-    assert weekly.slot_after(wednesday) == datetime(2026, 10, 19, 10, 0, tzinfo=tz)
+    assert weekly.slot_after(wednesday) == datetime(2026, 10, 19, 9, 0, tzinfo=tz)
 
 
 def post(theme, reactions, comments=0, focus=True, days=1, name="Анжелла Шаталина"):

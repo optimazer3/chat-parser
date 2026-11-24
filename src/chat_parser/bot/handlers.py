@@ -63,7 +63,7 @@ BTN_SEND_NOW = "📤 Отправить отчёт сейчас"
 
 # Меняется вместе с набором кнопок: бот один раз пришлёт новую клавиатуру.
 KEYBOARD_KEY = "keyboard_version"
-KEYBOARD_VERSION = "9"
+KEYBOARD_VERSION = "10"
 
 # Отчёты уходят на почту, в боте остаются три кнопки. Прежние кнопки убраны
 # с клавиатуры, но их обработчики оставлены: у кого-то ещё может висеть старая.
@@ -80,10 +80,10 @@ MAIN_KB = ReplyKeyboardMarkup(
 def help_text() -> str:
     return (
         "👋 <b>Мониторинг чатов рынка оптики</b>\n\n"
-        "Добавь канал по ссылке или @username. Раз в неделю я собираю PDF по всем "
-        "подключённым каналам: лучшие посты по реакциям и комментариям и темы для новых публикаций. "
+        "Добавь канал по ссылке или @username. Каждый понедельник в 09:00 МСК я собираю PDF "
+        "по всем подключённым каналам за четыре недели с реакциями, комментариями и идеями постов. "
         "Отчёт приходит на почту или в личный чат, если почта недоступна.\n\n"
-        "📅 <b>Еженедельный отчёт</b> — расписание и получение PDF сейчас.\n"
+        "📅 <b>Еженедельный отчёт</b> — сразу получить PDF на почту.\n"
         "➕ <b>Добавить чат</b> — управление каналами.\n"
         "👤 <b>Добавить инфо о человеке</b> — компания, роль и заметка."
     )
@@ -1056,7 +1056,7 @@ async def cmd_usage(message: Message) -> None:
 
 
 @router.message(Command("live", "time"), F.chat.type == "private")
-@router.message(F.text.in_({BTN_WEEKLY, BTN_TIME}), F.chat.type == "private")
+@router.message(F.text == BTN_TIME, F.chat.type == "private")
 async def cmd_live(message: Message) -> None:
     lines = [f"📅 Следующий еженедельный PDF: <b>{fmt.when_next(await weekly.next_at())}</b>."]
     rows = [[("📥 Получить PDF сейчас", "weekly:now")]]
@@ -1069,7 +1069,7 @@ async def cmd_live(message: Message) -> None:
 
 
 @router.message(Command("report", "weekly"), F.chat.type == "private")
-@router.message(F.text.in_({BTN_SEND_NOW, BTN_REPORT}), F.chat.type == "private")
+@router.message(F.text.in_({BTN_WEEKLY, BTN_SEND_NOW, BTN_REPORT}), F.chat.type == "private")
 async def cmd_weekly(message: Message, bot: Bot) -> None:
     """Отправить недельный PDF по запросу без сдвига расписания."""
     from . import delivery
